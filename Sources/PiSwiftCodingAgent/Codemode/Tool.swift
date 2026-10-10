@@ -18,6 +18,8 @@ public struct CodemodeStoreEntryData: Sendable {
 
 public struct CodemodeToolOptions: Sendable {
     public var models: Bool
+    public var omitInlineOutputSchemas: Bool
+    public var inlineEnumValueLimit: Int?
     public var collisionPolicy: ToolNameCollisionPolicy
     public var defaultTimeoutMs: Int?
     public var maxTimeoutMs: Int?
@@ -48,8 +50,12 @@ public struct CodemodeToolOptions: Sendable {
                 validationErrorPrefix: String? = nil,
                 getDefaultTimeoutMs: (@Sendable () -> Int?)? = nil,
                 getMaxTimeoutMs: (@Sendable () -> Int?)? = nil,
-                recordLateCall: (@Sendable (String, CodemodeNestedCall) -> Void)? = nil) {
+                recordLateCall: (@Sendable (String, CodemodeNestedCall) -> Void)? = nil,
+                omitInlineOutputSchemas: Bool = false,
+                inlineEnumValueLimit: Int? = nil) {
         self.models = models
+        self.omitInlineOutputSchemas = omitInlineOutputSchemas
+        self.inlineEnumValueLimit = inlineEnumValueLimit.map { max(0, $0) }
         self.collisionPolicy = collisionPolicy
         self.defaultTimeoutMs = defaultTimeoutMs
         self.maxTimeoutMs = maxTimeoutMs
@@ -83,7 +89,9 @@ private func codemodeDescriptionOptions(_ options: CodemodeToolOptions,
         namespaces: namespaces,
         deferred: deferred,
         inlineBudget: options.getInlineBudget?() ?? defaultCodemodeInlineBudget,
-        guidelines: guidelines)
+        guidelines: guidelines,
+        omitInlineOutputSchemas: options.omitInlineOutputSchemas,
+        inlineEnumValueLimit: options.inlineEnumValueLimit)
 }
 
 private func describeScriptCall(_ tool: AgentTool) -> String {

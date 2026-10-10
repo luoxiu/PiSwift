@@ -4,6 +4,9 @@ public struct CodemodeExtensionOptions: Sendable {
     public var mode: CodemodeMode?
     public var inlineBudget: Double?
     public var models: Bool
+    /// Keep full return schemas in discovery but omit them from the inline catalog.
+    public var omitInlineOutputSchemas: Bool
+    public var inlineEnumValueLimit: Int?
     public var collisionPolicy: ToolNameCollisionPolicy?
     public var defaultTimeoutMs: Int?
     public var maxTimeoutMs: Int?
@@ -12,10 +15,13 @@ public struct CodemodeExtensionOptions: Sendable {
     public init(mode: CodemodeMode? = nil, inlineBudget: Double? = nil, models: Bool = true,
                 collisionPolicy: ToolNameCollisionPolicy? = nil,
                 defaultTimeoutMs: Int? = nil, maxTimeoutMs: Int? = nil,
-                validationErrorPrefix: String? = nil) {
+                validationErrorPrefix: String? = nil, omitInlineOutputSchemas: Bool = false,
+                inlineEnumValueLimit: Int? = nil) {
         self.mode = mode
         self.inlineBudget = inlineBudget
         self.models = models
+        self.omitInlineOutputSchemas = omitInlineOutputSchemas
+        self.inlineEnumValueLimit = inlineEnumValueLimit.map { max(0, $0) }
         self.collisionPolicy = collisionPolicy
         self.defaultTimeoutMs = defaultTimeoutMs
         self.maxTimeoutMs = maxTimeoutMs
@@ -59,7 +65,9 @@ public func createCodemodeExtension(options: CodemodeExtensionOptions = .init())
                 }
                 api.appendEntry(CODEMODE_LATE_CALL_ENTRY_TYPE,
                                 ["parentToolCallId": parentId, "call": row])
-            })
+            },
+            omitInlineOutputSchemas: options.omitInlineOutputSchemas,
+            inlineEnumValueLimit: options.inlineEnumValueLimit)
         _ = api.registerTool(createCodemodeToolDefinition(options: toolOptions))
     }
 }

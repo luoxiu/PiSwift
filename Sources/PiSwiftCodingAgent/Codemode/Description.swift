@@ -1,5 +1,7 @@
 import Foundation
+import CoreFoundation
 import PiSwiftAgent
+import PiSwiftAI
 
 public let defaultCodemodeInlineBudget = 3_000.0
 
@@ -10,17 +12,25 @@ public struct CodemodeDescriptionOptions: Sendable {
     public var guidelines: [String: [String]]
     /// Nil includes every non-deferred tool, as in upstream's bare builder.
     public var inlineBudget: Double?
+    /// Omit return schemas only from the initial inline catalog. Discovery keeps full schemas.
+    public var omitInlineOutputSchemas: Bool
+    /// Show large input enums as their primitive type. Discovery keeps every enum value.
+    public var inlineEnumValueLimit: Int?
     /// Name shown for the script engine. C5b uses JavaScriptCore.
     public var sandboxName: String
 
     public init(models: Bool = false, namespaces: [String: ToolNamespace] = [:],
                 deferred: Set<String> = [], inlineBudget: Double? = defaultCodemodeInlineBudget,
-                sandboxName: String = "JavaScriptCore", guidelines: [String: [String]] = [:]) {
+                sandboxName: String = "JavaScriptCore", guidelines: [String: [String]] = [:],
+                omitInlineOutputSchemas: Bool = false,
+                inlineEnumValueLimit: Int? = nil) {
         self.models = models
         self.namespaces = namespaces
         self.deferred = deferred
         self.guidelines = guidelines
         self.inlineBudget = inlineBudget
+        self.omitInlineOutputSchemas = omitInlineOutputSchemas
+        self.inlineEnumValueLimit = inlineEnumValueLimit.map { max(0, $0) }
         self.sandboxName = sandboxName
     }
 }
@@ -81,8 +91,49 @@ private func selected(_ groups: [CatalogGroup], budget: Double?) -> Set<String> 
     return shown
 }
 
+private func compactInlineEnums(_ value: Any, limit: Int) -> Any {
+    if let array = value as? [Any] {
+        return array.map { compactInlineEnums($0, limit: limit) }
+    }
+    guard var schema = value as? [String: Any] else {
+        return value
+    }
+    if let values = schema["enum"] as? [Any], values.count > limit {
+        schema.removeValue(forKey: "enum")
+        if schema["type"] == nil {
+            var types: Set<String> = []
+            for value in values {
+                if value is NSNull {
+                    types.insert("null")
+                } else if value is String {
+                    types.insert("string")
+                } else if let number = value as? NSNumber {
+                    types.insert(CFGetTypeID(number) == CFBooleanGetTypeID() ? "boolean" : "number")
+                } else if value is [Any] {
+                    types.insert("array")
+                } else if value is [String: Any] {
+                    types.insert("object")
+                }
+            }
+            if !types.isEmpty {
+                schema["type"] = types.sorted()
+            }
+        }
+    }
+    return schema.mapValues { compactInlineEnums($0, limit: limit) }
+}
+
 public func createCodemodeDescription(_ tools: [AgentTool], options: CodemodeDescriptionOptions = .init()) -> String {
-    let declarations = tools.filter { $0.name != "codemode" && !options.deferred.contains($0.name) }.map { CodemodeDeclaration(tool: $0, guidelines: options.guidelines[$0.name] ?? []) }
+    let declarations = tools.filter { $0.name != "codemode" && !options.deferred.contains($0.name) }.map { tool in
+        var declaration = CodemodeDeclaration(tool: tool, guidelines: options.guidelines[tool.name] ?? [])
+        if options.omitInlineOutputSchemas {
+            declaration.outputSchema = nil
+        }
+        if let limit = options.inlineEnumValueLimit, let input = declaration.inputSchema {
+            declaration.inputSchema = AnyCodable(compactInlineEnums(input.value, limit: limit))
+        }
+        return declaration
+    }
     var groups: [String: CatalogGroup] = ["": CatalogGroup(namespace: nil, entries: [])]
     for (order, declaration) in declarations.enumerated() {
         let namespace = options.namespaces[declaration.name]
