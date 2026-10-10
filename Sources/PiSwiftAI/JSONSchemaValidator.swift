@@ -57,16 +57,101 @@ public final class JSONSchemaValidator: Sendable {
         path: String = "root",
         coerceTypes: Bool = true
     ) -> ValidationResult {
+        validate(value, against: schema, path: path, coerceTypes: coerceTypes,
+                 context: ValidationContext(root: schema))
+    }
+
+    private struct ReferenceLocation: Hashable {
+        let reference: String
+        let valueDepth: Int
+    }
+
+    private struct ValidationContext {
+        let root: [String: Any]
+        var depth = 0
+        var valueDepth = 0
+        var references: Set<ReferenceLocation> = []
+
+        func childValue() -> ValidationContext {
+            var child = self
+            child.valueDepth += 1
+            return child
+        }
+
+        func resolve(_ reference: String) -> Any? {
+            if reference == "#" {
+                return root
+            }
+            guard reference.hasPrefix("#/"),
+                  let pointer = String(reference.dropFirst()).removingPercentEncoding else {
+                return nil
+            }
+            var current: Any = root
+            for rawSegment in pointer.dropFirst().split(separator: "/", omittingEmptySubsequences: false) {
+                let segment = String(rawSegment)
+                guard segment.range(of: "~(?![01])", options: .regularExpression) == nil else {
+                    return nil
+                }
+                let key = segment.replacingOccurrences(of: "~1", with: "/")
+                    .replacingOccurrences(of: "~0", with: "~")
+                guard let dictionary = current as? [String: Any], let next = dictionary[key] else {
+                    return nil
+                }
+                current = next
+            }
+            return current
+        }
+    }
+
+    private func validate(
+        _ value: Any?,
+        against schema: [String: Any],
+        path: String,
+        coerceTypes: Bool,
+        context parentContext: ValidationContext
+    ) -> ValidationResult {
+        guard parentContext.depth < 128 else {
+            return .invalid(SchemaValidationError(path: path, message: "schema validation depth limit exceeded"))
+        }
+        var context = parentContext
+        context.depth += 1
+        if let reference = schema["$ref"] {
+            guard let reference = reference as? String, let target = context.resolve(reference) else {
+                return .invalid(SchemaValidationError(path: path, message: "unresolved local schema reference"))
+            }
+            let location = ReferenceLocation(reference: reference, valueDepth: context.valueDepth)
+            guard context.references.insert(location).inserted else {
+                return .invalid(SchemaValidationError(path: path, message: "cyclic schema reference without value progress"))
+            }
+            let result: ValidationResult
+            if let target = target as? [String: Any] {
+                result = validate(value, against: target, path: path, coerceTypes: coerceTypes, context: context)
+            } else if let allowed = target as? Bool {
+                result = allowed ? .valid(value) : .invalid(SchemaValidationError(path: path, message: "schema rejects all values"))
+            } else {
+                return .invalid(SchemaValidationError(path: path, message: "schema reference must identify a schema"))
+            }
+            guard result.isValid else {
+                return result
+            }
+            var siblings = schema
+            siblings.removeValue(forKey: "$ref")
+            guard !siblings.isEmpty else {
+                return result
+            }
+            return validate(result.coercedValue ?? value, against: siblings, path: path,
+                            coerceTypes: coerceTypes, context: context)
+        }
         if let anyOf = schema["anyOf"] as? [[String: Any]] {
             for subSchema in anyOf {
-                let exact = validate(value, against: subSchema, path: path, coerceTypes: false)
+                let exact = validate(value, against: subSchema, path: path, coerceTypes: false, context: context)
                 if exact.isValid {
                     return exact
                 }
             }
             if coerceTypes {
                 for subSchema in anyOf {
-                    let result = validate(value, against: subSchema, path: path, coerceTypes: true)
+                    let result = validate(value, against: subSchema, path: path, coerceTypes: true, context: context)
                     if result.isValid {
                         return result
                     }
@@ -77,7 +162,7 @@ public final class JSONSchemaValidator: Sendable {
 
         if let oneOf = schema["oneOf"] as? [[String: Any]] {
             let exactMatches = oneOf.compactMap { subSchema -> ValidationResult? in
-                let result = validate(value, against: subSchema, path: path, coerceTypes: false)
+                let result = validate(value, against: subSchema, path: path, coerceTypes: false, context: context)
                 return result.isValid ? result : nil
             }
             if exactMatches.count == 1 {
@@ -91,7 +176,7 @@ public final class JSONSchemaValidator: Sendable {
                 return .invalid(SchemaValidationError(path: path, message: "does not match any of the oneOf schemas"))
             }
             let coercedMatches = oneOf.compactMap { subSchema -> ValidationResult? in
-                let result = validate(value, against: subSchema, path: path, coerceTypes: true)
+                let result = validate(value, against: subSchema, path: path, coerceTypes: true, context: context)
                 return result.isValid ? result : nil
             }
             if coercedMatches.count == 1 {
@@ -107,7 +192,7 @@ public final class JSONSchemaValidator: Sendable {
         if value == nil || value is NSNull {
             if let allOf = schema["allOf"] as? [[String: Any]] {
                 for branch in allOf {
-                    let result = validate(value, against: branch, path: path, coerceTypes: false)
+                    let result = validate(value, against: branch, path: path, coerceTypes: false, context: context)
                     if !result.isValid { return result }
                 }
             }
@@ -146,7 +231,7 @@ public final class JSONSchemaValidator: Sendable {
         if let allOf = schema["allOf"] as? [[String: Any]] {
             var currentValue: Any = value
             for subSchema in allOf {
-                let result = validate(currentValue, against: subSchema, path: path, coerceTypes: coerceTypes)
+                let result = validate(currentValue, against: subSchema, path: path, coerceTypes: coerceTypes, context: context)
                 if !result.isValid {
                     return result
                 }
@@ -182,7 +267,7 @@ public final class JSONSchemaValidator: Sendable {
         // Try each expected type
         var lastError: SchemaValidationError?
         for expectedType in expectedTypes {
-            let result = validateType(value, expectedType: expectedType, schema: schema, path: path, coerceTypes: coerceTypes)
+            let result = validateType(value, expectedType: expectedType, schema: schema, path: path, coerceTypes: coerceTypes, context: context)
             if result.isValid {
                 return result
             }
@@ -199,7 +284,8 @@ public final class JSONSchemaValidator: Sendable {
         expectedType: String,
         schema: [String: Any],
         path: String,
-        coerceTypes: Bool
+        coerceTypes: Bool,
+        context: ValidationContext
     ) -> ValidationResult {
         switch expectedType {
         case "string":
@@ -211,9 +297,9 @@ public final class JSONSchemaValidator: Sendable {
         case "boolean":
             return validateBoolean(value, path: path, coerceTypes: coerceTypes)
         case "array":
-            return validateArray(value, schema: schema, path: path, coerceTypes: coerceTypes)
+            return validateArray(value, schema: schema, path: path, coerceTypes: coerceTypes, context: context)
         case "object":
-            return validateObject(value, schema: schema, path: path, coerceTypes: coerceTypes)
+            return validateObject(value, schema: schema, path: path, coerceTypes: coerceTypes, context: context)
         case "null":
             if value is NSNull {
                 return .valid(NSNull())
@@ -469,7 +555,7 @@ public final class JSONSchemaValidator: Sendable {
 
     // MARK: - Array Validation
 
-    private func validateArray(_ value: Any, schema: [String: Any], path: String, coerceTypes: Bool) -> ValidationResult {
+    private func validateArray(_ value: Any, schema: [String: Any], path: String, coerceTypes: Bool, context: ValidationContext) -> ValidationResult {
         guard let arrayValue = value as? [Any] else {
             return .invalid(SchemaValidationError(path: path, message: "must be an array"))
         }
@@ -507,7 +593,7 @@ public final class JSONSchemaValidator: Sendable {
         // uses an array-valued `items` plus optional `additionalItems`.
         if let prefixItems = schema["prefixItems"] as? [[String: Any]] {
             for (index, itemSchema) in prefixItems.enumerated() where index < arrayValue.count {
-                let result = validate(arrayValue[index], against: itemSchema, path: "\(path)[\(index)]", coerceTypes: coerceTypes)
+                let result = validate(arrayValue[index], against: itemSchema, path: "\(path)[\(index)]", coerceTypes: coerceTypes, context: context.childValue())
                 if !result.isValid { return result }
                 coercedItems.append(result.coercedValue ?? arrayValue[index])
             }
@@ -518,7 +604,7 @@ public final class JSONSchemaValidator: Sendable {
             if let itemsSchema = schema["items"] as? [String: Any] {
                 for (offset, item) in remaining.enumerated() {
                     let index = prefixItems.count + offset
-                    let result = validate(item, against: itemsSchema, path: "\(path)[\(index)]", coerceTypes: coerceTypes)
+                    let result = validate(item, against: itemsSchema, path: "\(path)[\(index)]", coerceTypes: coerceTypes, context: context.childValue())
                     if !result.isValid { return result }
                     coercedItems.append(result.coercedValue ?? item)
                 }
@@ -529,7 +615,7 @@ public final class JSONSchemaValidator: Sendable {
         }
         if let tupleItems = schema["items"] as? [[String: Any]] {
             for (index, itemSchema) in tupleItems.enumerated() where index < arrayValue.count {
-                let result = validate(arrayValue[index], against: itemSchema, path: "\(path)[\(index)]", coerceTypes: coerceTypes)
+                let result = validate(arrayValue[index], against: itemSchema, path: "\(path)[\(index)]", coerceTypes: coerceTypes, context: context.childValue())
                 if !result.isValid { return result }
                 coercedItems.append(result.coercedValue ?? arrayValue[index])
             }
@@ -540,7 +626,7 @@ public final class JSONSchemaValidator: Sendable {
             if let additionalItems = schema["additionalItems"] as? [String: Any] {
                 for (offset, item) in remaining.enumerated() {
                     let index = tupleItems.count + offset
-                    let result = validate(item, against: additionalItems, path: "\(path)[\(index)]", coerceTypes: coerceTypes)
+                    let result = validate(item, against: additionalItems, path: "\(path)[\(index)]", coerceTypes: coerceTypes, context: context.childValue())
                     if !result.isValid { return result }
                     coercedItems.append(result.coercedValue ?? item)
                 }
@@ -554,7 +640,7 @@ public final class JSONSchemaValidator: Sendable {
         if let itemsSchema = schema["items"] as? [String: Any] {
             for (index, item) in arrayValue.enumerated() {
                 let itemPath = "\(path)[\(index)]"
-                let result = validate(item, against: itemsSchema, path: itemPath, coerceTypes: coerceTypes)
+                let result = validate(item, against: itemsSchema, path: itemPath, coerceTypes: coerceTypes, context: context.childValue())
                 if !result.isValid {
                     return result
                 }
@@ -569,7 +655,7 @@ public final class JSONSchemaValidator: Sendable {
 
     // MARK: - Object Validation
 
-    private func validateObject(_ value: Any, schema: [String: Any], path: String, coerceTypes: Bool) -> ValidationResult {
+    private func validateObject(_ value: Any, schema: [String: Any], path: String, coerceTypes: Bool, context: ValidationContext) -> ValidationResult {
         guard let objectValue = value as? [String: Any] else {
             return .invalid(SchemaValidationError(path: path, message: "must be an object"))
         }
@@ -599,7 +685,7 @@ public final class JSONSchemaValidator: Sendable {
             let propPath = path == "root" ? key : "\(path).\(key)"
 
             if let propSchema = propertiesSchema[key] {
-                let result = validate(propValue, against: propSchema, path: propPath, coerceTypes: coerceTypes)
+                let result = validate(propValue, against: propSchema, path: propPath, coerceTypes: coerceTypes, context: context.childValue())
                 if !result.isValid {
                     errors.append(contentsOf: result.errors)
                 } else {
@@ -615,7 +701,7 @@ public final class JSONSchemaValidator: Sendable {
                         coercedObject[key] = propValue
                     }
                 } else if let additionalSchema = additionalProperties as? [String: Any] {
-                    let result = validate(propValue, against: additionalSchema, path: propPath, coerceTypes: coerceTypes)
+                    let result = validate(propValue, against: additionalSchema, path: propPath, coerceTypes: coerceTypes, context: context.childValue())
                     if !result.isValid {
                         errors.append(contentsOf: result.errors)
                     } else {
