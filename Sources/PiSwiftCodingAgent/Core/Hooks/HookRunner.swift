@@ -81,6 +81,8 @@ public final class HookRunner: Sendable {
         var setThinkingLevelHandler: HookSetThinkingLevelHandler
         var registerToolHandler: HookRegisterToolHandler
         var unregisterToolHandler: HookUnregisterToolHandler
+        var registerOwnedToolHandler: HookRegisterOwnedToolHandler
+        var unregisterOwnedToolHandler: HookUnregisterOwnedToolHandler
 
         func apply(to hook: LoadedHook) {
             hook.setSendMessageHandler(sendMessageHandler)
@@ -98,6 +100,8 @@ public final class HookRunner: Sendable {
             hook.setSetThinkingLevelHandler(setThinkingLevelHandler)
             hook.setRegisterToolHandler(registerToolHandler)
             hook.setUnregisterToolHandler(unregisterToolHandler)
+            hook.setRegisterOwnedToolHandler(registerOwnedToolHandler)
+            hook.setUnregisterOwnedToolHandler(unregisterOwnedToolHandler)
         }
     }
 
@@ -333,6 +337,8 @@ public final class HookRunner: Sendable {
         setThinkingLevelHandler: HookSetThinkingLevelHandler? = nil,
         registerToolHandler: HookRegisterToolHandler? = nil,
         unregisterToolHandler: HookUnregisterToolHandler? = nil,
+        registerOwnedToolHandler: HookRegisterOwnedToolHandler? = nil,
+        unregisterOwnedToolHandler: HookUnregisterOwnedToolHandler? = nil,
         sendUserMessageHandler: HookSendUserMessageHandler? = nil,
         setLabelHandler: HookSetLabelHandler? = nil,
         getContextUsage: HookGetContextUsageHandler? = nil,
@@ -403,7 +409,9 @@ public final class HookRunner: Sendable {
             getThinkingLevelHandler: getThinkingLevelHandler ?? { .off },
             setThinkingLevelHandler: setThinkingLevelHandler ?? { _ in },
             registerToolHandler: registerToolHandler ?? { _ in },
-            unregisterToolHandler: unregisterToolHandler ?? { _ in }
+            unregisterToolHandler: unregisterToolHandler ?? { _ in },
+            registerOwnedToolHandler: registerOwnedToolHandler ?? { _, _ in .success(()) },
+            unregisterOwnedToolHandler: unregisterOwnedToolHandler ?? { _, _ in }
         )
         state.withLock { $0.wiring = wiring }
         for hook in hooks {
@@ -448,13 +456,25 @@ public final class HookRunner: Sendable {
     /// On name collision the last hook in iteration order wins; this matches the
     /// command-collision policy in `getRegisteredCommands()`.
     public func getExtensionTools() -> [CustomTool] {
-        var byName: [String: CustomTool] = [:]
+        getExtensionToolDefinitions().map(\.tool)
+    }
+
+    public func getExtensionToolDefinitions() -> [LoadedCustomTool] {
+        var byName: [String: LoadedCustomTool] = [:]
+        var order: [String] = []
         for hook in hooks where hook.isExtension {
-            for (name, tool) in hook.currentTools() {
-                byName[name] = tool
+            let tools = hook.currentTools()
+            for name in hook.currentToolOrder() {
+                guard let tool = tools[name] else {
+                    continue
+                }
+                if byName[name] == nil {
+                    order.append(name)
+                }
+                byName[name] = LoadedCustomTool(path: hook.path, resolvedPath: hook.resolvedPath, tool: tool)
             }
         }
-        return Array(byName.values)
+        return order.compactMap { byName[$0] }
     }
 
     /// Names of every extension-registered tool currently loaded. Used by

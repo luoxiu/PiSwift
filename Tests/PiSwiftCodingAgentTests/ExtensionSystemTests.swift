@@ -36,11 +36,21 @@ private func testSDKPaths() -> ExtensionCompiler.SDKPaths? {
         return nil
     }
 
+    if let sdkDirectory = ProcessInfo.processInfo.environment["PI_EXTENSION_SDK_PATH"],
+       let paths = checkBuildDir(sdkDirectory) {
+        return paths
+    }
+
     // 1. The test bundle lives inside .build/<triple>/debug/  —  the SDK
     //    artifacts (.swiftmodule + .dylib) are in that same directory.
     if let resourceURL = Bundle.module.resourceURL {
-        let debugDir = resourceURL.deletingLastPathComponent().path
-        if let paths = checkBuildDir(debugDir) { return paths }
+        var directory = resourceURL
+        for _ in 0..<6 {
+            if let paths = checkBuildDir(directory.path) {
+                return paths
+            }
+            directory.deleteLastPathComponent()
+        }
     }
 
     // 2. Walk up from #filePath (absolute source tree path).

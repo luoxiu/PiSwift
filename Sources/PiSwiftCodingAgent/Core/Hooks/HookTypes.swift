@@ -290,11 +290,13 @@ public struct ToolInfo: Sendable {
     public var namespace: ToolNamespace?
     public var annotations: ToolAnnotations?
     public var sourceInfo: SourceInfo?
+    /// The path that owns the executable currently installed in the session.
+    public var ownerPath: String?
 
     public init(name: String, description: String, sourceInfo: SourceInfo? = nil,
                 parameters: [String: AnyCodable]? = nil, promptGuidelines: [String]? = nil,
                 exposure: ToolExposure = .direct, namespace: ToolNamespace? = nil,
-                annotations: ToolAnnotations? = nil) {
+                annotations: ToolAnnotations? = nil, ownerPath: String? = nil) {
         self.name = name
         self.description = description
         self.parameters = parameters
@@ -302,6 +304,7 @@ public struct ToolInfo: Sendable {
         self.exposure = exposure
         self.namespace = namespace
         self.annotations = annotations
+        self.ownerPath = ownerPath
         self.sourceInfo = sourceInfo
     }
 }
@@ -353,9 +356,13 @@ public typealias HookGetActiveToolsSetter = @Sendable (@escaping HookGetActiveTo
 public typealias HookGetAllToolsSetter = @Sendable (@escaping HookGetAllToolsHandler) -> Void
 public typealias HookSetActiveToolsSetter = @Sendable (@escaping HookSetActiveToolsHandler) -> Void
 public typealias HookRegisterToolHandler = @Sendable (_ tool: CustomTool) -> Void
+public typealias HookRegisterOwnedToolHandler = @Sendable (_ tool: CustomTool, _ ownerPath: String) -> Result<Void, HookAPIError>
 public typealias HookUnregisterToolHandler = @Sendable (_ name: String) -> Void
+public typealias HookUnregisterOwnedToolHandler = @Sendable (_ name: String, _ ownerPath: String) -> Void
 public typealias HookRegisterToolSetter = @Sendable (@escaping HookRegisterToolHandler) -> Void
 public typealias HookUnregisterToolSetter = @Sendable (@escaping HookUnregisterToolHandler) -> Void
+public typealias HookRegisterOwnedToolSetter = @Sendable (@escaping HookRegisterOwnedToolHandler) -> Void
+public typealias HookUnregisterOwnedToolSetter = @Sendable (@escaping HookUnregisterOwnedToolHandler) -> Void
 public typealias HookSetFlagValue = @Sendable (_ name: String, _ value: HookFlagValue) -> Void
 public typealias HookRegisterProviderHandler = @Sendable (_ config: HookProviderConfig) -> Void
 public typealias HookUnregisterProviderHandler = @Sendable (_ provider: String) -> Void
@@ -1921,6 +1928,8 @@ public struct LoadedHook: Sendable {
     /// Returns the extension's current tools. This keeps tools registered after
     /// session start visible to reload bookkeeping.
     public var currentTools: @Sendable () -> [String: CustomTool]
+    public var currentToolOrder: @Sendable () -> [String]
+    public var toolRegistrationErrors: [HookAPIError]
     public var toolRenderers: [ToolRendererResolver]
     public var currentToolRenderers: @Sendable () -> [ToolRendererResolver]
     public var providerRegistrations: [String: HookProviderConfig]
@@ -1950,6 +1959,8 @@ public struct LoadedHook: Sendable {
     public var setUnregisterVirtualModelHandler: HookUnregisterVirtualModelSetter
     public var setRegisterToolHandler: HookRegisterToolSetter
     public var setUnregisterToolHandler: HookUnregisterToolSetter
+    public var setRegisterOwnedToolHandler: HookRegisterOwnedToolSetter
+    public var setUnregisterOwnedToolHandler: HookUnregisterOwnedToolSetter
     public var setFlagValue: HookSetFlagValue
     /// Removes event-bus listeners registered by this hook.
     public var dispose: @Sendable () -> Void
@@ -1974,6 +1985,8 @@ public struct LoadedHook: Sendable {
         shortcuts: [KeyId: HookShortcut] = [:],
         tools: [String: CustomTool] = [:],
         currentTools: (@Sendable () -> [String: CustomTool])? = nil,
+        currentToolOrder: (@Sendable () -> [String])? = nil,
+        toolRegistrationErrors: [HookAPIError] = [],
         toolRenderers: [ToolRendererResolver] = [],
         currentToolRenderers: (@Sendable () -> [ToolRendererResolver])? = nil,
         providerRegistrations: [String: HookProviderConfig] = [:],
@@ -2003,6 +2016,8 @@ public struct LoadedHook: Sendable {
         setUnregisterVirtualModelHandler: @escaping HookUnregisterVirtualModelSetter = { _ in },
         setRegisterToolHandler: @escaping HookRegisterToolSetter = { _ in },
         setUnregisterToolHandler: @escaping HookUnregisterToolSetter = { _ in },
+        setRegisterOwnedToolHandler: @escaping HookRegisterOwnedToolSetter = { _ in },
+        setUnregisterOwnedToolHandler: @escaping HookUnregisterOwnedToolSetter = { _ in },
         setFlagValue: @escaping HookSetFlagValue = { _, _ in },
         dispose: @escaping @Sendable () -> Void = {},
         isExtension: Bool = false,
@@ -2022,6 +2037,8 @@ public struct LoadedHook: Sendable {
         self.shortcuts = shortcuts
         self.tools = tools
         self.currentTools = currentTools ?? { tools }
+        self.currentToolOrder = currentToolOrder ?? { tools.keys.sorted() }
+        self.toolRegistrationErrors = toolRegistrationErrors
         self.toolRenderers = toolRenderers
         self.currentToolRenderers = currentToolRenderers ?? { toolRenderers }
         self.providerRegistrations = providerRegistrations
@@ -2051,6 +2068,8 @@ public struct LoadedHook: Sendable {
         self.setUnregisterVirtualModelHandler = setUnregisterVirtualModelHandler
         self.setRegisterToolHandler = setRegisterToolHandler
         self.setUnregisterToolHandler = setUnregisterToolHandler
+        self.setRegisterOwnedToolHandler = setRegisterOwnedToolHandler
+        self.setUnregisterOwnedToolHandler = setUnregisterOwnedToolHandler
         self.setFlagValue = setFlagValue
         self.dispose = dispose
         self.isExtension = isExtension
@@ -2080,6 +2099,8 @@ public enum HookAPIError: LocalizedError, Sendable {
     case invalidFlagDefault(String)
     case emptyCommandName(path: String)
     case missingToolParameters(name: String, path: String)
+    case toolNameCollision(name: String, ownerPath: String, path: String)
+    case toolIdentifierCollision(identifier: String, name: String, ownerName: String, ownerPath: String, path: String)
     case invalidMcpServer(extensionPath: String, detail: String)
     case mcpServerAlreadyRegistered(name: String, owner: String)
     case mcpServerNameConflict(name: String, registeredName: String)
@@ -2091,6 +2112,10 @@ public enum HookAPIError: LocalizedError, Sendable {
             return "Command registered by extension \"\(path)\" must have a non-empty string name. Use pi.registerCommand(\"name\", { description, handler })."
         case .missingToolParameters(let name, let path):
             return "Tool \"\(name)\" registered by extension \"\(path)\" must define an object parameter schema."
+        case .toolNameCollision(let name, let ownerPath, let path):
+            return "Tool \"\(name)\" registered by \"\(path)\" conflicts with the tool owned by \"\(ownerPath)\"."
+        case .toolIdentifierCollision(let identifier, let name, let ownerName, let ownerPath, let path):
+            return "Tool \"\(name)\" registered by \"\(path)\" uses JavaScript identifier \"\(identifier)\", which is used by tool \"\(ownerName)\" owned by \"\(ownerPath)\"."
         case .invalidMcpServer(let path, let detail):
             return "Invalid MCP server registered by extension \"\(path)\": \(detail)"
         case .mcpServerAlreadyRegistered(let name, let owner):
@@ -2102,6 +2127,19 @@ public enum HookAPIError: LocalizedError, Sendable {
 }
 
 public final class HookAPI: Sendable {
+    private let toolRegistrationRegistry: ToolRegistrationRegistry?
+    private let isLoading = LockedState(false)
+    private let registrationErrors = LockedState<[HookAPIError]>([])
+    public var toolRegistrationErrors: [HookAPIError] {
+        registrationErrors.withLock { $0 }
+    }
+    public var toolNameCollisionPolicy: ToolNameCollisionPolicy {
+        toolRegistrationRegistry?.collisionPolicy ?? .overwrite
+    }
+
+    public var toolRegistrationOrder: [String] {
+        state.withLock { $0.toolOrder }
+    }
     private let loadFailure = LockedState<HookAPIError?>(nil)
 
     /// Checked access for hosts that retain an API after factory failure.
@@ -2111,6 +2149,9 @@ public final class HookAPI: Sendable {
 
     func invalidateAfterLoadFailure() {
         loadFailure.withLock { $0 = .inactive(hookPath) }
+        for name in toolRegistrationOrder {
+            toolRegistrationRegistry?.unregister(name: name, ownerPath: hookPath)
+        }
         mcpServerRegistry?.unregisterAll(extensionPath: hookPath)
         disposeEventBusListeners()
         state.withLock { state in
@@ -2121,6 +2162,7 @@ public final class HookAPI: Sendable {
             state.virtualModelRegistrations.removeAll()
             state.handlers.removeAll()
             state.tools.removeAll()
+            state.toolOrder.removeAll()
             state.toolRenderers.removeAll()
             state.commands.removeAll()
         }
@@ -2140,8 +2182,9 @@ public final class HookAPI: Sendable {
         var flags: [String: HookFlag]
         var shortcuts: [KeyId: HookShortcut]
         /// Custom tools registered by the extension via `pi.registerTool(_:)`.
-        /// Keyed by tool name; collisions overwrite (last write wins).
+        /// Keyed by tool name; the session controls name collisions.
         var tools: [String: CustomTool]
+        var toolOrder: [String]
         var toolRenderers: [ToolRendererResolver]
         var providerRegistrations: [String: HookProviderConfig]
         var mcpServerRegistrations: [String: McpServerConfig]
@@ -2155,6 +2198,8 @@ public final class HookAPI: Sendable {
         var unregisterVirtualModelHandler: HookUnregisterVirtualModelHandler
         var registerToolHandler: HookRegisterToolHandler
         var unregisterToolHandler: HookUnregisterToolHandler
+        var registerOwnedToolHandler: HookRegisterOwnedToolHandler?
+        var unregisterOwnedToolHandler: HookUnregisterOwnedToolHandler?
         var sendMessageHandler: HookSendMessageHandler
         var sendUserMessageHandler: HookSendUserMessageHandler
         var appendEntryHandler: HookAppendEntryHandler
@@ -2361,7 +2406,9 @@ public final class HookAPI: Sendable {
         set { state.withLock { $0.hookPath = newValue } }
     }
 
-    public init(events: EventBus = createEventBus(), hookPath: String? = nil) {
+    public init(events: EventBus = createEventBus(), hookPath: String? = nil,
+                toolRegistrationRegistry: ToolRegistrationRegistry? = nil) {
+        self.toolRegistrationRegistry = toolRegistrationRegistry
         self.mcpServerRegistry = (events as? EventBusImpl)?.mcpServers
         let trackedEventBus = TrackedEventBus(events)
         self.trackedEventBus = trackedEventBus
@@ -2376,6 +2423,7 @@ public final class HookAPI: Sendable {
             flags: [:],
             shortcuts: [:],
             tools: [:],
+            toolOrder: [],
             toolRenderers: [],
             providerRegistrations: [:],
             mcpServerRegistrations: [:],
@@ -2389,6 +2437,8 @@ public final class HookAPI: Sendable {
             unregisterVirtualModelHandler: { _, _ in },
             registerToolHandler: { _ in },
             unregisterToolHandler: { _ in },
+            registerOwnedToolHandler: nil,
+            unregisterOwnedToolHandler: nil,
             sendMessageHandler: { _, _ in },
             sendUserMessageHandler: { _, _ in },
             appendEntryHandler: { _, _ in },
@@ -2409,8 +2459,14 @@ public final class HookAPI: Sendable {
         ))
     }
 
-    func beginLoading() { trackedEventBus.beginLoading() }
-    func commitLoading() { trackedEventBus.commitLoading() }
+    func beginLoading() {
+        isLoading.withLock { $0 = true }
+        trackedEventBus.beginLoading()
+    }
+    func commitLoading() {
+        isLoading.withLock { $0 = false }
+        trackedEventBus.commitLoading()
+    }
 
     func disposeEventBusListeners() {
         trackedEventBus.dispose()
@@ -2518,6 +2574,14 @@ public final class HookAPI: Sendable {
 
     public func setUnregisterToolHandler(_ handler: @escaping HookUnregisterToolHandler) {
         unregisterToolHandler = handler
+    }
+
+    public func setRegisterOwnedToolHandler(_ handler: @escaping HookRegisterOwnedToolHandler) {
+        state.withLock { $0.registerOwnedToolHandler = handler }
+    }
+
+    public func setUnregisterOwnedToolHandler(_ handler: @escaping HookUnregisterOwnedToolHandler) {
+        state.withLock { $0.unregisterOwnedToolHandler = handler }
     }
 
     public func setFlagValue(_ name: String, _ value: HookFlagValue) {
@@ -2686,7 +2750,7 @@ public final class HookAPI: Sendable {
     }
 
     /// Register a custom tool callable by the LLM. Mirrors pi-mono's `pi.registerTool(_)`.
-    /// The tool's `name` must be unique across the session (collisions overwrite). The
+    /// The session collision policy controls whether an existing name can be replaced. The
     /// extension that registered the tool owns its lifetime — when the extension is
     /// dropped via `/reload`, its tools are removed from the agent's roster.
     @discardableResult
@@ -2697,7 +2761,22 @@ public final class HookAPI: Sendable {
             loadFailure.withLock { $0 = error }
             return .failure(error)
         }
-        tools[tool.name] = tool
+        if isLoading.withLock({ $0 }),
+           let error = toolRegistrationRegistry?.register(name: tool.name, ownerPath: hookPath, exposure: tool.exposure ?? .direct) {
+            registrationErrors.withLock { $0.append(error) }
+            return .failure(error)
+        }
+        let ownedHandler = state.withLock { $0.registerOwnedToolHandler }
+        let result = ownedHandler?(tool, hookPath) ?? .success(())
+        if case .failure = result {
+            return result
+        }
+        state.withLock { state in
+            if state.tools[tool.name] == nil {
+                state.toolOrder.append(tool.name)
+            }
+            state.tools[tool.name] = tool
+        }
         registerToolHandler(tool)
         return .success(())
     }
@@ -2706,8 +2785,18 @@ public final class HookAPI: Sendable {
     /// Returns false when the tool name was not registered by this hook.
     @discardableResult
     public func unregisterTool(_ name: String) -> Bool {
-        let removed = state.withLock { $0.tools.removeValue(forKey: name) != nil }
-        if removed { unregisterToolHandler(name) }
+        let removed = state.withLock { state in
+            guard state.tools.removeValue(forKey: name) != nil else {
+                return false
+            }
+            state.toolOrder.removeAll { $0 == name }
+            return true
+        }
+        if removed {
+            toolRegistrationRegistry?.unregister(name: name, ownerPath: hookPath)
+            state.withLock { $0.unregisterOwnedToolHandler }?(name, hookPath)
+            unregisterToolHandler(name)
+        }
         return removed
     }
 

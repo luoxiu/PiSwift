@@ -19,10 +19,11 @@ public struct ExtensionLoader {
     public static func load(
         _ inlineExtension: InlineExtension,
         cwd: String,
-        eventBus: EventBus
+        eventBus: EventBus,
+        toolRegistrationRegistry: ToolRegistrationRegistry? = nil
     ) -> LoadExtensionResult {
         let path = inlineExtension.builtin ? "\(BUILTIN_PATH_PREFIX)\(inlineExtension.name)" : "<inline:\(inlineExtension.name)>"
-        let api = HookAPI(events: eventBus, hookPath: path)
+        let api = HookAPI(events: eventBus, hookPath: path, toolRegistrationRegistry: toolRegistrationRegistry)
         api.setExecCwd(cwd)
         api.beginLoading()
         do {
@@ -47,6 +48,8 @@ public struct ExtensionLoader {
             shortcuts: api.shortcuts,
             tools: api.tools,
             currentTools: { api.tools },
+            currentToolOrder: { api.toolRegistrationOrder },
+            toolRegistrationErrors: api.toolRegistrationErrors,
             toolRenderers: api.toolRenderers,
             currentToolRenderers: { api.toolRenderers },
             providerRegistrations: api.providerRegistrations,
@@ -76,6 +79,8 @@ public struct ExtensionLoader {
             setUnregisterVirtualModelHandler: api.setUnregisterVirtualModelHandler,
             setRegisterToolHandler: api.setRegisterToolHandler,
             setUnregisterToolHandler: api.setUnregisterToolHandler,
+            setRegisterOwnedToolHandler: api.setRegisterOwnedToolHandler,
+            setUnregisterOwnedToolHandler: api.setUnregisterOwnedToolHandler,
             setFlagValue: api.setFlagValue,
             dispose: api.disposeEventBusListeners,
             isExtension: true,
@@ -95,7 +100,8 @@ public struct ExtensionLoader {
         cwd: String,
         eventBus: EventBus,
         cacheDir: String,
-        sdkPaths: ExtensionCompiler.SDKPaths
+        sdkPaths: ExtensionCompiler.SDKPaths,
+        toolRegistrationRegistry: ToolRegistrationRegistry? = nil
     ) async -> LoadExtensionResult {
         let resolvedPath = resolveToCwd(path, cwd: cwd)
 
@@ -110,14 +116,14 @@ public struct ExtensionLoader {
         if FileManager.default.fileExists(atPath: resolvedPath, isDirectory: &isDirectory), isDirectory.boolValue {
             let packageUrl = url.appendingPathComponent("Package.swift")
             if FileManager.default.fileExists(atPath: packageUrl.path) {
-                return await loadPackageDirectory(resolvedPath, cwd: cwd, eventBus: eventBus, cacheDir: cacheDir)
+                return await loadPackageDirectory(resolvedPath, cwd: cwd, eventBus: eventBus, cacheDir: cacheDir, toolRegistrationRegistry: toolRegistrationRegistry)
             }
             return LoadExtensionResult(error: .invalidExtension(path: path, reason: "Directory has no Package.swift"))
         }
 
         // Otherwise treat as single Swift file
         if url.pathExtension.lowercased() == "swift" {
-            return await loadSwiftFile(resolvedPath, cwd: cwd, eventBus: eventBus, cacheDir: cacheDir, sdkPaths: sdkPaths)
+            return await loadSwiftFile(resolvedPath, cwd: cwd, eventBus: eventBus, cacheDir: cacheDir, sdkPaths: sdkPaths, toolRegistrationRegistry: toolRegistrationRegistry)
         }
 
         return LoadExtensionResult(error: .invalidExtension(path: path, reason: "Unsupported file format"))
@@ -153,7 +159,7 @@ public struct ExtensionLoader {
             }
         }
 
-        return results
+        return results.sorted()
     }
 
     // MARK: - Private
@@ -163,7 +169,8 @@ public struct ExtensionLoader {
         cwd: String,
         eventBus: EventBus,
         cacheDir: String,
-        sdkPaths: ExtensionCompiler.SDKPaths
+        sdkPaths: ExtensionCompiler.SDKPaths,
+        toolRegistrationRegistry: ToolRegistrationRegistry? = nil
     ) async -> LoadExtensionResult {
         do {
             let dylibPath = try await ExtensionCompiler.compileSingleFile(
@@ -175,7 +182,8 @@ public struct ExtensionLoader {
                 dylibPath: dylibPath,
                 extensionPath: resolvedPath,
                 eventBus: eventBus,
-                cwd: cwd
+                cwd: cwd,
+                toolRegistrationRegistry: toolRegistrationRegistry
             )
             return LoadExtensionResult(hook: hook)
         } catch let error as ExtensionLoadError {
@@ -189,7 +197,8 @@ public struct ExtensionLoader {
         _ resolvedPath: String,
         cwd: String,
         eventBus: EventBus,
-        cacheDir: String
+        cacheDir: String,
+        toolRegistrationRegistry: ToolRegistrationRegistry? = nil
     ) async -> LoadExtensionResult {
         do {
             let dylibPath = try await ExtensionCompiler.buildPackageDirectory(
@@ -200,7 +209,8 @@ public struct ExtensionLoader {
                 dylibPath: dylibPath,
                 extensionPath: resolvedPath,
                 eventBus: eventBus,
-                cwd: cwd
+                cwd: cwd,
+                toolRegistrationRegistry: toolRegistrationRegistry
             )
             return LoadExtensionResult(hook: hook)
         } catch let error as ExtensionLoadError {
@@ -253,13 +263,14 @@ public func loadExtensions(
     cwd: String,
     eventBus: EventBus,
     cacheDir: String,
-    sdkPaths: ExtensionCompiler.SDKPaths
+    sdkPaths: ExtensionCompiler.SDKPaths,
+    toolRegistrationRegistry: ToolRegistrationRegistry? = nil
 ) async -> LoadExtensionsResult {
     var hooks: [LoadedHook] = []
     var errors: [ExtensionLoadError] = []
 
     for path in paths {
-        let result = await ExtensionLoader.load(path, cwd: cwd, eventBus: eventBus, cacheDir: cacheDir, sdkPaths: sdkPaths)
+        let result = await ExtensionLoader.load(path, cwd: cwd, eventBus: eventBus, cacheDir: cacheDir, sdkPaths: sdkPaths, toolRegistrationRegistry: toolRegistrationRegistry)
         if let hook = result.hook {
             hooks.append(hook)
         }
@@ -278,7 +289,8 @@ public func discoverAndLoadExtensions(
     _ agentDir: String = getAgentDir(),
     _ eventBus: EventBus,
     includeProjectExtensions: Bool = true,
-    discoverDefaults: Bool = true
+    discoverDefaults: Bool = true,
+    toolRegistrationRegistry: ToolRegistrationRegistry? = nil
 ) async -> LoadExtensionsResult {
     // Resolve SDK paths -- if not available, skip extension loading. We log a warning
     // when extensions exist on disk but can't be compiled, so the failure is visible
@@ -332,5 +344,5 @@ public func discoverAndLoadExtensions(
         }
     }
 
-    return await loadExtensions(allPaths, cwd: cwd, eventBus: eventBus, cacheDir: cacheDir, sdkPaths: sdkPaths)
+    return await loadExtensions(allPaths, cwd: cwd, eventBus: eventBus, cacheDir: cacheDir, sdkPaths: sdkPaths, toolRegistrationRegistry: toolRegistrationRegistry)
 }

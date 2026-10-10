@@ -57,6 +57,7 @@ public struct CreateAgentSessionOptions: Sendable {
     /// `.all`: disable everything (no built-ins, no extensions, no custom tools).
     /// `.builtin`: keep extension/custom tools, disable only the default built-in set.
     public var noTools: NoToolsMode?
+    public var toolNameCollisionPolicy: ToolNameCollisionPolicy
     public var customTools: [CustomToolDefinition]?
     public var additionalCustomToolPaths: [String]?
     public var resourceLoader: ResourceLoader?
@@ -95,6 +96,7 @@ public struct CreateAgentSessionOptions: Sendable {
         toolNames: [String]? = nil,
         excludeTools: [String]? = nil,
         noTools: NoToolsMode? = nil,
+        toolNameCollisionPolicy: ToolNameCollisionPolicy = .overwrite,
         customTools: [CustomToolDefinition]? = nil,
         additionalCustomToolPaths: [String]? = nil,
         resourceLoader: ResourceLoader? = nil,
@@ -127,6 +129,7 @@ public struct CreateAgentSessionOptions: Sendable {
         self.toolNames = toolNames
         self.excludeTools = excludeTools
         self.noTools = noTools
+        self.toolNameCollisionPolicy = toolNameCollisionPolicy
         self.customTools = customTools
         self.additionalCustomToolPaths = additionalCustomToolPaths
         self.resourceLoader = resourceLoader
@@ -457,6 +460,8 @@ private func createLoadedHooksFromDefinitions(_ definitions: [HookDefinition], e
             shortcuts: api.shortcuts,
             tools: api.tools,
             currentTools: { api.tools },
+            currentToolOrder: { api.toolRegistrationOrder },
+            toolRegistrationErrors: api.toolRegistrationErrors,
             toolRenderers: api.toolRenderers,
             currentToolRenderers: { api.toolRenderers },
             providerRegistrations: api.providerRegistrations,
@@ -481,6 +486,8 @@ private func createLoadedHooksFromDefinitions(_ definitions: [HookDefinition], e
             setUnregisterVirtualModelHandler: api.setUnregisterVirtualModelHandler,
             setRegisterToolHandler: api.setRegisterToolHandler,
             setUnregisterToolHandler: api.setUnregisterToolHandler,
+            setRegisterOwnedToolHandler: api.setRegisterOwnedToolHandler,
+            setUnregisterOwnedToolHandler: api.setUnregisterOwnedToolHandler,
             setFlagValue: api.setFlagValue,
             dispose: api.disposeEventBusListeners
         )
@@ -519,8 +526,11 @@ private func createFactoryFromLoadedHook(_ loaded: LoadedHook) -> HookFactory {
         for shortcut in loaded.shortcuts.values {
             api.registerShortcut(shortcut.shortcut, description: shortcut.description, handler: shortcut.handler)
         }
-        for tool in loaded.tools.values {
-            api.registerTool(tool)
+        let tools = loaded.currentTools()
+        for name in loaded.currentToolOrder() {
+            if let tool = tools[name] {
+                api.registerTool(tool)
+            }
         }
         for provider in loaded.providerRegistrations.values {
             api.registerProvider(provider)
@@ -609,13 +619,41 @@ public func createAgentSession(_ options: CreateAgentSessionOptions = CreateAgen
             globalEntries: globalExtensionEntries, projectEntries: projectExtensionEntries,
             globalBaseDir: agentDir, projectBaseDir: projectExtensionBaseDir).enabled)
     }
-    let loadInlineExtensions: @Sendable () -> LoadExtensionsResult = {
+    var customToolsResult: CustomToolsLoadResult
+    if options.noTools == .all, options.toolNames == nil {
+        // v0.68.0/v0.70.0: --no-tools disables extension/custom tools too. Don't load any.
+        customToolsResult = CustomToolsLoadResult(tools: [], errors: [])
+    } else if let customTools = options.customTools {
+        let loadedTools = customTools.map { definition in
+            let path = definition.path ?? "<inline>"
+            return LoadedCustomTool(path: path, resolvedPath: path, tool: definition.tool)
+        }
+        customToolsResult = CustomToolsLoadResult(tools: loadedTools, errors: [])
+    } else {
+        let configuredPaths = settingsManager.getCustomTools() + (options.additionalCustomToolPaths ?? [])
+        let builtInToolNames = ToolName.allCases.map(\.rawValue)
+        customToolsResult = discoverAndLoadCustomTools(configuredPaths, cwd, builtInToolNames, agentDir, eventBus)
+        for error in customToolsResult.errors {
+            writeStderr("Failed to load custom tool \"\(error.path)\": \(error.error)\n")
+        }
+    }
+
+    let toolRegistrationRegistry = ToolRegistrationRegistry(collisionPolicy: options.toolNameCollisionPolicy)
+    for name in ToolName.allCases.map(\.rawValue) {
+        _ = toolRegistrationRegistry.register(name: name, ownerPath: BUILTIN_PATH_PREFIX + name)
+    }
+    for loaded in customToolsResult.tools {
+        if let error = toolRegistrationRegistry.register(name: loaded.tool.name, ownerPath: loaded.path, exposure: loaded.tool.exposure ?? .direct) {
+            throw error
+        }
+    }
+    let loadInlineExtensions: @Sendable (ToolRegistrationRegistry) -> LoadExtensionsResult = { registry in
         var hooks: [LoadedHook] = []
         var errors: [ExtensionLoadError] = explicitBuiltinPaths.subtracting(knownBuiltinPaths).sorted().map {
             .invalidExtension(path: $0, reason: "Unknown built-in extension: \($0)")
         }
         for inlineExtension in selectedInlineExtensions {
-            let result = ExtensionLoader.load(inlineExtension, cwd: cwd, eventBus: eventBus)
+            let result = ExtensionLoader.load(inlineExtension, cwd: cwd, eventBus: eventBus, toolRegistrationRegistry: registry)
             if let hook = result.hook {
                 hooks.append(hook)
             }
@@ -631,13 +669,14 @@ public func createAgentSession(_ options: CreateAgentSessionOptions = CreateAgen
         agentDir,
         eventBus,
         includeProjectExtensions: projectTrusted,
-        discoverDefaults: !noExtensions
+        discoverDefaults: !noExtensions,
+        toolRegistrationRegistry: toolRegistrationRegistry
     )
     time("discoverAndLoadExtensions")
     for error in extensionResult.errors {
         writeStderr("Failed to load extension: \(error.localizedDescription)\n")
     }
-    let inlineExtensionResult = loadInlineExtensions()
+    let inlineExtensionResult = loadInlineExtensions(toolRegistrationRegistry)
     for error in inlineExtensionResult.errors {
         writeStderr("Failed to load inline extension: \(error.localizedDescription)\n")
     }
@@ -649,16 +688,25 @@ public func createAgentSession(_ options: CreateAgentSessionOptions = CreateAgen
     // Captures the same paths/cwd/agentDir/eventBus the initial load used. SDK extension
     // resolution is repeated inside discoverAndLoadExtensions so it picks up newly-installed
     // SDKs too.
+    let startupCustomTools = customToolsResult.tools
     let reloadExtensionsHook: @Sendable () async -> LoadExtensionsResult = {
+        let registry = ToolRegistrationRegistry(collisionPolicy: options.toolNameCollisionPolicy)
+        for name in ToolName.allCases.map(\.rawValue) {
+            _ = registry.register(name: name, ownerPath: BUILTIN_PATH_PREFIX + name)
+        }
+        for loaded in startupCustomTools {
+            _ = registry.register(name: loaded.tool.name, ownerPath: loaded.path, exposure: loaded.tool.exposure ?? .direct)
+        }
         let fileExtensions = await discoverAndLoadExtensions(
             extensionPaths,
             cwd,
             agentDir,
             eventBus,
             includeProjectExtensions: projectTrusted,
-            discoverDefaults: !noExtensions
+            discoverDefaults: !noExtensions,
+            toolRegistrationRegistry: registry
         )
-        let inlineExtensions = loadInlineExtensions()
+        let inlineExtensions = loadInlineExtensions(registry)
         let replaced = omitReplacedExtensions(fileExtensions.hooks + inlineExtensions.hooks)
         return LoadExtensionsResult(hooks: replaced.hooks,
             errors: fileExtensions.errors + inlineExtensions.errors,
@@ -806,25 +854,6 @@ public func createAgentSession(_ options: CreateAgentSessionOptions = CreateAgen
     let allBuiltInToolsMap = createAllTools(cwd: cwd, options: toolsOptions, subagentContext: subagentContext)
     time("createCodingTools")
 
-    var customToolsResult: CustomToolsLoadResult
-    if options.noTools == .all, options.toolNames == nil {
-        // v0.68.0/v0.70.0: --no-tools disables extension/custom tools too. Don't load any.
-        customToolsResult = CustomToolsLoadResult(tools: [], errors: [])
-    } else if let customTools = options.customTools {
-        let loadedTools = customTools.map { definition in
-            let path = definition.path ?? "<inline>"
-            return LoadedCustomTool(path: path, resolvedPath: path, tool: definition.tool)
-        }
-        customToolsResult = CustomToolsLoadResult(tools: loadedTools, errors: [])
-    } else {
-        let configuredPaths = settingsManager.getCustomTools() + (options.additionalCustomToolPaths ?? [])
-        let builtInToolNames = createAllTools(cwd: cwd, options: toolsOptions, subagentContext: subagentContext).keys.map { $0.rawValue }
-        customToolsResult = discoverAndLoadCustomTools(configuredPaths, cwd, builtInToolNames, agentDir, eventBus)
-        for error in customToolsResult.errors {
-            writeStderr("Failed to load custom tool \"\(error.path)\": \(error.error)\n")
-        }
-    }
-
     let getCustomToolContext: @Sendable (String, CancellationToken?) -> CustomToolContext = { [sessionManager, modelRegistry, eventBus] toolCallId, signal in
         let agent = agentBox.withLock { $0 }
         let session = sessionBox.withLock { $0 }
@@ -862,13 +891,19 @@ public func createAgentSession(_ options: CreateAgentSessionOptions = CreateAgen
 
     // Tools registered by extensions via `pi.registerTool(_:)`. Wrapped through the same
     // CustomTool→AgentTool bridge as settings-defined custom tools.
-    let extensionTools = hookRunner.getExtensionTools()
-    let extensionToolDefinitions = extensionTools.map { tool in
-        LoadedCustomTool(path: "<extension>", resolvedPath: "<extension>", tool: tool)
-    }
+    let extensionToolDefinitions = hookRunner.getExtensionToolDefinitions()
     let wrappedExtensionTools = wrapCustomTools(extensionToolDefinitions, contextFactory: getCustomToolContext)
         .filter { !excludedTools.matches($0.name) }
 
+    var toolOwnerPaths = Dictionary(uniqueKeysWithValues: allBuiltInToolsMap.keys.map {
+        ($0.rawValue, BUILTIN_PATH_PREFIX + $0.rawValue)
+    })
+    for loaded in customToolsResult.tools + extensionToolDefinitions {
+        if options.toolNameCollisionPolicy == .reject, let owner = toolOwnerPaths[loaded.tool.name] {
+            throw HookAPIError.toolNameCollision(name: loaded.tool.name, ownerPath: owner, path: loaded.path)
+        }
+        toolOwnerPaths[loaded.tool.name] = loaded.path
+    }
     var toolRegistry: [String: AgentTool] = [:]
     for (name, tool) in allBuiltInToolsMap {
         toolRegistry[name.rawValue] = tool
@@ -1116,6 +1151,8 @@ public func createAgentSession(_ options: CreateAgentSessionOptions = CreateAgen
         toolRegistry: toolRegistry,
         toolRegistryOrder: toolRegistryOrder,
         toolDefinitions: toolDefinitions,
+        toolOwnerPaths: toolOwnerPaths,
+        toolNameCollisionPolicy: options.toolNameCollisionPolicy,
         rebuildSystemPrompt: rebuildSystemPrompt,
         reloadExtensionsHook: reloadExtensionsHook,
         wrapExtensionTools: { tools in
@@ -1138,5 +1175,12 @@ public func createAgentSession(_ options: CreateAgentSessionOptions = CreateAgen
     sendMessageHandlerBox.withLock { $0 = sendMessageHandler }
 
     return CreateAgentSessionResult(session: createdSession, customToolsResult: customToolsResult, modelFallbackMessage: modelFallbackMessage,
-        diagnostics: deduplicateDiagnostics(collectSettingsDiagnostics(settingsManager) + extensionResult.warnings + inlineExtensionResult.warnings + replacementResult.warnings))
+        diagnostics: deduplicateDiagnostics(collectSettingsDiagnostics(settingsManager) + extensionResult.warnings + inlineExtensionResult.warnings + replacementResult.warnings +
+            (options.toolNameCollisionPolicy == .reject ? (extensionResult.errors + inlineExtensionResult.errors).map {
+                ResourceDiagnostic(type: "error", message: $0.localizedDescription)
+            } : []) + allLoadedHooks.flatMap { hook in
+                hook.toolRegistrationErrors.map { error in
+                    ResourceDiagnostic(type: "error", message: error.localizedDescription, path: hook.path)
+                }
+            }))
 }

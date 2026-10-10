@@ -46,6 +46,19 @@ public func toCodemodeIdentifier(_ name: String) -> String {
     return result.isEmpty ? "_" : result
 }
 
+/// Return a diagnostic when two names resolve to the same JavaScript property.
+public func codemodeToolIdentifierCollision(_ names: [String]) -> String? {
+    var namesByIdentifier: [String: String] = [:]
+    for name in names {
+        let identifier = toCodemodeIdentifier(name)
+        if let previous = namesByIdentifier[identifier] {
+            return "Tools \"\(previous)\" and \"\(name)\" use the same JavaScript identifier \"\(identifier)\"."
+        }
+        namesByIdentifier[identifier] = name
+    }
+    return nil
+}
+
 private func object(_ value: Any?) -> [String: Any]? { value as? [String: Any] }
 private func string(_ value: Any?) -> String? { value as? String }
 private func array(_ value: Any?) -> [Any]? { value as? [Any] }

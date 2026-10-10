@@ -20,7 +20,8 @@ public struct ExtensionDylibLoader {
         dylibPath: String,
         extensionPath: String,
         eventBus: EventBus,
-        cwd: String
+        cwd: String,
+        toolRegistrationRegistry: ToolRegistrationRegistry? = nil
     ) throws -> LoadedHook {
         // RTLD_LOCAL prevents symbol collisions between extensions
         guard let handle = dlopen(dylibPath, RTLD_NOW | RTLD_LOCAL) else {
@@ -39,7 +40,7 @@ public struct ExtensionDylibLoader {
 
         let entryPoint = unsafeBitCast(sym, to: (@convention(c) (UnsafeMutableRawPointer) -> Void).self)
 
-        let api = HookAPI(events: eventBus, hookPath: extensionPath)
+        let api = HookAPI(events: eventBus, hookPath: extensionPath, toolRegistrationRegistry: toolRegistrationRegistry)
         api.setExecCwd(cwd)
 
         // Keep the API alive for the lifetime of the process.
@@ -70,6 +71,8 @@ public struct ExtensionDylibLoader {
             shortcuts: api.shortcuts,
             tools: api.tools,
             currentTools: { api.tools },
+            currentToolOrder: { api.toolRegistrationOrder },
+            toolRegistrationErrors: api.toolRegistrationErrors,
             toolRenderers: api.toolRenderers,
             currentToolRenderers: { api.toolRenderers },
             providerRegistrations: api.providerRegistrations,
@@ -99,6 +102,8 @@ public struct ExtensionDylibLoader {
             setUnregisterVirtualModelHandler: api.setUnregisterVirtualModelHandler,
             setRegisterToolHandler: api.setRegisterToolHandler,
             setUnregisterToolHandler: api.setUnregisterToolHandler,
+            setRegisterOwnedToolHandler: api.setRegisterOwnedToolHandler,
+            setUnregisterOwnedToolHandler: api.setUnregisterOwnedToolHandler,
             setFlagValue: api.setFlagValue,
             dispose: api.disposeEventBusListeners,
             isExtension: true

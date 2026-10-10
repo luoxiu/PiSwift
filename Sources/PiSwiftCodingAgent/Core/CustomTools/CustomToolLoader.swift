@@ -39,7 +39,7 @@ private func discoverToolsInDir(_ dir: String) -> [String] {
         }
     }
 
-    return tools
+    return tools.sorted()
 }
 
 private func loadCustomTool(

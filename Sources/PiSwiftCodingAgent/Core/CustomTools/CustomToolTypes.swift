@@ -19,16 +19,23 @@ public enum ToolExposure: String, Sendable, Codable {
     case hidden
 }
 
+public enum ToolNameCollisionPolicy: String, Sendable, Codable {
+    case overwrite
+    case reject
+}
+
 public struct ToolNamespace: Sendable, Codable {
     public var name: String
     public var description: String?
+    public var version: String?
     /// Usage instructions returned when a tool describes this namespace.
     public var instructions: String?
 
-    public init(name: String, description: String? = nil, instructions: String? = nil) {
+    public init(name: String, description: String? = nil, instructions: String? = nil, version: String? = nil) {
         self.name = name
         self.description = description
         self.instructions = instructions
+        self.version = version
     }
 }
 

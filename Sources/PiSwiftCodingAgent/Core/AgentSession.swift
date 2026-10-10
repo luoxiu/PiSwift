@@ -80,6 +80,8 @@ public struct AgentSessionConfig: Sendable {
     public var toolRegistry: [String: AgentTool]?
     public var toolRegistryOrder: [String]?
     public var toolDefinitions: [String: CustomTool]?
+    public var toolOwnerPaths: [String: String]?
+    public var toolNameCollisionPolicy: ToolNameCollisionPolicy
     public var rebuildSystemPrompt: (@Sendable ([String]) -> String)?
     /// Re-discover and re-load extension dylibs. Wired by `createAgentSession()` so it
     /// uses the same paths/cwd/agentDir as the initial load. Invoked by
@@ -117,6 +119,8 @@ public struct AgentSessionConfig: Sendable {
         toolRegistry: [String: AgentTool]? = nil,
         toolRegistryOrder: [String]? = nil,
         toolDefinitions: [String: CustomTool]? = nil,
+        toolOwnerPaths: [String: String]? = nil,
+        toolNameCollisionPolicy: ToolNameCollisionPolicy = .overwrite,
         rebuildSystemPrompt: (@Sendable ([String]) -> String)? = nil,
         reloadExtensionsHook: (@Sendable () async -> LoadExtensionsResult)? = nil,
         wrapExtensionTools: (@Sendable ([CustomTool]) -> [AgentTool])? = nil,
@@ -144,6 +148,8 @@ public struct AgentSessionConfig: Sendable {
         self.toolRegistry = toolRegistry
         self.toolRegistryOrder = toolRegistryOrder
         self.toolDefinitions = toolDefinitions
+        self.toolOwnerPaths = toolOwnerPaths
+        self.toolNameCollisionPolicy = toolNameCollisionPolicy
         self.rebuildSystemPrompt = rebuildSystemPrompt
         self.reloadExtensionsHook = reloadExtensionsHook
         self.wrapExtensionTools = wrapExtensionTools
@@ -503,6 +509,8 @@ public final class AgentSession: Sendable {
         var toolRegistry: [String: AgentTool]
         var toolRegistryOrder: [String]
         var toolDefinitions: [String: CustomTool]
+        var toolOwnerPaths: [String: String]
+        var toolNameCollisionPolicy: ToolNameCollisionPolicy
         var hiddenDeclarations: Set<String> = []
         var nestedToolCalls: NestedToolCallRunner?
         var rebuildSystemPrompt: (@Sendable ([String]) -> String)?
@@ -854,6 +862,14 @@ public final class AgentSession: Sendable {
             initialTools.map { ($0.name, $0) }, uniquingKeysWith: { _, newer in newer })
         let initialRegistryOrder = config.toolRegistryOrder ??
             (config.toolRegistry == nil ? initialTools.map(\.name) : initialRegistry.keys.sorted())
+        var initialOwnerPaths = Dictionary(uniqueKeysWithValues: initialRegistry.keys.map { name in
+            (name, ToolName(rawValue: name) == nil ? "<sdk:\(name)>" : BUILTIN_PATH_PREFIX + name)
+        })
+        for loaded in (config.customTools ?? []) + (config.hookRunner?.getExtensionToolDefinitions() ?? []) {
+            if initialRegistry[loaded.tool.name] != nil {
+                initialOwnerPaths[loaded.tool.name] = loaded.path
+            }
+        }
         self.agent = config.agent
         self.sessionManager = config.sessionManager
         self.settingsManager = config.settingsManager
@@ -905,6 +921,8 @@ public final class AgentSession: Sendable {
             toolRegistry: initialRegistry,
             toolRegistryOrder: initialRegistryOrder,
             toolDefinitions: config.toolDefinitions ?? [:],
+            toolOwnerPaths: config.toolOwnerPaths ?? initialOwnerPaths,
+            toolNameCollisionPolicy: config.toolNameCollisionPolicy,
             rebuildSystemPrompt: config.rebuildSystemPrompt,
             toolPromptSnippets: [:],
             toolPromptGuidelines: ((config.customTools ?? []).map(\.tool) +
@@ -1095,8 +1113,12 @@ public final class AgentSession: Sendable {
             setThinkingLevelHandler: { [weak self] level in
                 self?.setThinkingLevel(level)
             },
-            registerToolHandler: { [weak self] tool in self?.registerLiveExtensionTool(tool) },
-            unregisterToolHandler: { [weak self] name in self?.unregisterLiveExtensionTool(name) },
+            registerOwnedToolHandler: { [weak self] tool, path in
+                self?.registerLiveExtensionTool(tool, ownerPath: path) ?? .failure(.inactive(path))
+            },
+            unregisterOwnedToolHandler: { [weak self] name, path in
+                self?.unregisterLiveExtensionTool(name, ownerPath: path)
+            },
             sendUserMessageHandler: { [weak self] content, options in
                 Task { [weak self] in
                     guard let self else { return }
@@ -2105,21 +2127,28 @@ public final class AgentSession: Sendable {
     }
 
     public func getAllTools() -> [ToolInfo] {
-        registeredTools().map { tool in
-            let definition = toolDefinitions[tool.name]
-            let customPath = customToolsInternal.first { $0.tool.name == tool.name }?.path
-            let source = _hookRunner?.getToolSourceInfo(tool.name) ??
-                (customPath.map { path in SourceInfo(path: path,
-                    source: getSyntheticPathSource(path) ?? "custom", scope: "user", origin: "top-level") } ??
-                 (ToolName(rawValue: tool.name) == nil
-                    ? SourceInfo(path: "<sdk:\(tool.name)>", source: "sdk", scope: "temporary", origin: "top-level")
-                    : SourceInfo(path: BUILTIN_PATH_PREFIX + tool.name, source: "builtin",
-                                 scope: "user", origin: "top-level")))
+        let snapshot = state.withLock { current in
+            (current.toolRegistryOrder.compactMap { current.toolRegistry[$0] },
+             current.toolDefinitions, current.toolOwnerPaths, current.customToolsInternal)
+        }
+        let hookPaths = Set(_hookRunner?.getExtensionHookPaths() ?? [])
+        return snapshot.0.map { tool in
+            let definition = snapshot.1[tool.name]
+            let ownerPath = snapshot.2[tool.name]
+            let source = ownerPath.map { path in
+                let isExtension = hookPaths.contains(path)
+                let isCustom = snapshot.3.contains { $0.path == path }
+                return SourceInfo(path: path,
+                    source: getSyntheticPathSource(path) ?? (isExtension ? "extension:" + URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent : "custom"),
+                    scope: isExtension || (!isCustom && ToolName(rawValue: tool.name) == nil) ? "temporary" : "user",
+                    origin: "top-level")
+            }
             return ToolInfo(name: tool.name, description: definition?.description ?? tool.description,
                             sourceInfo: source, parameters: definition?.parameters ?? tool.parameters,
                             promptGuidelines: definition?.promptGuidelines ?? builtInToolPrompt[tool.name]?.guidelines,
                             exposure: definition?.exposure ?? .direct,
-                            namespace: definition?.namespace, annotations: definition?.annotations)
+                            namespace: definition?.namespace, annotations: definition?.annotations,
+                            ownerPath: ownerPath)
         }
     }
 
@@ -2228,8 +2257,7 @@ public final class AgentSession: Sendable {
                 descriptions.merge(changes?.descriptions ?? [:]) { _, new in new }
                 hidden.formUnion(changes?.hiddenDeclarations ?? [])
             } catch {
-                let path = _hookRunner?.getToolSourceInfo(tool.name)?.path ??
-                    customToolsInternal.first { $0.tool.name == tool.name }?.path ?? "<sdk:\(tool.name)>"
+                let path = state.withLock { $0.toolOwnerPaths[tool.name] } ?? "<sdk:\(tool.name)>"
                 _hookRunner?.emitError(HookError(hookPath: path, event: "prepare_loadout",
                                                  error: error.localizedDescription))
             }
@@ -2246,17 +2274,43 @@ public final class AgentSession: Sendable {
     /// Apply a tool registered after session creation. This is used by MCP
     /// metadata refreshes and gives inline extensions the same live tool
     /// surface as reloaded extensions.
-    private func registerLiveExtensionTool(_ tool: CustomTool) {
-        guard isAllowedTool(tool.name), let wrapped = wrapExtensionToolsInternal?([tool]).first else { return }
-        var registry = toolRegistry
-        registry[wrapped.name] = wrapped
-        toolRegistry = registry
-        if !toolRegistryOrder.contains(wrapped.name) { toolRegistryOrder.append(wrapped.name) }
-        var definitions = toolDefinitions
-        definitions[tool.name] = tool
-        toolDefinitions = definitions
-        state.withLock { $0.toolPromptGuidelines[tool.name] = tool.promptGuidelines }
-
+    private func registerLiveExtensionTool(_ tool: CustomTool, ownerPath: String) -> Result<Void, HookAPIError> {
+        guard isAllowedTool(tool.name), let wrapped = wrapExtensionToolsInternal?([tool]).first else {
+            return .success(())
+        }
+        let collision = state.withLock { current -> HookAPIError? in
+            if current.toolNameCollisionPolicy == .reject, current.toolRegistry[tool.name] != nil {
+                let owner = current.toolOwnerPaths[tool.name] ?? "<sdk:\(tool.name)>"
+                return .toolNameCollision(name: tool.name, ownerPath: owner, path: ownerPath)
+            }
+            if current.toolNameCollisionPolicy == .reject, hasCodemodeIdentifier(tool.exposure ?? .direct) {
+                let identifier = toCodemodeIdentifier(tool.name)
+                for name in current.toolRegistryOrder {
+                    guard current.toolRegistry[name] != nil,
+                          hasCodemodeIdentifier(current.toolDefinitions[name]?.exposure ?? .direct) else {
+                        continue
+                    }
+                    if toCodemodeIdentifier(name) == identifier {
+                        return .toolIdentifierCollision(identifier: identifier, name: tool.name,
+                            ownerName: name, ownerPath: current.toolOwnerPaths[name] ?? "<sdk:\(name)>",
+                            path: ownerPath)
+                    }
+                }
+            }
+            current.toolRegistry[wrapped.name] = wrapped
+            current.toolOwnerPaths[tool.name] = ownerPath
+            current.toolDefinitions[tool.name] = tool
+            if !current.toolRegistryOrder.contains(wrapped.name) {
+                current.toolRegistryOrder.append(wrapped.name)
+            }
+            current.toolPromptGuidelines[tool.name] = tool.promptGuidelines
+            return nil
+        }
+        if let collision {
+            _hookRunner?.emitError(HookError(hookPath: ownerPath, event: "register_tool",
+                                            error: collision.localizedDescription))
+            return .failure(collision)
+        }
         var activeNames = getActiveToolNames()
         if state.withLock({ $0.allowedTools != nil }) {
             activeNames += toolRegistryOrder.filter(isActivatedOnRegistration)
@@ -2266,17 +2320,24 @@ public final class AgentSession: Sendable {
         }
         setActiveTools(activeNames)
         refreshSystemPromptForActiveTools()
+        return .success(())
     }
 
-    private func unregisterLiveExtensionTool(_ name: String) {
-        var registry = toolRegistry
-        registry.removeValue(forKey: name)
-        toolRegistry = registry
-        toolRegistryOrder.removeAll { $0 == name }
-        var definitions = toolDefinitions
-        definitions.removeValue(forKey: name)
-        toolDefinitions = definitions
-        state.withLock { $0.toolPromptGuidelines[name] = nil }
+    private func unregisterLiveExtensionTool(_ name: String, ownerPath: String) {
+        let removed = state.withLock { current in
+            guard current.toolOwnerPaths[name] == ownerPath else {
+                return false
+            }
+            current.toolOwnerPaths[name] = nil
+            current.toolRegistry.removeValue(forKey: name)
+            current.toolRegistryOrder.removeAll { $0 == name }
+            current.toolDefinitions.removeValue(forKey: name)
+            current.toolPromptGuidelines[name] = nil
+            return true
+        }
+        guard removed else {
+            return
+        }
         setActiveTools(getActiveToolNames().filter { $0 != name })
         refreshSystemPromptForActiveTools()
     }
@@ -2364,6 +2425,12 @@ public final class AgentSession: Sendable {
 
         // 4. Swap. Returns the paths that were dropped so the caller can log them.
         let dropped = hookRunner.replaceExtensionHooks(result.hooks)
+        for hook in result.hooks {
+            for error in hook.toolRegistrationErrors {
+                hookRunner.emitError(HookError(hookPath: hook.path, event: "register_tool",
+                                               error: error.localizedDescription))
+            }
+        }
 
         // 5. Refresh extension tools on the agent: drop the old, add the new.
         if let wrap = wrapExtensionToolsInternal {
@@ -2389,10 +2456,21 @@ public final class AgentSession: Sendable {
                     registry[tool.name] = tool
                     if !order.contains(tool.name) { order.append(tool.name) }
                 }
-                toolRegistry = registry
-                toolRegistryOrder = order
-                for tool in newExtensionTools { definitions[tool.name] = tool }
-                toolDefinitions = definitions
+                for tool in newExtensionTools {
+                    definitions[tool.name] = tool
+                }
+                let loadedDefinitions = hookRunner.getExtensionToolDefinitions().filter { isAllowedTool($0.tool.name) }
+                state.withLock { current in
+                    current.toolRegistry = registry
+                    current.toolRegistryOrder = order
+                    current.toolDefinitions = definitions
+                    for name in removedToolNames {
+                        current.toolOwnerPaths[name] = nil
+                    }
+                    for loaded in loadedDefinitions {
+                        current.toolOwnerPaths[loaded.tool.name] = loaded.path
+                    }
+                }
 
                 var activeNames = getActiveToolNames().filter { !removedToolNames.contains($0) }
                 for tool in wrappedNew where !activeNames.contains(tool.name) && isActivatedOnRegistration(tool.name) {

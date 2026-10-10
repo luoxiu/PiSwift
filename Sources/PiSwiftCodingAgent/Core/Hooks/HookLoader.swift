@@ -104,6 +104,8 @@ private func loadHook(_ hookPath: String, cwd: String, eventBus: EventBus) -> (h
             shortcuts: api.shortcuts,
             tools: api.tools,
             currentTools: { api.tools },
+            currentToolOrder: { api.toolRegistrationOrder },
+            toolRegistrationErrors: api.toolRegistrationErrors,
             toolRenderers: api.toolRenderers,
             currentToolRenderers: { api.toolRenderers },
             providerRegistrations: api.providerRegistrations,
@@ -130,6 +132,10 @@ private func loadHook(_ hookPath: String, cwd: String, eventBus: EventBus) -> (h
             setGetMcpServersHandler: api.setGetMcpServersHandler,
             setRegisterVirtualModelHandler: api.setRegisterVirtualModelHandler,
             setUnregisterVirtualModelHandler: api.setUnregisterVirtualModelHandler,
+            setRegisterToolHandler: api.setRegisterToolHandler,
+            setUnregisterToolHandler: api.setUnregisterToolHandler,
+            setRegisterOwnedToolHandler: api.setRegisterOwnedToolHandler,
+            setUnregisterOwnedToolHandler: api.setUnregisterOwnedToolHandler,
             setFlagValue: api.setFlagValue,
             dispose: api.disposeEventBusListeners
         )
