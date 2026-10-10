@@ -15,6 +15,47 @@ in the sibling `../PiSwiftTui` package so this package stays suitable for mobile
 applications. See
 `AGENT_HARNESS_API_BOUNDARY.md` for the parity decision.
 
+## Code mode host controls
+
+Hosts can set limits without changes to script source:
+
+```swift
+let codeMode = createCodemodeExtension(options: CodemodeExtensionOptions(
+    mode: .on,
+    defaultTimeoutMs: 60_000,
+    maxTimeoutMs: 600_000,
+    validationErrorPrefix: "validation: "
+))
+```
+
+`defaultTimeoutMs` and `maxTimeoutMs` are optional. The same fields are available
+in `CodemodeSettings` and the `codemode` settings object. Extension options take
+precedence over settings. A script can request a timeout on its first line:
+`// @options: {"timeout_ms": 600000}`. A request above the host maximum fails with
+an error that gives the maximum. With both options unset, the existing timeout
+behavior stays in use. A host timeout ends the wait. It cannot guarantee that
+a JavaScriptCore thread or a native operation has stopped on iOS.
+
+After a script ends, later bridge calls are rejected before tool dispatch.
+Their bounded call records use `rejected_after_end`. `CodemodeRuntimeResult.rejectedCalls`
+remains available for attempts after the host returns. The built-in extension saves
+late call details as `codemode-late-call` session entries, with the parent tool-call
+ID and the call row. It retains at most 128 such rows per execution, with bounded
+argument and error previews. A late bridge call also rejects its JavaScript promise.
+For a native operation whose result is uncertain, return `AgentToolResult.details` with `{"outcome": "unknown"}`.
+Code mode records `outcome_unknown` and lists these calls separately in error and
+abort summaries. The caller must inspect the operation before a retry. Keep an
+existing error prefix in the result text. The optional `validationErrorPrefix`
+applies to code mode argument-schema failures before the host tool hook runs.
+
+Set `CreateAgentSessionOptions.toolNameCollisionPolicy` to `.reject` to reject
+duplicate tool names and JavaScript identifiers such as `edit-node` and
+`edit_node`. The default is `.overwrite` for compatibility. A rejected extension
+registration returns `HookAPIError` and produces a diagnostic. Extension tools
+retain registration order. `ToolInfo.ownerPath` identifies the owner of the
+executable registration, including live replacements. `ToolNamespace.version`
+is optional and appears as `version` in `describeNamespace` output.
+
 ## MCP adapter extension
 
 `PiMCPAdapter` is an opt-in inline extension. Applications provide MCP
