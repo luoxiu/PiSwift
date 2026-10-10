@@ -4,6 +4,7 @@ import PiSwiftAgent
 
 public let CODEMODE_TOOL_NAME = "codemode"
 public let CODEMODE_STORE_ENTRY_TYPE = "codemode-store"
+public let CODEMODE_LATE_CALL_ENTRY_TYPE = "codemode-late-call"
 
 public struct CodemodeStoreEntryData: Sendable {
     public var set: [String: AnyCodable]
@@ -27,6 +28,8 @@ public struct CodemodeToolOptions: Sendable {
     /// Tool rules shown by describeTool(), searchTools(), and ALL_TOOLS.
     public var getToolGuidelines: (@Sendable () -> [String: [String]])?
     public var appendEntry: (@Sendable (String, CodemodeStoreEntryData) -> Void)?
+    /// Persist a bounded call update that arrives after the script result.
+    public var recordLateCall: (@Sendable (String, CodemodeNestedCall) -> Void)?
     public var getMode: (@Sendable () -> CodemodeMode)?
     public var getInlineBudget: (@Sendable () -> Double?)?
     /// A test can supply a model runtime without a full session.
@@ -44,7 +47,8 @@ public struct CodemodeToolOptions: Sendable {
                 maxTimeoutMs: Int? = nil,
                 validationErrorPrefix: String? = nil,
                 getDefaultTimeoutMs: (@Sendable () -> Int?)? = nil,
-                getMaxTimeoutMs: (@Sendable () -> Int?)? = nil) {
+                getMaxTimeoutMs: (@Sendable () -> Int?)? = nil,
+                recordLateCall: (@Sendable (String, CodemodeNestedCall) -> Void)? = nil) {
         self.models = models
         self.collisionPolicy = collisionPolicy
         self.defaultTimeoutMs = defaultTimeoutMs
@@ -55,6 +59,7 @@ public struct CodemodeToolOptions: Sendable {
         self.getToolNamespace = getToolNamespace
         self.getToolGuidelines = getToolGuidelines
         self.appendEntry = appendEntry
+        self.recordLateCall = recordLateCall
         self.getMode = getMode
         self.getInlineBudget = getInlineBudget
         self.modelRuntime = modelRuntime

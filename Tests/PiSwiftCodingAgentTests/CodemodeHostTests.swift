@@ -23,6 +23,38 @@ private func hostText(_ result: AgentToolResult) -> String {
     }.joined(separator: "\n")
 }
 
+private func hostWaitUntil(_ predicate: @escaping @Sendable () -> Bool) async throws {
+    for _ in 0..<100 {
+        if predicate() {
+            return
+        }
+        try await Task.sleep(for: .milliseconds(50))
+    }
+}
+
+private actor HostNativeRelease {
+    private var released = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if released {
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func release() {
+        guard !released else {
+            return
+        }
+        released = true
+        for waiter in waiters {
+            waiter.resume()
+        }
+        waiters.removeAll()
+    }
+}
+
 @Test(.timeLimit(.minutes(1))) func codemodeHostTimeoutOptions() async throws {
     #expect(CodemodeToolOptions().defaultTimeoutMs == nil)
     #expect(CodemodeToolOptions().maxTimeoutMs == nil)
@@ -82,7 +114,9 @@ private func hostText(_ result: AgentToolResult) -> String {
             return { run() {
                 bridge("done", "true", "null", "[]");
                 for (let i = 0; i < 300; i++) {
-                    bridge("call", String(i), "late", "x".repeat(1000));
+                    try {
+                        bridge("call", String(i), "late", "x".repeat(1000));
+                    } catch {}
                 }
             }, settle() {}, stalled() {} };
         })
@@ -126,7 +160,7 @@ func codemodeHostDisablesLateCallsAfterTimeoutOrAbort(abort: Bool) async throws 
     }
     let result = await task.value
     #expect(result.execution.failure?.kind == (abort ? .aborted : .timeout))
-    try await Task.sleep(for: .milliseconds(600))
+    try await hostWaitUntil { !result.rejectedCalls.isEmpty }
     #expect(dispatches.withLock { $0 } == 0)
     #expect(result.rejectedCalls.count == 1)
 }
@@ -175,6 +209,7 @@ func codemodeHostDisablesLateCallsAfterTimeoutOrAbort(abort: Bool) async throws 
     let signal = CancellationToken()
     let dispatches = LockedState(0)
     let statuses = LockedState<[String]>([])
+    let caught = LockedState(false)
     let tool = AgentTool(label: "ready", name: "ready", description: "Ready", parameters: [:]) {
         _, _, _, _ in AgentToolResult(content: [])
     }
@@ -188,15 +223,19 @@ func codemodeHostDisablesLateCallsAfterTimeoutOrAbort(abort: Bool) async throws 
                                    result: AgentToolResult(content: []), isError: false)
     }
     let result = try await executeCodemode(toolCallId: "late-abort",
-        params: ["code": AnyCodable("await tools.ready({}); const end = Date.now() + 400; while (Date.now() < end) {} await tools.ready({})")],
+        params: ["code": AnyCodable("await tools.ready({}); const end = Date.now() + 400; while (Date.now() < end) {} try { await tools.ready({}) } catch (e) { await tools.ready({caught: e.message}) }")],
         signal: signal, onUpdate: { result in
             let rows = (result.details?.value as? [String: Any])?["calls"] as? [[String: Any]] ?? []
             statuses.withLock { $0 = rows.compactMap { $0["status"] as? String } }
+            if rows.contains(where: { ($0["args"] as? String)?.contains("caught") == true }) {
+                caught.withLock { $0 = true }
+            }
         }, context: context, forceWatchdog: true)
     #expect(result.isError == true)
-    try await Task.sleep(for: .milliseconds(600))
+    try await hostWaitUntil { caught.withLock { $0 } }
     #expect(dispatches.withLock { $0 } == 1)
     #expect(statuses.withLock { $0 }.contains("rejected_after_end"))
+    #expect(caught.withLock { $0 })
 }
 
 @Test(.timeLimit(.minutes(1))) func codemodeHostNamespaceIncludesCatalogVersion() async throws {
@@ -239,6 +278,12 @@ func codemodeHostDisablesLateCallsAfterTimeoutOrAbort(abort: Bool) async throws 
 @Test(.timeLimit(.minutes(1)), arguments: [false, true])
 func codemodeHostAbandonedNativeCallRemainsUnknownAndPublishesLateOutcome(abort: Bool) async throws {
     let signal = CancellationToken()
+    let release = HostNativeRelease()
+    defer {
+        Task {
+            await release.release()
+        }
+    }
     let dispatches = LockedState(0)
     let latest = LockedState<[[String: AnyCodable]]>([])
     let tool = AgentTool(label: "change", name: "change", description: "Change", parameters: [:]) {
@@ -249,7 +294,7 @@ func codemodeHostAbandonedNativeCallRemainsUnknownAndPublishesLateOutcome(abort:
         if abort {
             signal.cancel()
         }
-        try? await Task.sleep(for: .milliseconds(700))
+        await release.wait()
         return AgentToolCallOutcome(toolCall: AgentToolCall(id: "late-native-1", name: name, arguments: args),
             result: AgentToolResult(content: [.text(TextContent(text: "outcome_unknown: inspect late-native-1"))],
                                     details: AnyCodable(["outcome": "unknown"])), isError: true)
@@ -259,15 +304,87 @@ func codemodeHostAbandonedNativeCallRemainsUnknownAndPublishesLateOutcome(abort:
         onUpdate: { result in
             let rows = (result.details?.value as? [String: Any])?["calls"] as? [[String: Any]] ?? []
             latest.withLock { $0 = rows.map { $0.mapValues(AnyCodable.init) } }
-        }, context: context, options: CodemodeToolOptions(defaultTimeoutMs: abort ? 2_000 : 400),
+        }, context: context, options: CodemodeToolOptions(defaultTimeoutMs: 3_000),
         forceWatchdog: true)
+    await release.release()
     #expect(result.isError == true)
     #expect(dispatches.withLock { $0 } == 1)
     let rows = (result.details?.value as? [String: Any])?["calls"] as? [[String: Any]]
     #expect(rows?.first?["status"] as? String == "outcome_unknown")
     #expect(hostText(result).contains("outcome unknown — inspect before retrying: change"))
-    try await Task.sleep(for: .milliseconds(900))
+    try await hostWaitUntil { latest.withLock { $0.first?["id"]?.value as? String } == "late-native-1" }
     #expect(latest.withLock { $0.first?["status"]?.value as? String } == "outcome_unknown")
     #expect(latest.withLock { $0.first?["id"]?.value as? String } == "late-native-1")
     #expect(latest.withLock { $0.first?["error"]?.value as? String } == "outcome_unknown: inspect late-native-1")
+}
+
+@Test(.timeLimit(.minutes(1))) func codemodeHostExtensionPersistsLateNativeOutcomeAfterAbort() async throws {
+    let model = getModel(provider: .openai, modelId: "gpt-4o-mini")
+    let auth = AuthStorage(":memory:")
+    auth.setRuntimeApiKey(model.provider, "test")
+    let manager = SessionManager.inMemory()
+    let agent = LockedState<Agent?>(nil)
+    let native = InlineExtension(name: "late-native") { api in
+        _ = api.registerTool(CustomTool(name: "change", label: "change", description: "Change",
+            parameters: [:], execute: { _, _, _, _, _ in
+                Task {
+                    try? await Task.sleep(for: .milliseconds(50))
+                    agent.withLock { $0 }?.abort()
+                }
+                try? await Task.sleep(for: .milliseconds(500))
+                return AgentToolResult(content: [.text(TextContent(text: "outcome_unknown: inspect native-1"))],
+                                       details: AnyCodable(["outcome": "unknown"]), isError: true)
+            }, exposure: .codemode))
+    }
+    let created = try await createAgentSession(CreateAgentSessionOptions(authStorage: auth,
+        model: model, offline: true, toolNames: ["codemode", "change"], resourceLoader: TestResourceLoader(),
+        inlineExtensions: [createCodemodeExtension(), native], sessionManager: manager,
+        settingsManager: .inMemory()))
+    agent.withLock { $0 = created.session.agent }
+    defer {
+        agent.withLock { $0 = nil }
+        created.session.dispose()
+    }
+    let responses = LockedState(0)
+    created.session.agent.streamFn = { model, _, _ in
+        let turn = responses.withLock { count in
+            count += 1
+            return count
+        }
+        let stream = AssistantMessageEventStream()
+        let content: [ContentBlock] = turn == 1
+            ? [.toolCall(ToolCall(id: "outer-late", name: "codemode",
+                                 arguments: ["code": AnyCodable("await tools.change({})")]))]
+            : [.text(TextContent(text: "done"))]
+        let reason: StopReason = turn == 1 ? .toolUse : .stop
+        let message = AssistantMessage(content: content,
+            api: model.api, provider: model.provider, model: model.id,
+            usage: Usage(input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0), stopReason: reason)
+        stream.push(.done(reason: reason, message: message))
+        stream.end(message)
+        return stream
+    }
+    try await created.session.prompt("change")
+    try await hostWaitUntil {
+        manager.getBranch().contains { entry in
+            if case .custom(let value) = entry {
+                return value.customType == CODEMODE_LATE_CALL_ENTRY_TYPE
+            }
+            return false
+        }
+    }
+    let late = manager.getBranch().compactMap { entry -> CustomEntry? in
+        if case .custom(let value) = entry, value.customType == CODEMODE_LATE_CALL_ENTRY_TYPE {
+            return value
+        }
+        return nil
+    }
+    let entry = try #require(late.first)
+    let data = try #require(entry.data?.value as? [String: Any])
+    #expect(data["parentToolCallId"] as? String == "outer-late")
+    let row = try #require(data["call"] as? [String: Any])
+    #expect(row["name"] as? String == "change")
+    #expect(row["status"] as? String == "outcome_unknown")
+    #expect(row["error"] as? String == "outcome_unknown: inspect native-1")
+    #expect(late.count <= 128)
 }

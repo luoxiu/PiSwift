@@ -493,6 +493,9 @@ private func runtimeWorker(input: RuntimeInput, mailbox: RuntimeMailbox, stopFla
             if stopFlag.isCancelled {
                 stopFlag.reject(CodemodeRuntimeCall(id: id, target: kind == "call" ? .tool : .global,
                                                    name: name, argsJSON: c, signal: CancellationToken()))
+                if let context = JSContext.current() {
+                    context.exception = JSValue(newErrorFromMessage: "rejected_after_end: Execution ended before dispatch", in: context)
+                }
                 return
             }
             emit.yield(.call(id: id, target: kind == "call" ? .tool : .global, name: name, argsJSON: c))

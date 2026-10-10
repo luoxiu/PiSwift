@@ -253,12 +253,26 @@ private actor CodemodeCallState {
     private var closed = false
     private var rejectedCount = 0
     private var nativeCallIndexes: Set<Int> = []
+    private var lateRecordCount = 0
+    private let recordLateCall: (@Sendable (String, CodemodeNestedCall) -> Void)?
     private let toolCallId: String
     private let onUpdate: AgentToolUpdateCallback?
 
-    init(toolCallId: String, onUpdate: AgentToolUpdateCallback?) {
+    init(toolCallId: String, onUpdate: AgentToolUpdateCallback?,
+         recordLateCall: (@Sendable (String, CodemodeNestedCall) -> Void)?) {
         self.toolCallId = toolCallId
         self.onUpdate = onUpdate
+        self.recordLateCall = recordLateCall
+    }
+
+    private func recordAfterEnd(_ call: CodemodeNestedCall) {
+        guard closed, lateRecordCount < 128 else {
+            return
+        }
+        lateRecordCount += 1
+        var bounded = call
+        bounded.name = CodemodeNestedCall.preview(call.name, limit: 200)
+        recordLateCall?(toolCallId, bounded)
     }
 
     private func publish() {
@@ -306,6 +320,7 @@ private actor CodemodeCallState {
         calls[index].error = error
         calls[index].cost = cost
         if let newUsage { usage = usage.map { combineUsage($0, newUsage) } ?? newUsage }
+        recordAfterEnd(calls[index])
         publish()
     }
 
@@ -317,6 +332,9 @@ private actor CodemodeCallState {
         calls.append(CodemodeNestedCall(id: "\(toolCallId)/rejected/\(call.id)", name: call.name,
                                        args: call.argsJSON ?? "", status: .rejectedAfterEnd,
                                        error: "Execution ended before dispatch"))
+        if let call = calls.last {
+            recordAfterEnd(call)
+        }
         publish()
     }
 
@@ -614,7 +632,8 @@ public func executeCodemode(toolCallId: String, params: [String: AnyCodable],
         globals += ["models.getModelsOfType", "models.getAvailableOfType", "models.getModelOfType", "models.classify", "models.generateImages"]
             .map { CodemodeRuntimeGlobal(name: $0, spread: true) }
     }
-    let state = CodemodeCallState(toolCallId: toolCallId, onUpdate: onUpdate)
+    let state = CodemodeCallState(toolCallId: toolCallId, onUpdate: onUpdate,
+                                  recordLateCall: options.recordLateCall)
     let limit = ClassifyLimit()
     let byName = Dictionary(callable.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
     let result = await CodemodeSandbox.execute(

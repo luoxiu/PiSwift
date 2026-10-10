@@ -47,7 +47,19 @@ public func createCodemodeExtension(options: CodemodeExtensionOptions = .init())
             maxTimeoutMs: options.maxTimeoutMs,
             validationErrorPrefix: options.validationErrorPrefix,
             getDefaultTimeoutMs: { api.getSettings().codemode?.defaultTimeoutMs },
-            getMaxTimeoutMs: { api.getSettings().codemode?.maxTimeoutMs })
+            getMaxTimeoutMs: { api.getSettings().codemode?.maxTimeoutMs },
+            recordLateCall: { parentId, call in
+                var row: [String: Any] = ["id": call.id, "name": call.name,
+                                          "args": call.args, "status": call.status.rawValue]
+                if let error = call.error {
+                    row["error"] = error
+                }
+                if let duration = call.durationMs {
+                    row["durationMs"] = duration
+                }
+                api.appendEntry(CODEMODE_LATE_CALL_ENTRY_TYPE,
+                                ["parentToolCallId": parentId, "call": row])
+            })
         _ = api.registerTool(createCodemodeToolDefinition(options: toolOptions))
     }
 }
