@@ -54,12 +54,12 @@ public struct NestedCallRecorder: Sendable {
         return calls.count - 1
     }
 
-    public mutating func finish(_ index: Int?, isError: Bool, errorText: String) {
+    public mutating func finish(_ index: Int?, isError: Bool, errorText: String, outcomeUnknown: Bool = false) {
         guard let index, calls.indices.contains(index) else { return }
-        calls[index].status = isError ? .error : .ok
+        calls[index].status = outcomeUnknown ? .outcomeUnknown : isError ? .error : .ok
         let start = startedAt.removeValue(forKey: calls[index].id) ?? Date()
         calls[index].durationMs = max(0, (Date().timeIntervalSince(start) * 1000).rounded())
-        if isError && !errorText.isEmpty {
+        if (isError || outcomeUnknown) && !errorText.isEmpty {
             calls[index].error = String(errorText.prefix(NestedCallLimits.maxErrorChars))
         }
     }
@@ -182,7 +182,8 @@ public actor NestedToolCallRunner {
             if case .text(let text) = block { return text.text }
             return nil
         }.joined(separator: "\n")
-        completed.finish(recordIndex, isError: outcome.isError, errorText: errorText)
+        let outcomeUnknown = (outcome.result.details?.value as? [String: Any])?["outcome"] as? String == "unknown"
+        completed.finish(recordIndex, isError: outcome.isError, errorText: errorText, outcomeUnknown: outcomeUnknown)
         if let usage = outcome.result.usage { completed.addUsage(usage) }
         recorders[scope.rootId] = completed
 

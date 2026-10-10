@@ -70,11 +70,28 @@ public struct CodemodeRuntimeResult: Sendable {
     public var storeWrites: CodemodeStoreWrites
     /// True when a timeout cannot stop the JavaScriptCore thread and the host abandons it.
     public var usedWatchdog: Bool
+    private var rejectedCallSnapshot: [CodemodeRuntimeCall]
+    private var rejectedCallReader: (@Sendable () -> [CodemodeRuntimeCall])?
+    /// A live record of calls rejected after the script ended, including attempts after the host returns.
+    /// The runtime retains at most 128 calls, with 200-character name and argument previews.
+    public var rejectedCalls: [CodemodeRuntimeCall] {
+        get { rejectedCallReader?() ?? rejectedCallSnapshot }
+        set {
+            rejectedCallSnapshot = newValue
+            rejectedCallReader = nil
+        }
+    }
 
-    public init(execution: CodemodeExecutionResult, storeWrites: CodemodeStoreWrites = .init(), usedWatchdog: Bool) {
+    public init(execution: CodemodeExecutionResult, storeWrites: CodemodeStoreWrites = .init(), usedWatchdog: Bool, rejectedCalls: [CodemodeRuntimeCall] = []) {
+        self.rejectedCallSnapshot = rejectedCalls
+        self.rejectedCallReader = nil
         self.execution = execution
         self.storeWrites = storeWrites
         self.usedWatchdog = usedWatchdog
+    }
+
+    mutating func readRejectedCalls(_ reader: @escaping @Sendable () -> [CodemodeRuntimeCall]) {
+        rejectedCallReader = reader
     }
 }
 
@@ -112,10 +129,41 @@ private final class RuntimeMailbox: Sendable {
 }
 
 private final class RuntimeStopFlag: Sendable {
-    private let state = LockedState(false)
+    private struct State: Sendable {
+        var ended = false
+        var rejected: [CodemodeRuntimeCall] = []
+    }
+    private let state = LockedState(State())
+    private let onRejectedCall: (@Sendable (CodemodeRuntimeCall) -> Void)?
 
-    func cancel() { state.withLock { $0 = true } }
-    var isCancelled: Bool { state.withLock { $0 } }
+    init(onRejectedCall: (@Sendable (CodemodeRuntimeCall) -> Void)? = nil) {
+        self.onRejectedCall = onRejectedCall
+    }
+
+    func cancel() {
+        state.withLock { $0.ended = true }
+    }
+
+    var isCancelled: Bool { state.withLock { $0.ended } }
+
+    func reject(_ call: CodemodeRuntimeCall) {
+        call.signal.cancel()
+        let recorded = state.withLock { state -> CodemodeRuntimeCall? in
+            if state.rejected.count < 128 {
+                var bounded = call
+                bounded.name = CodemodeNestedCall.preview(call.name, limit: 200)
+                bounded.argsJSON = call.argsJSON.map { CodemodeNestedCall.preview($0, limit: 200) }
+                state.rejected.append(bounded)
+                return bounded
+            }
+            return nil
+        }
+        if let recorded {
+            onRejectedCall?(recorded)
+        }
+    }
+
+    var rejectedCalls: [CodemodeRuntimeCall] { state.withLock { $0.rejected } }
 }
 
 private struct RuntimeInput: Sendable {
@@ -145,11 +193,13 @@ public enum CodemodeSandbox {
         timeoutMs: Int? = nil,
         signal: CancellationToken? = nil,
         forceWatchdog: Bool = false,
+        collisionPolicy: ToolNameCollisionPolicy = .overwrite,
+        onRejectedCall: (@Sendable (CodemodeRuntimeCall) -> Void)? = nil,
         onCall: @escaping @Sendable (CodemodeRuntimeCall) async -> CodemodeRuntimeReply
     ) async -> CodemodeRuntimeResult {
         await execute(code: code, tools: tools, globals: globals, store: store, timeoutMs: timeoutMs,
                       signal: signal, forceWatchdog: forceWatchdog, preludeSource: codemodePreludeSource,
-                      onCall: onCall)
+                      collisionPolicy: collisionPolicy, onRejectedCall: onRejectedCall, onCall: onCall)
     }
 
     // Upstream #10444: tests can supply the equivalent of the raw-worker fixture.
@@ -162,12 +212,20 @@ public enum CodemodeSandbox {
         signal: CancellationToken? = nil,
         forceWatchdog: Bool = false,
         preludeSource: String = codemodePreludeSource,
+        collisionPolicy: ToolNameCollisionPolicy = .overwrite,
+        onRejectedCall: (@Sendable (CodemodeRuntimeCall) -> Void)? = nil,
         onCall: @escaping @Sendable (CodemodeRuntimeCall) async -> CodemodeRuntimeReply
     ) async -> CodemodeRuntimeResult {
         if signal?.isCancelled == true {
             return CodemodeRuntimeResult(execution: .init(output: [],
                 failure: .init(kind: .aborted, message: "Execution aborted")),
                 usedWatchdog: !usesTimeLimit(forceWatchdog: forceWatchdog))
+        }
+        let collision = codemodeToolIdentifierCollision(tools.map(\.name))
+            ?? codemodeToolIdentifierCollision(tools.map(\.jsName))
+        if collisionPolicy == .reject, let collision {
+            return CodemodeRuntimeResult(execution: .init(output: [], failure: .init(kind: .sandbox, message: collision)),
+                                         usedWatchdog: !usesTimeLimit(forceWatchdog: forceWatchdog))
         }
         let validation = validateGlobals(globals)
         if let validation {
@@ -184,7 +242,7 @@ public enum CodemodeSandbox {
                                  storeJSON: storeJSON, useTimeLimit: usesTimeLimit(forceWatchdog: forceWatchdog))
         let watchdog = !input.useTimeLimit
         let mailbox = RuntimeMailbox()
-        let stopFlag = RuntimeStopFlag()
+        let stopFlag = RuntimeStopFlag(onRejectedCall: onRejectedCall)
         let (events, emitter) = AsyncStream<RuntimeEvent>.makeStream()
         Thread.detachNewThread {
             defer { emitter.yield(.stopped) }
@@ -231,10 +289,18 @@ public enum CodemodeSandbox {
                     break
                 }
                 let callSignal = CancellationToken()
-                pending[id] = callSignal
                 let call = CodemodeRuntimeCall(id: id, target: target, name: name,
                                                argsJSON: argsJSON, signal: callSignal)
+                guard !stopFlag.isCancelled else {
+                    stopFlag.reject(call)
+                    continue
+                }
+                pending[id] = callSignal
                 Task {
+                    guard !stopFlag.isCancelled, !call.signal.isCancelled else {
+                        stopFlag.reject(call)
+                        return
+                    }
                     let reply = await onCall(call)
                     emitter.yield(.callResult(id: id, reply))
                 }
@@ -301,6 +367,7 @@ public enum CodemodeSandbox {
             mailbox.send(.stop)
         }
         emitter.finish()
+        result?.readRejectedCalls { stopFlag.rejectedCalls }
         return result ?? CodemodeRuntimeResult(execution: .init(output: output,
             failure: .init(kind: .sandbox, message: "JavaScriptCore stopped before the script settled")),
             usedWatchdog: watchdog)
@@ -423,6 +490,11 @@ private func runtimeWorker(input: RuntimeInput, mailbox: RuntimeMailbox, stopFla
                 emit.yield(.bridgeBroken("unknown message from the worker"))
                 return
             }
+            if stopFlag.isCancelled {
+                stopFlag.reject(CodemodeRuntimeCall(id: id, target: kind == "call" ? .tool : .global,
+                                                   name: name, argsJSON: c, signal: CancellationToken()))
+                return
+            }
             emit.yield(.call(id: id, target: kind == "call" ? .tool : .global, name: name, argsJSON: c))
         case "output":
             if a == "image", bValue.isString, let data = b {
@@ -433,6 +505,7 @@ private func runtimeWorker(input: RuntimeInput, mailbox: RuntimeMailbox, stopFla
                 emit.yield(.bridgeBroken("unknown message from the worker"))
             }
         case "done":
+            stopFlag.cancel()
             emit.yield(.done(ok: a == "true", payload: b, writes: c))
         default:
             emit.yield(.bridgeBroken("unknown message from the worker"))

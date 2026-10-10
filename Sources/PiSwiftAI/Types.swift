@@ -1666,6 +1666,7 @@ public struct AssistantImages: Sendable {
 }
 
 public enum NestedToolCallStatus: String, Sendable, Codable {
+    case outcomeUnknown = "outcome_unknown"
     case ok
     case error
     case unfinished

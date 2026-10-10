@@ -4,11 +4,22 @@ public struct CodemodeExtensionOptions: Sendable {
     public var mode: CodemodeMode?
     public var inlineBudget: Double?
     public var models: Bool
+    public var collisionPolicy: ToolNameCollisionPolicy?
+    public var defaultTimeoutMs: Int?
+    public var maxTimeoutMs: Int?
+    public var validationErrorPrefix: String?
 
-    public init(mode: CodemodeMode? = nil, inlineBudget: Double? = nil, models: Bool = true) {
+    public init(mode: CodemodeMode? = nil, inlineBudget: Double? = nil, models: Bool = true,
+                collisionPolicy: ToolNameCollisionPolicy? = nil,
+                defaultTimeoutMs: Int? = nil, maxTimeoutMs: Int? = nil,
+                validationErrorPrefix: String? = nil) {
         self.mode = mode
         self.inlineBudget = inlineBudget
         self.models = models
+        self.collisionPolicy = collisionPolicy
+        self.defaultTimeoutMs = defaultTimeoutMs
+        self.maxTimeoutMs = maxTimeoutMs
+        self.validationErrorPrefix = validationErrorPrefix
     }
 }
 
@@ -30,7 +41,13 @@ public func createCodemodeExtension(options: CodemodeExtensionOptions = .init())
                 // Upstream builds a Map, so a later entry with the same name wins.
                 Dictionary(api.getAllTools().map { ($0.name, $0.promptGuidelines ?? []) },
                            uniquingKeysWith: { _, last in last })
-            })
+            },
+            collisionPolicy: options.collisionPolicy ?? api.toolNameCollisionPolicy,
+            defaultTimeoutMs: options.defaultTimeoutMs,
+            maxTimeoutMs: options.maxTimeoutMs,
+            validationErrorPrefix: options.validationErrorPrefix,
+            getDefaultTimeoutMs: { api.getSettings().codemode?.defaultTimeoutMs },
+            getMaxTimeoutMs: { api.getSettings().codemode?.maxTimeoutMs })
         _ = api.registerTool(createCodemodeToolDefinition(options: toolOptions))
     }
 }

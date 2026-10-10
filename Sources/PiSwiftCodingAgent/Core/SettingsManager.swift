@@ -255,10 +255,15 @@ public enum CodemodeMode: String, Sendable, Codable {
 public struct CodemodeSettings: Sendable {
     public var mode: CodemodeMode?
     public var inlineBudget: Double?
+    public var defaultTimeoutMs: Int?
+    public var maxTimeoutMs: Int?
 
-    public init(mode: CodemodeMode? = nil, inlineBudget: Double? = nil) {
+    public init(mode: CodemodeMode? = nil, inlineBudget: Double? = nil,
+                defaultTimeoutMs: Int? = nil, maxTimeoutMs: Int? = nil) {
         self.mode = mode
         self.inlineBudget = inlineBudget
+        self.defaultTimeoutMs = defaultTimeoutMs
+        self.maxTimeoutMs = maxTimeoutMs
     }
 }
 
@@ -757,6 +762,38 @@ public final class SettingsManager: Sendable {
         if globalSettings.codemode == nil { globalSettings.codemode = CodemodeSettings() }
         globalSettings.codemode?.inlineBudget = budget
         markModified("codemode", "inlineBudget")
+        save()
+    }
+
+    public func getCodemodeDefaultTimeoutMs() -> Int? {
+        settings.codemode?.defaultTimeoutMs
+    }
+
+    public func getCodemodeMaxTimeoutMs() -> Int? {
+        settings.codemode?.maxTimeoutMs
+    }
+
+    public func setCodemodeDefaultTimeoutMs(_ timeout: Int) {
+        guard timeout > 0, timeout <= 2_147_483_647 else {
+            return
+        }
+        if globalSettings.codemode == nil {
+            globalSettings.codemode = CodemodeSettings()
+        }
+        globalSettings.codemode?.defaultTimeoutMs = timeout
+        markModified("codemode", "defaultTimeoutMs")
+        save()
+    }
+
+    public func setCodemodeMaxTimeoutMs(_ timeout: Int) {
+        guard timeout > 0, timeout <= 2_147_483_647 else {
+            return
+        }
+        if globalSettings.codemode == nil {
+            globalSettings.codemode = CodemodeSettings()
+        }
+        globalSettings.codemode?.maxTimeoutMs = timeout
+        markModified("codemode", "maxTimeoutMs")
         save()
     }
 
@@ -1722,7 +1759,9 @@ public final class SettingsManager: Sendable {
             }
             settings.codemode = CodemodeSettings(
                 mode: (codemode["mode"] as? String).flatMap(CodemodeMode.init(rawValue:)),
-                inlineBudget: budget)
+                inlineBudget: budget,
+                defaultTimeoutMs: codemodeTimeout(codemode["defaultTimeoutMs"]),
+                maxTimeoutMs: codemodeTimeout(codemode["maxTimeoutMs"]))
         }
         settings.projectTrust = json["projectTrust"] as? [String: Bool]
 
@@ -2144,6 +2183,12 @@ public final class SettingsManager: Sendable {
             var value: [String: Any] = [:]
             if let mode = codemode.mode { value["mode"] = mode.rawValue }
             if let budget = codemode.inlineBudget, budget.isFinite, budget >= 0 { value["inlineBudget"] = budget }
+            if let timeout = settings.codemode?.defaultTimeoutMs, codemodeTimeout(timeout) != nil {
+                value["defaultTimeoutMs"] = timeout
+            }
+            if let timeout = settings.codemode?.maxTimeoutMs, codemodeTimeout(timeout) != nil {
+                value["maxTimeoutMs"] = timeout
+            }
             json["codemode"] = value
         }
 
@@ -2320,7 +2365,9 @@ public final class SettingsManager: Sendable {
             let baseValue = result.codemode ?? CodemodeSettings()
             let budget = value.inlineBudget.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
             result.codemode = CodemodeSettings(mode: value.mode ?? baseValue.mode,
-                                               inlineBudget: budget ?? baseValue.inlineBudget)
+                                               inlineBudget: budget ?? baseValue.inlineBudget,
+                                               defaultTimeoutMs: codemodeTimeout(value.defaultTimeoutMs) ?? baseValue.defaultTimeoutMs,
+                                               maxTimeoutMs: codemodeTimeout(value.maxTimeoutMs) ?? baseValue.maxTimeoutMs)
         }
         if let value = override.thinkingBudgets {
             let baseValue = result.thinkingBudgets ?? ThinkingBudgetsSettings()
@@ -2356,4 +2403,15 @@ public final class SettingsManager: Sendable {
 
 private func normalizeProjectTrustPath(_ path: String) -> String {
     URL(fileURLWithPath: path).standardized.path
+}
+
+private func codemodeTimeout(_ value: Any?) -> Int? {
+    guard let number = value as? NSNumber,
+          CFGetTypeID(number) != CFBooleanGetTypeID(),
+          number.doubleValue.isFinite, number.doubleValue > 0,
+          number.doubleValue <= 2_147_483_647,
+          number.doubleValue.rounded() == number.doubleValue else {
+        return nil
+    }
+    return number.intValue
 }

@@ -4,6 +4,8 @@ import PiSwiftAgent
 
 public enum CodemodeNestedCallStatus: String, Sendable, Codable {
     case running, ok, error, cancelled
+    case rejectedAfterEnd = "rejected_after_end"
+    case outcomeUnknown = "outcome_unknown"
 }
 
 public struct CodemodeNestedCall: Sendable, Codable {
@@ -91,10 +93,18 @@ private func failureText(_ failure: CodemodeFailure, calls: [CodemodeNestedCall]
     case .aborted: head = "Script aborted: \(failure.message)"
     case .sandbox: head = "Script sandbox failed: \(failure.message)"
     }
-    let summary = calls.isEmpty ? "No tool calls were made." :
+    let completed = calls.filter { $0.status != .outcomeUnknown && $0.status != .rejectedAfterEnd }
+    let summary = completed.isEmpty ? (calls.isEmpty ? "No tool calls were made." : "No tool calls completed before the failure.") :
         "Tool calls made before the failure (they are not undone): " +
-        calls.map { "\($0.name) (\($0.status.rawValue))" }.joined(separator: ", ")
-    return "Script error:\n\(head)\n\n\(summary)"
+        completed.map { "\($0.name) (\($0.status.rawValue))" }.joined(separator: ", ")
+    let unknown = calls.filter { $0.status == .outcomeUnknown }
+    let unknownSummary = unknown.isEmpty ? "" :
+        "\n\nNative calls with outcome unknown — inspect before retrying: " +
+        unknown.map { "\($0.name) [\($0.id)]" }.joined(separator: ", ")
+    let rejected = calls.filter { $0.status == .rejectedAfterEnd }
+    let rejectedSummary = rejected.isEmpty ? "" :
+        "\n\nCalls rejected after execution ended: " + rejected.map(\.name).joined(separator: ", ")
+    return "Script error:\n\(head)\n\n\(summary)\(unknownSummary)\(rejectedSummary)"
 }
 
 private func valueText(_ value: AnyCodable) -> String {

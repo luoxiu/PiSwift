@@ -159,8 +159,11 @@ private func codemodeRun(_ code: String, session: SessionManager = .inMemory(),
         }, context, nil)
     #expect(codemodeValue(early) == "early")
     let rows = (early.details?.value as? [String: Any])?["calls"] as? [[String: Any]]
-    #expect(rows?.first?["status"] as? String == "cancelled")
-    #expect(updates.withLock { $0 }.contains("running"))
+    let status = rows?.first?["status"] as? String
+    #expect(status == "outcome_unknown" || status == "rejected_after_end")
+    if status == "outcome_unknown" {
+        #expect(updates.withLock { $0 }.contains("running"))
+    }
 }
 
 @Test(.timeLimit(.minutes(1))) func codemodeBuiltinIsHiddenReplaceableAndInactive() async throws {

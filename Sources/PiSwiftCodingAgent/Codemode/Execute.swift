@@ -251,6 +251,8 @@ private actor CodemodeCallState {
     private var modelCallCount = 0
     private var generatedImages = 0
     private var closed = false
+    private var rejectedCount = 0
+    private var nativeCallIndexes: Set<Int> = []
     private let toolCallId: String
     private let onUpdate: AgentToolUpdateCallback?
 
@@ -279,7 +281,11 @@ private actor CodemodeCallState {
     }
 
     func startTool(name: String, args: String) -> Int {
-        start(id: "\(toolCallId)/?", name: name, args: args)
+        let index = start(id: "\(toolCallId)/?", name: name, args: args)
+        if index >= 0 {
+            nativeCallIndexes.insert(index)
+        }
+        return index
     }
 
     func nextModelCallID(_ name: String) -> String {
@@ -291,7 +297,9 @@ private actor CodemodeCallState {
 
     func finish(index: Int, id: String? = nil, status: CodemodeNestedCallStatus,
                 durationMs: Double, error: String? = nil, cost: Double? = nil, usage newUsage: Usage? = nil) {
-        guard !closed, calls.indices.contains(index) else { return }
+        guard calls.indices.contains(index) else {
+            return
+        }
         if let id { calls[index].id = id }
         calls[index].status = status
         calls[index].durationMs = durationMs
@@ -301,9 +309,28 @@ private actor CodemodeCallState {
         publish()
     }
 
+    func recordRejected(_ call: CodemodeRuntimeCall) {
+        guard rejectedCount < 128 else {
+            return
+        }
+        rejectedCount += 1
+        calls.append(CodemodeNestedCall(id: "\(toolCallId)/rejected/\(call.id)", name: call.name,
+                                       args: call.argsJSON ?? "", status: .rejectedAfterEnd,
+                                       error: "Execution ended before dispatch"))
+        publish()
+    }
+
     func complete() -> (calls: [CodemodeNestedCall], usage: Usage?, generatedImages: Int) {
         closed = true
-        for index in calls.indices where calls[index].status == .running { calls[index].status = .cancelled }
+        for index in calls.indices where calls[index].status == .running {
+            if nativeCallIndexes.contains(index) {
+                calls[index].status = .outcomeUnknown
+                calls[index].error = "outcome_unknown: the native operation may still be running"
+            } else {
+                calls[index].status = .cancelled
+            }
+        }
+        publish()
         return (calls, usage, generatedImages)
     }
 }
@@ -332,23 +359,53 @@ private func failure(_ message: String) -> CodemodeRuntimeReply {
 }
 
 private func handleTool(_ call: CodemodeRuntimeCall, tool: AgentTool?, context: CustomToolContext?,
-                        state: CodemodeCallState) async -> CodemodeRuntimeReply {
+                        state: CodemodeCallState, options: CodemodeToolOptions) async -> CodemodeRuntimeReply {
+    guard !call.signal.isCancelled else { return failure("Execution ended before the tool call started") }
     guard let tool, let context else { return failure("Tool calls need a session") }
     let started = Date()
     let argsJSON = call.argsJSON ?? "{}"
     let index = await state.startTool(name: tool.name, args: call.argsJSON ?? "")
+    guard index >= 0, !call.signal.isCancelled else {
+        return failure("Execution ended before the tool call started")
+    }
     do {
-        guard let args = try parseJSON(argsJSON).value as? [String: Any] else {
-            throw CodemodeBridgeError.message("Tool arguments must be an object")
+        let args: [String: Any]
+        do {
+            guard let object = try parseJSON(argsJSON).value as? [String: Any] else {
+                throw CodemodeBridgeError.message("Tool arguments must be an object")
+            }
+            args = object
+        } catch {
+            throw CodemodeBridgeError.message((options.validationErrorPrefix ?? "") + error.localizedDescription)
+        }
+        if let prefix = options.validationErrorPrefix {
+            do {
+                var prepared = args.mapValues(AnyCodable.init)
+                if let prepare = tool.prepareArguments, let rewritten = try await prepare(prepared) {
+                    prepared = rewritten
+                }
+                _ = try validateToolArguments(tool: tool.aiTool,
+                    toolCall: ToolCall(id: "\(call.id)", name: tool.name, arguments: prepared))
+            } catch {
+                throw CodemodeBridgeError.message(prefix + error.localizedDescription)
+            }
+        }
+        guard !call.signal.isCancelled else {
+            throw CodemodeBridgeError.message("Execution ended before the tool call started")
         }
         let outcome = await context.executeTool(name: tool.name, args: args.mapValues(AnyCodable.init),
                                                  options: ExecuteToolOptions(signal: call.signal,
                                                      argumentsJSON: parseToolArgumentsSource(argsJSON)))
         let body = textOf(outcome.result)
-        let status: CodemodeNestedCallStatus = outcome.isError ? (call.signal.isCancelled ? .cancelled : .error) : .ok
+        let unknown = (outcome.result.details?.value as? [String: Any])?["outcome"] as? String == "unknown"
+        let message = unknown && body.isEmpty ? "outcome_unknown: the native operation may still be running" : body
+        let status: CodemodeNestedCallStatus = unknown ? .outcomeUnknown : outcome.isError ? (call.signal.isCancelled ? .cancelled : .error) : .ok
         await state.finish(index: index, id: outcome.toolCall.id, status: status,
                            durationMs: Date().timeIntervalSince(started) * 1000,
-                           error: outcome.isError ? (body.isEmpty ? "Tool \"\(tool.name)\" failed" : body) : nil)
+                           error: unknown || outcome.isError ? (message.isEmpty ? "Tool \"\(tool.name)\" failed" : message) : nil)
+        if unknown {
+            return failure(message)
+        }
         if let structured = outcome.result.structuredContent, tool.outputSchema != nil {
             return success(structured)
         }
@@ -418,6 +475,9 @@ private func handleGlobal(_ call: CodemodeRuntimeCall, callable: [AgentTool],
             }
             guard let namespace else { return success(nil) }
             var fields: [String: Any] = ["name": namespace.name, "tools": names]
+            if let version = namespace.version {
+                fields["version"] = version
+            }
             if let description = namespace.description, !description.isEmpty { fields["description"] = description }
             if let instructions = namespace.instructions, !instructions.isEmpty { fields["instructions"] = instructions }
             return success(AnyCodable(fields))
@@ -468,6 +528,10 @@ private func handleGlobal(_ call: CodemodeRuntimeCall, callable: [AgentTool],
                                               args: "\(providerName)/\(id)")
                 let started = Date()
                 await limit.acquire()
+                guard index >= 0, !call.signal.isCancelled else {
+                    await limit.release()
+                    return failure("Execution ended before the model call started")
+                }
                 let reply: AnyCodable
                 let stopReason: String
                 let errorMessage: String?
@@ -513,14 +577,34 @@ public func executeCodemode(toolCallId: String, params: [String: AnyCodable],
                             forceWatchdog: Bool = false) async throws -> AgentToolResult {
     let started = Date()
     guard let code = params["code"]?.value as? String else {
-        throw CodemodeBridgeError.message("codemode expects a code string")
+        throw CodemodeSourceError((options.validationErrorPrefix ?? "") + "codemode expects a code string")
     }
-    let parsed = try parseCodemodeSource(code)
+    let parsed: ParsedCodemodeSource
+    let timeoutMs: Int?
+    do {
+        parsed = try parseCodemodeSource(code)
+        let defaultTimeout = options.defaultTimeoutMs ?? options.getDefaultTimeoutMs?()
+        let maximum = options.maxTimeoutMs ?? options.getMaxTimeoutMs?()
+        for value in [defaultTimeout, maximum].compactMap({ $0 }) {
+            guard value > 0, value <= 2_147_483_647 else {
+                throw CodemodeSourceError("Host timeout must be a positive integer up to 2147483647")
+            }
+        }
+        timeoutMs = parsed.options.timeoutMs ?? defaultTimeout
+        if let timeoutMs, let maximum, timeoutMs > maximum {
+            throw CodemodeSourceError("Script timeout must not exceed \(maximum) ms")
+        }
+    } catch {
+        throw CodemodeSourceError((options.validationErrorPrefix ?? "") + error.localizedDescription)
+    }
     let callable = context.map { getCodemodeCallableTools($0.tools) } ?? []
     let guidelines = options.getToolGuidelines?() ?? [:]
-    let samples = Dictionary(uniqueKeysWithValues: callable.map {
+    if options.collisionPolicy == .reject, let collision = codemodeToolIdentifierCollision(callable.map(\.name)) {
+        throw CodemodeSourceError((options.validationErrorPrefix ?? "") + collision)
+    }
+    let samples = Dictionary(callable.map {
         ($0.name, renderToolSample(CodemodeDeclaration(tool: $0, guidelines: guidelines[$0.name] ?? [])))
-    })
+    }, uniquingKeysWith: { first, _ in first })
     let runtimeTools = callable.map { CodemodeRuntimeTool(name: $0.name, description: samples[$0.name] ?? "") }
     let modelRuntime = options.modelRuntime ?? context?.modelRegistry
     var globals = [CodemodeRuntimeGlobal(name: "searchTools", spread: true),
@@ -532,21 +616,36 @@ public func executeCodemode(toolCallId: String, params: [String: AnyCodable],
     }
     let state = CodemodeCallState(toolCallId: toolCallId, onUpdate: onUpdate)
     let limit = ClassifyLimit()
-    let byName = Dictionary(uniqueKeysWithValues: callable.map { ($0.name, $0) })
+    let byName = Dictionary(callable.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
     let result = await CodemodeSandbox.execute(
         code: parsed.code, tools: runtimeTools, globals: globals,
         store: context.map { readCodemodeStore($0.sessionManager.getBranch()) } ?? [:],
-        timeoutMs: parsed.options.timeoutMs, signal: signal, forceWatchdog: forceWatchdog,
+        timeoutMs: timeoutMs, signal: signal, forceWatchdog: forceWatchdog,
+        collisionPolicy: options.collisionPolicy,
+        onRejectedCall: { call in
+            Task {
+                await state.recordRejected(call)
+            }
+        },
         onCall: { call in
             switch call.target {
             case .tool:
-                return await handleTool(call, tool: byName[call.name], context: context, state: state)
+                return await handleTool(call, tool: byName[call.name], context: context, state: state, options: options)
             case .global:
                 return await handleGlobal(call, callable: callable, samples: samples, options: options,
                                           modelRuntime: modelRuntime, state: state, limit: limit)
             }
         })
-    let final = await state.complete()
+    var final = await state.complete()
+    let recordedRejections = Set(final.calls.filter { $0.status == .rejectedAfterEnd }.map(\.id))
+    final.calls += result.rejectedCalls.compactMap { call in
+        let id = "\(toolCallId)/rejected/\(call.id)"
+        guard !recordedRejections.contains(id) else {
+            return nil
+        }
+        return CodemodeNestedCall(id: id, name: call.name, args: call.argsJSON ?? "",
+                                  status: .rejectedAfterEnd, error: "Execution ended before dispatch")
+    }
     if result.execution.failure == nil,
        !result.storeWrites.set.isEmpty || !result.storeWrites.delete.isEmpty {
         options.appendEntry?(CODEMODE_STORE_ENTRY_TYPE, CodemodeStoreEntryData(

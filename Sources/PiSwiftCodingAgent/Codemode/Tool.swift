@@ -17,6 +17,12 @@ public struct CodemodeStoreEntryData: Sendable {
 
 public struct CodemodeToolOptions: Sendable {
     public var models: Bool
+    public var collisionPolicy: ToolNameCollisionPolicy
+    public var defaultTimeoutMs: Int?
+    public var maxTimeoutMs: Int?
+    public var validationErrorPrefix: String?
+    public var getDefaultTimeoutMs: (@Sendable () -> Int?)?
+    public var getMaxTimeoutMs: (@Sendable () -> Int?)?
     public var getToolNamespace: (@Sendable (String) -> ToolNamespace?)?
     /// Tool rules shown by describeTool(), searchTools(), and ALL_TOOLS.
     public var getToolGuidelines: (@Sendable () -> [String: [String]])?
@@ -32,8 +38,20 @@ public struct CodemodeToolOptions: Sendable {
                 getMode: (@Sendable () -> CodemodeMode)? = nil,
                 getInlineBudget: (@Sendable () -> Double?)? = nil,
                 modelRuntime: (any CodemodeModelRuntime)? = nil,
-                getToolGuidelines: (@Sendable () -> [String: [String]])? = nil) {
+                getToolGuidelines: (@Sendable () -> [String: [String]])? = nil,
+                collisionPolicy: ToolNameCollisionPolicy = .overwrite,
+                defaultTimeoutMs: Int? = nil,
+                maxTimeoutMs: Int? = nil,
+                validationErrorPrefix: String? = nil,
+                getDefaultTimeoutMs: (@Sendable () -> Int?)? = nil,
+                getMaxTimeoutMs: (@Sendable () -> Int?)? = nil) {
         self.models = models
+        self.collisionPolicy = collisionPolicy
+        self.defaultTimeoutMs = defaultTimeoutMs
+        self.maxTimeoutMs = maxTimeoutMs
+        self.validationErrorPrefix = validationErrorPrefix
+        self.getDefaultTimeoutMs = getDefaultTimeoutMs
+        self.getMaxTimeoutMs = getMaxTimeoutMs
         self.getToolNamespace = getToolNamespace
         self.getToolGuidelines = getToolGuidelines
         self.appendEntry = appendEntry
