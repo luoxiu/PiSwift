@@ -1,8 +1,15 @@
 import Foundation
 
+/// The information returned by the code mode `searchTools` helper.
+public enum CodemodeSearchResultDetail: String, Sendable {
+    case full
+    case summary
+}
+
 public struct CodemodeExtensionOptions: Sendable {
     public var mode: CodemodeMode?
     public var inlineBudget: Double?
+    public var searchResultDetail: CodemodeSearchResultDetail
     public var models: Bool
     /// Keep full return schemas in discovery but omit them from the inline catalog.
     public var omitInlineOutputSchemas: Bool
@@ -16,9 +23,10 @@ public struct CodemodeExtensionOptions: Sendable {
                 collisionPolicy: ToolNameCollisionPolicy? = nil,
                 defaultTimeoutMs: Int? = nil, maxTimeoutMs: Int? = nil,
                 validationErrorPrefix: String? = nil, omitInlineOutputSchemas: Bool = false,
-                inlineEnumValueLimit: Int? = nil) {
+                inlineEnumValueLimit: Int? = nil, searchResultDetail: CodemodeSearchResultDetail = .full) {
         self.mode = mode
         self.inlineBudget = inlineBudget
+        self.searchResultDetail = searchResultDetail
         self.models = models
         self.omitInlineOutputSchemas = omitInlineOutputSchemas
         self.inlineEnumValueLimit = inlineEnumValueLimit.map { max(0, $0) }
@@ -67,7 +75,8 @@ public func createCodemodeExtension(options: CodemodeExtensionOptions = .init())
                                 ["parentToolCallId": parentId, "call": row])
             },
             omitInlineOutputSchemas: options.omitInlineOutputSchemas,
-            inlineEnumValueLimit: options.inlineEnumValueLimit)
+            inlineEnumValueLimit: options.inlineEnumValueLimit,
+            searchResultDetail: options.searchResultDetail)
         _ = api.registerTool(createCodemodeToolDefinition(options: toolOptions))
     }
 }

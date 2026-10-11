@@ -76,3 +76,69 @@ func codemodeDiscoveryZeroBudgetOverridesSettingsAndCallsAllEditorTools() async 
     #expect(settings.getCodemodeInlineBudget() == defaultCodemodeInlineBudget)
 }
 
+@Test(.timeLimit(.minutes(1)), arguments: [CodemodeSearchResultDetail.full, .summary])
+func codemodeDiscoverySearchDetailKeepsFullDescribeTool(detail: CodemodeSearchResultDetail) async throws {
+    let description = "Read editor documentation. " + String(repeating: "Detailed usage guidance. ", count: 30)
+    let tool = AgentTool(label: "editor", name: "editor-docs", description: description,
+        parameters: ["type": AnyCodable("object"), "properties": AnyCodable(["path": ["type": "string"]])],
+        execute: { _, _, _, _ in AgentToolResult(content: []) },
+        outputSchema: ["type": AnyCodable("object"), "properties": AnyCodable(["body": ["type": "string"]])])
+    let plain = AgentTool(label: "plain", name: "plain_docs", description: String(repeating: "Documentation ", count: 30),
+        parameters: [:], execute: { _, _, _, _ in AgentToolResult(content: []) })
+    var context = CustomToolContext(sessionManager: .inMemory(), modelRegistry: ModelRegistry(AuthStorage(":memory:")),
+        model: nil, isIdle: { true }, hasPendingMessages: { false }, abort: {},
+        events: createEventBus(), sendMessage: { _, _ in })
+    context.setNestedToolHost(tools: [tool, plain]) { name, args, _ in
+        AgentToolCallOutcome(toolCall: AgentToolCall(id: name, name: name, arguments: args),
+            result: AgentToolResult(content: []), isError: false)
+    }
+    let options = CodemodeToolOptions(getToolNamespace: { name in
+        name == "editor-docs" ? ToolNamespace(name: "editor") : nil
+    }, getToolGuidelines: { ["editor-docs": ["Read only selected documentation."]] }, searchResultDetail: detail)
+    let result = try await executeCodemode(toolCallId: "search-detail", params: ["code": AnyCodable("""
+        const hits = await searchTools('documentation');
+        const filtered = await searchTools('documentation', {namespace: 'editor'});
+        return { hits, filtered, schema: await describeTool('editor_docs') };
+        """)], context: context, options: options)
+    #expect(result.isError != true)
+    let text = try #require(result.content.compactMap { block -> String? in
+        if case .text(let value) = block {
+            return value.text
+        }
+        return nil
+    }.last)
+    let value = try #require(try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+    let rows = try #require(value["hits"] as? [[String: Any]])
+    #expect(rows.count == 2)
+    let row = try #require(rows.first { $0["name"] as? String == "editor_docs" })
+    let plainRow = try #require(rows.first { $0["name"] as? String == "plain_docs" })
+    let sample = try #require(value["schema"] as? String)
+    #expect(sample.contains("codemode tool declaration:"))
+    #expect(sample.contains("path"))
+    #expect(sample.contains("body"))
+    #expect(sample.contains("Read only selected documentation."))
+    if detail == .summary {
+        #expect(Set(row.keys) == ["name", "namespace", "description"])
+        #expect(row["namespace"] as? String == "editor")
+        #expect(row["description"] as? String == "Read editor documentation.")
+        #expect(plainRow["namespace"] is NSNull)
+        #expect((plainRow["description"] as? String)?.count ?? 0 <= 160)
+        #expect(rows.allSatisfy { !($0["description"] as? String ?? "").contains("codemode tool declaration:") })
+    } else {
+        #expect(Set(row.keys) == ["name", "description"])
+        #expect(row["description"] as? String == sample)
+    }
+    let filtered = try #require(value["filtered"] as? [[String: Any]])
+    #expect(filtered.count == 1)
+    #expect(filtered.first?["name"] as? String == "editor_docs")
+}
+
+@Test func codemodeDiscoveryOptionsDefaultToFullSearch() {
+    #expect(CodemodeToolOptions().searchResultDetail == .full)
+    #expect(CodemodeExtensionOptions().searchResultDetail == .full)
+    let full = createCodemodeDescription([], options: .init(searchResultDetail: .full))
+    let summary = createCodemodeDescription([], options: .init(searchResultDetail: .summary))
+    #expect(!full.contains("returns short summaries"))
+    #expect(summary.contains("returns short summaries"))
+    #expect(summary.contains("call `describeTool(name)` for their full schemas"))
+}

@@ -18,6 +18,7 @@ public struct CodemodeStoreEntryData: Sendable {
 
 public struct CodemodeToolOptions: Sendable {
     public var models: Bool
+    public var searchResultDetail: CodemodeSearchResultDetail
     public var omitInlineOutputSchemas: Bool
     public var inlineEnumValueLimit: Int?
     public var collisionPolicy: ToolNameCollisionPolicy
@@ -55,8 +56,10 @@ public struct CodemodeToolOptions: Sendable {
                 recordLateCall: (@Sendable (String, CodemodeNestedCall) -> Void)? = nil,
                 omitInlineOutputSchemas: Bool = false,
                 inlineEnumValueLimit: Int? = nil,
-                lateCallWindow: Duration = .seconds(60)) {
+                lateCallWindow: Duration = .seconds(60),
+                searchResultDetail: CodemodeSearchResultDetail = .full) {
         self.models = models
+        self.searchResultDetail = searchResultDetail
         self.lateCallWindow = lateCallWindow
         self.omitInlineOutputSchemas = omitInlineOutputSchemas
         self.inlineEnumValueLimit = inlineEnumValueLimit.map { max(0, $0) }
@@ -95,7 +98,8 @@ private func codemodeDescriptionOptions(_ options: CodemodeToolOptions,
         inlineBudget: options.getInlineBudget?() ?? defaultCodemodeInlineBudget,
         guidelines: guidelines,
         omitInlineOutputSchemas: options.omitInlineOutputSchemas,
-        inlineEnumValueLimit: options.inlineEnumValueLimit)
+        inlineEnumValueLimit: options.inlineEnumValueLimit,
+        searchResultDetail: options.searchResultDetail)
 }
 
 private func describeScriptCall(_ tool: AgentTool) -> String {

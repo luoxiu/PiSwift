@@ -22,9 +22,11 @@ Hosts can set limits without changes to script source:
 ```swift
 let codeMode = createCodemodeExtension(options: CodemodeExtensionOptions(
     mode: .on,
+    inlineBudget: 0,
     defaultTimeoutMs: 60_000,
     maxTimeoutMs: 600_000,
-    validationErrorPrefix: "validation: "
+    validationErrorPrefix: "validation: ",
+    searchResultDetail: .summary
 ))
 ```
 
@@ -34,6 +36,17 @@ file. Set it to `0` to omit all inline tool declarations. Tools with `.codemode`
 or `.deferred` exposure remain callable and available through discovery. Use
 `.deferred` when a tool must stay out of the inline catalog for every budget.
 The default budget remains 3000 estimated tokens.
+
+`CodemodeSearchResultDetail` has `.full` and `.summary` cases. Set the additive
+`searchResultDetail` option on `CodemodeExtensionOptions` (or
+`CodemodeToolOptions`) to `.summary` for rows with exactly `name`, `namespace`,
+and `description`. The namespace is `null` when absent; the description is at
+most 160 characters. Summary rows have no declarations or schemas. The default
+`.full` keeps the existing `{ name, description }` rows with full tool samples.
+In summary mode, search for relevant tools, call `describeTool(name)` for each
+selected tool, then execute calls and return selected results. `describeTool`
+keeps the full description, guidance, input declaration, and output schema.
+Ranking, namespace filters, and `ALL_TOOLS` keep their existing behavior.
 
 `defaultTimeoutMs` and `maxTimeoutMs` are optional. The same fields are available
 in `CodemodeSettings` and the `codemode` settings object. Extension options take

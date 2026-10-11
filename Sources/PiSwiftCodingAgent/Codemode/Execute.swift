@@ -496,6 +496,23 @@ private func handleTool(_ call: CodemodeRuntimeCall, tool: AgentTool?, context: 
     }
 }
 
+/// Keep discovery summaries small. The full description and schema stay in `samples`.
+private func toolSearchSummaryDescription(_ description: String) -> String {
+    let paragraph = description.components(separatedBy: "\n").first ?? ""
+    var summary = paragraph.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+    if let sentenceEnd = summary.range(of: ". ") {
+        summary = String(summary[...sentenceEnd.lowerBound])
+    }
+    guard summary.count > 160 else {
+        return summary
+    }
+    let prefix = String(summary.prefix(159))
+    if let wordEnd = prefix.lastIndex(of: " ") {
+        return String(prefix[..<wordEnd]) + "…"
+    }
+    return prefix + "…"
+}
+
 private func handleGlobal(_ call: CodemodeRuntimeCall, callable: [AgentTool],
                           samples: [String: String], options: CodemodeToolOptions,
                           modelRuntime: (any CodemodeModelRuntime)?, state: CodemodeCallState,
@@ -531,8 +548,16 @@ private func handleGlobal(_ call: CodemodeRuntimeCall, callable: [AgentTool],
                 return createToolSearchDocument(info, namespace: toolNamespace)
             }
             let matches = Bm25Ranker().rank(query, documents: documents, limit: count)
-            return success(AnyCodable(matches.map { match in
-                ["name": toCodemodeIdentifier(match.name), "description": samples[match.name] ?? ""]
+            let toolsByName = Dictionary(callable.map { ($0.name, $0) }, uniquingKeysWith: { _, last in last })
+            return success(AnyCodable(matches.map { match -> [String: Any] in
+                if options.searchResultDetail == .summary {
+                    return [
+                        "name": toCodemodeIdentifier(match.name),
+                        "namespace": options.getToolNamespace?(match.name)?.name as Any? ?? NSNull(),
+                        "description": toolSearchSummaryDescription(toolsByName[match.name]?.description ?? "")
+                    ]
+                }
+                return ["name": toCodemodeIdentifier(match.name), "description": samples[match.name] ?? ""]
             }))
         case "describeTool":
             guard let name = raw.first as? String else { throw CodemodeBridgeError.message("describeTool() expects a tool name") }

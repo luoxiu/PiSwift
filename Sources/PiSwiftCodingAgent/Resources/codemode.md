@@ -29,7 +29,7 @@ The result starts with `Script completed` or `Script failed`, the wall time, and
 | `exit()` | End the script successfully. |
 | `store(key, value)` / `load(key)` | Keep small JSON values across `codemode` calls. See [Store values](#store-values). |
 | `ALL_TOOLS` | Every callable tool as `{ name, description }`, including tools the description does not list. |
-| `searchTools(query, { limit?, namespace? })` | Rank callable tools by relevance (BM25, default limit 8). Resolves to `{ name, description }[]`. |
+| `searchTools(query, { limit?, namespace? })` | Rank callable tools by relevance (BM25, default limit 8). By default, resolves to `{ name, description }[]` with full tool samples. Hosts can use summary mode for `{ name, namespace, description }[]` with short descriptions and no schemas. |
 | `describeTool(name)` | Resolves to a tool's description and TypeScript declaration, or `undefined`. |
 | `describeNamespace(name)` | Resolves to `{ name, description?, instructions?, tools }` for a namespace such as an MCP server, or `undefined`. |
 | `models` | List and run non-LLM models. See [Models](#models). |
@@ -47,7 +47,7 @@ What a call resolves to depends on the tool:
 
 A call that fails, is blocked, or gets invalid arguments rejects with an `Error` that carries the tool's error text. Use `Promise.allSettled()` to keep the results of the calls that succeed.
 
-The `codemode` description lists tools with their TypeScript declarations, grouped by namespace (for example one MCP server). Tools with `deferred` exposure, which includes MCP tools with the default `codemode` exposure, are not listed, so the description stays the same while MCP servers connect. Listed declarations share a budget of 3000 estimated tokens (`codemode.inlineBudget` in [settings](https://github.com/earendil-works/pi/blob/v1.1.0/packages/coding-agent/docs/settings.md#tools)). Scripts find the other tools with `searchTools()`, `describeTool()`, `describeNamespace()`, or by filtering `ALL_TOOLS`.
+The `codemode` description lists tools with their TypeScript declarations, grouped by namespace (for example one MCP server). Tools with `deferred` exposure, which includes MCP tools with the default `codemode` exposure, are not listed, so the description stays the same while MCP servers connect. A host can set `CodemodeExtensionOptions.inlineBudget` to `0` for no inline declarations without writing settings. With `searchResultDetail: .summary`, first use `searchTools()` to find relevant tools, then `describeTool(name)` to inspect each selected schema, execute calls, and return selected results. `describeTool()` keeps the full sample. Listed declarations share a budget of 3000 estimated tokens (`codemode.inlineBudget` in [settings](https://github.com/earendil-works/pi/blob/v1.1.0/packages/coding-agent/docs/settings.md#tools)). Scripts find the other tools with `searchTools()`, `describeTool()`, `describeNamespace()`, or by filtering `ALL_TOOLS`.
 
 While `codemode` is active, `codemode.mode` in [settings](https://github.com/earendil-works/pi/blob/v1.1.0/packages/coding-agent/docs/settings.md#tools) decides how the other tools are presented. With `on` (default) declared tools stay declared, and their descriptions say how to call them from scripts. With `only` they are hidden from the model and listed in the `codemode` description instead, so the model calls them through scripts. Tool declarations in the `codemode` description, `describeTool()`, and `ALL_TOOLS` carry the tools' prompt guidelines, since the system prompt rules only cover declared tools.
 

@@ -7,6 +7,7 @@ public let defaultCodemodeInlineBudget = 3_000.0
 
 public struct CodemodeDescriptionOptions: Sendable {
     public var models: Bool
+    public var searchResultDetail: CodemodeSearchResultDetail
     public var namespaces: [String: ToolNamespace]
     public var deferred: Set<String>
     public var guidelines: [String: [String]]
@@ -23,8 +24,9 @@ public struct CodemodeDescriptionOptions: Sendable {
                 deferred: Set<String> = [], inlineBudget: Double? = defaultCodemodeInlineBudget,
                 sandboxName: String = "JavaScriptCore", guidelines: [String: [String]] = [:],
                 omitInlineOutputSchemas: Bool = false,
-                inlineEnumValueLimit: Int? = nil) {
+                inlineEnumValueLimit: Int? = nil, searchResultDetail: CodemodeSearchResultDetail = .full) {
         self.models = models
+        self.searchResultDetail = searchResultDetail
         self.namespaces = namespaces
         self.deferred = deferred
         self.guidelines = guidelines
@@ -42,13 +44,16 @@ public var CODEMODE_DOCS_PATH: String {
     return Bundle.module.url(forResource: "codemode", withExtension: "md")!.path
 }
 
-private func describeGlobals(models: Bool) -> String {
+private func describeGlobals(models: Bool, searchResultDetail: CodemodeSearchResultDetail) -> String {
     var lines = [
         "Globals:",
         "- `text(value)`, `image(dataUrlOrImageBlock)`, `console.log(...)`, and top-level `return` add output; `exit()` ends the script. With several text items, each starts with a `==> text N/M <==` line, and `console` lines follow the other output in one `<console_output>` block. `image()` also saves the image to a temp file and the result names its path.",
         "- `store(key, value)` and `load(key)` keep JSON values across codemode calls.",
         "- `ALL_TOOLS`, `await searchTools(query, { limit?, namespace? })`, `await describeTool(name)`, `await describeNamespace(name)`: find unlisted tools, such as MCP tools.",
     ]
+    if searchResultDetail == .summary {
+        lines.append("- `searchTools()` returns short summaries with name, namespace, and description. Select tools, call `describeTool(name)` for their full schemas, then call `tools.name(args)` and return selected results.")
+    }
     if models { lines.append("- `models`: classifiers and image generation. Read \(CODEMODE_DOCS_PATH) first.") }
     return lines.joined(separator: "\n")
 }
@@ -154,7 +159,7 @@ public func createCodemodeDescription(_ tools: [AgentTool], options: CodemodeDes
     }
     let shown = selected(ordered, budget: options.inlineBudget)
     let intro = codemodeDescriptionIntro.replacingOccurrences(of: "JavaScriptCore sandbox", with: "\(options.sandboxName) sandbox")
-    var sections = [intro, describeGlobals(models: options.models)]
+    var sections = [intro, describeGlobals(models: options.models, searchResultDetail: options.searchResultDetail)]
     if declarations.contains(where: { shown.contains($0.name) && mcpStructuredContentSchema($0.outputSchema) != nil }) {
         sections.append("Shared MCP Types:\n```ts\n\(mcpTypescriptPreamble)\n```")
     }
