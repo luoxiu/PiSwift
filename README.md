@@ -28,6 +28,13 @@ let codeMode = createCodemodeExtension(options: CodemodeExtensionOptions(
 ))
 ```
 
+`CodemodeExtensionOptions.inlineBudget` is a session extension override. It takes
+precedence over `codemode.inlineBudget` in settings without writing a settings
+file. Set it to `0` to omit all inline tool declarations. Tools with `.codemode`
+or `.deferred` exposure remain callable and available through discovery. Use
+`.deferred` when a tool must stay out of the inline catalog for every budget.
+The default budget remains 3000 estimated tokens.
+
 `defaultTimeoutMs` and `maxTimeoutMs` are optional. The same fields are available
 in `CodemodeSettings` and the `codemode` settings object. Extension options take
 precedence over settings. A script can request a timeout on its first line:
