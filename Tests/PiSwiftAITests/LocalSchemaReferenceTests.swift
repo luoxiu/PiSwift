@@ -87,3 +87,61 @@ func localSchemaReferencesRejectUnresolvedReferences(reference: String) {
     #expect(!result.isValid)
     #expect(result.errors.first?.message == "additional property not allowed")
 }
+
+@Test func localSchemaReferencesResolveArrayIndexes() {
+    // zod-to-json-schema emits references into combinator arrays.
+    let schema: [String: Any] = [
+        "type": "object",
+        "properties": [
+            "filter": ["anyOf": [["type": "string", "minLength": 2], ["type": "integer"]]],
+            "again": ["$ref": "#/properties/filter/anyOf/0"],
+            "pair": ["type": "array", "prefixItems": [["type": "boolean"]], "items": ["$ref": "#/properties/pair/prefixItems/0"]]
+        ]
+    ]
+    #expect(JSONSchemaValidator.shared.validate(["again": "ok", "pair": [true, false]] as [String: Any],
+                                                against: schema, coerceTypes: false).isValid)
+    let result = JSONSchemaValidator.shared.validate(["again": "x"], against: schema, coerceTypes: false)
+    #expect(!result.isValid)
+    #expect(result.errors.first?.path == "again")
+}
+
+@Test(arguments: ["#/anyOf/2", "#/anyOf/01", "#/anyOf/-1", "#/anyOf/x"])
+func localSchemaReferencesRejectInvalidArrayIndexes(reference: String) {
+    let schema: [String: Any] = ["anyOf": [["type": "string"], ["type": "integer"]], "$ref": reference]
+    let result = JSONSchemaValidator.shared.validate("value", against: schema)
+    #expect(result.errors.first?.message == "unresolved local schema reference")
+}
+
+@Test func optionalNullsAreRemovedInsideReferencedObjects() throws {
+    let options: [String: Any] = ["type": "object", "properties": ["limit": ["type": "integer"]]]
+    let schema: [String: Any] = [
+        "type": "object",
+        "properties": [
+            "opts": ["$ref": "#/$defs/Opts"],
+            "maybe": ["anyOf": [["$ref": "#/$defs/Opts"], ["type": "null"]]],
+            "list": ["type": "array", "items": ["$ref": "#/$defs/Opts"]]
+        ],
+        "$defs": ["Opts": options]
+    ]
+    let tool = AITool(name: "pydantic", description: "Pydantic", parameters: schema.mapValues(AnyCodable.init))
+    let arguments: [String: AnyCodable] = [
+        "opts": AnyCodable(["limit": NSNull()]),
+        "maybe": AnyCodable(["limit": NSNull()]),
+        "list": AnyCodable([["limit": NSNull()]])
+    ]
+    let result = try validateToolArguments(tool: tool, toolCall: ToolCall(id: "call", name: "pydantic", arguments: arguments))
+    #expect((result["opts"]?.value as? [String: Any])?.isEmpty == true)
+    #expect((result["maybe"]?.value as? [String: Any])?.isEmpty == true)
+    #expect((result["list"]?.value as? [[String: Any]])?.first?.isEmpty == true)
+}
+
+@Test func optionalNullsAreKeptForNullableReferenceTargets() throws {
+    let schema: [String: Any] = [
+        "type": "object",
+        "properties": ["opts": ["$ref": "#/$defs/Opts"]],
+        "$defs": ["Opts": ["type": "object", "properties": ["limit": ["anyOf": [["$ref": "#/$defs/Count"], ["type": "null"]]]]],
+                  "Count": ["type": "integer"]]
+    ]
+    let normalized = normalizeOptionalNulls(["opts": ["limit": NSNull()]], schema: schema) as? [String: Any]
+    #expect((normalized?["opts"] as? [String: Any])?["limit"] is NSNull)
+}

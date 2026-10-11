@@ -251,8 +251,10 @@ private actor CodemodeCallState {
     private var modelCallCount = 0
     private var generatedImages = 0
     private var closed = false
-    private var rejectedCount = 0
+    private var rejectedIDs: Set<String> = []
     private var nativeCallIndexes: Set<Int> = []
+    private var rowByCallID: [Int: Int] = [:]
+    private var notStartedCallIDs: Set<Int> = []
     private var lateRecordCount = 0
     private let recordLateCall: (@Sendable (String, CodemodeNestedCall) -> Void)?
     private let toolCallId: String
@@ -294,12 +296,53 @@ private actor CodemodeCallState {
         return calls.count - 1
     }
 
-    func startTool(name: String, args: String) -> Int {
+    func startTool(callID: Int, name: String, args: String) -> Int {
         let index = start(id: "\(toolCallId)/?", name: name, args: args)
         if index >= 0 {
-            nativeCallIndexes.insert(index)
+            rowByCallID[callID] = index
         }
         return index
+    }
+
+    /// Marks the row as dispatched to the native tool. A row that was never dispatched
+    /// cannot have an unknown outcome.
+    func beginNativeCall(index: Int, signal: CancellationToken) -> Bool {
+        guard calls.indices.contains(index), !closed else {
+            return false
+        }
+        guard !signal.isCancelled else {
+            cancelBeforeDispatch(index: index)
+            return false
+        }
+        nativeCallIndexes.insert(index)
+        return true
+    }
+
+    func cancelBeforeDispatch(index: Int, error: String = codemodeNotStartedMessage) {
+        guard calls.indices.contains(index), !closed, calls[index].status == .running else {
+            return
+        }
+        calls[index].status = .cancelled
+        calls[index].error = error
+        publish()
+    }
+
+    /// A call the script made before it ended can start after the result is complete.
+    /// `complete(rejected:unfinished:)` usually recorded it already.
+    func recordNotStarted(callID: Int, name: String, args: String) {
+        guard closed, notStartedCallIDs.insert(callID).inserted else {
+            return
+        }
+        appendNotStarted(name: name, args: args)
+        if let call = calls.last {
+            recordAfterEnd(call)
+        }
+        publish()
+    }
+
+    private func appendNotStarted(name: String, args: String) {
+        calls.append(CodemodeNestedCall(id: "\(toolCallId)/?", name: name, args: previewJSON(args),
+                                        status: .cancelled, error: codemodeNotStartedMessage))
     }
 
     func nextModelCallID(_ name: String) -> String {
@@ -325,20 +368,35 @@ private actor CodemodeCallState {
     }
 
     func recordRejected(_ call: CodemodeRuntimeCall) {
-        guard rejectedCount < 128 else {
+        guard appendRejected(call) else {
             return
         }
-        rejectedCount += 1
-        calls.append(CodemodeNestedCall(id: "\(toolCallId)/rejected/\(call.id)", name: call.name,
-                                       args: call.argsJSON ?? "", status: .rejectedAfterEnd,
-                                       error: "Execution ended before dispatch"))
         if let call = calls.last {
             recordAfterEnd(call)
         }
         publish()
     }
 
-    func complete() -> (calls: [CodemodeNestedCall], usage: Usage?, generatedImages: Int) {
+    /// Adds one row per rejected call ID. The runtime and its callback can report the same call.
+    private func appendRejected(_ call: CodemodeRuntimeCall) -> Bool {
+        let id = "\(toolCallId)/rejected/\(call.id)"
+        guard rejectedIDs.count < 128, rejectedIDs.insert(id).inserted else {
+            return false
+        }
+        calls.append(CodemodeNestedCall(id: id, name: call.name, args: call.argsJSON ?? "",
+                                        status: .rejectedAfterEnd, error: "Execution ended before dispatch"))
+        return true
+    }
+
+    /// - Parameter unfinished: Tool calls that the script made before it ended and that have no reply.
+    func complete(rejected: [CodemodeRuntimeCall], unfinished: [CodemodeRuntimeCall])
+        -> (calls: [CodemodeNestedCall], usage: Usage?, generatedImages: Int) {
+        for call in unfinished where rowByCallID[call.id] == nil && notStartedCallIDs.insert(call.id).inserted {
+            appendNotStarted(name: call.name, args: call.argsJSON ?? "")
+        }
+        for call in rejected {
+            _ = appendRejected(call)
+        }
         closed = true
         for index in calls.indices where calls[index].status == .running {
             if nativeCallIndexes.contains(index) {
@@ -376,44 +434,45 @@ private func failure(_ message: String) -> CodemodeRuntimeReply {
     CodemodeRuntimeReply(ok: false, payloadJSON: message)
 }
 
+private let codemodeNotStartedMessage = "Execution ended before the tool call started"
+
 private func handleTool(_ call: CodemodeRuntimeCall, tool: AgentTool?, context: CustomToolContext?,
                         state: CodemodeCallState, options: CodemodeToolOptions) async -> CodemodeRuntimeReply {
-    guard !call.signal.isCancelled else { return failure("Execution ended before the tool call started") }
     guard let tool, let context else { return failure("Tool calls need a session") }
     let started = Date()
     let argsJSON = call.argsJSON ?? "{}"
-    let index = await state.startTool(name: tool.name, args: call.argsJSON ?? "")
-    guard index >= 0, !call.signal.isCancelled else {
-        return failure("Execution ended before the tool call started")
+    let index = await state.startTool(callID: call.id, name: tool.name, args: call.argsJSON ?? "")
+    guard index >= 0 else {
+        await state.recordNotStarted(callID: call.id, name: tool.name, args: call.argsJSON ?? "")
+        return failure(codemodeNotStartedMessage)
+    }
+    guard !call.signal.isCancelled else {
+        await state.cancelBeforeDispatch(index: index)
+        return failure(codemodeNotStartedMessage)
     }
     do {
-        let args: [String: Any]
+        // Prepare and validate once here, so every host sees schema failures before dispatch.
+        let args: [String: AnyCodable]
         do {
             guard let object = try parseJSON(argsJSON).value as? [String: Any] else {
                 throw CodemodeBridgeError.message("Tool arguments must be an object")
             }
-            args = object
+            var prepared = object.mapValues(AnyCodable.init)
+            if let prepare = tool.prepareArguments, let rewritten = try await prepare(prepared) {
+                prepared = rewritten
+            }
+            args = try validateToolArguments(tool: tool.aiTool,
+                toolCall: ToolCall(id: "\(call.id)", name: tool.name, arguments: prepared))
         } catch {
             throw CodemodeBridgeError.message((options.validationErrorPrefix ?? "") + error.localizedDescription)
         }
-        if let prefix = options.validationErrorPrefix {
-            do {
-                var prepared = args.mapValues(AnyCodable.init)
-                if let prepare = tool.prepareArguments, let rewritten = try await prepare(prepared) {
-                    prepared = rewritten
-                }
-                _ = try validateToolArguments(tool: tool.aiTool,
-                    toolCall: ToolCall(id: "\(call.id)", name: tool.name, arguments: prepared))
-            } catch {
-                throw CodemodeBridgeError.message(prefix + error.localizedDescription)
-            }
+        guard await state.beginNativeCall(index: index, signal: call.signal) else {
+            return failure(codemodeNotStartedMessage)
         }
-        guard !call.signal.isCancelled else {
-            throw CodemodeBridgeError.message("Execution ended before the tool call started")
-        }
-        let outcome = await context.executeTool(name: tool.name, args: args.mapValues(AnyCodable.init),
+        let outcome = await context.executeTool(name: tool.name, args: args,
                                                  options: ExecuteToolOptions(signal: call.signal,
-                                                     argumentsJSON: parseToolArgumentsSource(argsJSON)))
+                                                     argumentsJSON: parseToolArgumentsSource(argsJSON),
+                                                     argumentsPrepared: true))
         let body = textOf(outcome.result)
         let unknown = (outcome.result.details?.value as? [String: Any])?["outcome"] as? String == "unknown"
         let message = unknown && body.isEmpty ? "outcome_unknown: the native operation may still be running" : body
@@ -548,7 +607,9 @@ private func handleGlobal(_ call: CodemodeRuntimeCall, callable: [AgentTool],
                 await limit.acquire()
                 guard index >= 0, !call.signal.isCancelled else {
                     await limit.release()
-                    return failure("Execution ended before the model call started")
+                    let message = "Execution ended before the model call started"
+                    await state.cancelBeforeDispatch(index: index, error: message)
+                    return failure(message)
                 }
                 let reply: AnyCodable
                 let stopReason: String
@@ -608,15 +669,17 @@ public func executeCodemode(toolCallId: String, params: [String: AnyCodable],
                 throw CodemodeSourceError("Host timeout must be a positive integer up to 2147483647")
             }
         }
-        timeoutMs = parsed.options.timeoutMs ?? defaultTimeout
-        if let timeoutMs, let maximum, timeoutMs > maximum {
+        if let requested = parsed.options.timeoutMs, let maximum, requested > maximum {
             throw CodemodeSourceError("Script timeout must not exceed \(maximum) ms")
         }
+        // The host maximum also limits a script that requests no timeout.
+        timeoutMs = parsed.options.timeoutMs ?? [defaultTimeout, maximum].compactMap { $0 }.min()
     } catch {
         throw CodemodeSourceError((options.validationErrorPrefix ?? "") + error.localizedDescription)
     }
     let callable = context.map { getCodemodeCallableTools($0.tools) } ?? []
     let guidelines = options.getToolGuidelines?() ?? [:]
+    // This check covers the sandbox identifiers, so the sandbox does not do it again.
     if options.collisionPolicy == .reject, let collision = codemodeToolIdentifierCollision(callable.map(\.name)) {
         throw CodemodeSourceError((options.validationErrorPrefix ?? "") + collision)
     }
@@ -640,8 +703,11 @@ public func executeCodemode(toolCallId: String, params: [String: AnyCodable],
         code: parsed.code, tools: runtimeTools, globals: globals,
         store: context.map { readCodemodeStore($0.sessionManager.getBranch()) } ?? [:],
         timeoutMs: timeoutMs, signal: signal, forceWatchdog: forceWatchdog,
-        collisionPolicy: options.collisionPolicy,
-        onRejectedCall: { call in
+        // An abandoned JavaScriptCore thread retains this closure. It must not retain the call state.
+        onRejectedCall: { [weak state] call in
+            guard let state else {
+                return
+            }
             Task {
                 await state.recordRejected(call)
             }
@@ -655,15 +721,14 @@ public func executeCodemode(toolCallId: String, params: [String: AnyCodable],
                                           modelRuntime: modelRuntime, state: state, limit: limit)
             }
         })
-    var final = await state.complete()
-    let recordedRejections = Set(final.calls.filter { $0.status == .rejectedAfterEnd }.map(\.id))
-    final.calls += result.rejectedCalls.compactMap { call in
-        let id = "\(toolCallId)/rejected/\(call.id)"
-        guard !recordedRejections.contains(id) else {
-            return nil
+    let unfinishedTools = context == nil ? [] : result.unfinishedCalls.filter { $0.target == .tool && byName[$0.name] != nil }
+    let final = await state.complete(rejected: result.rejectedCalls, unfinished: unfinishedTools)
+    if result.usedWatchdog {
+        // The thread can still try calls. Keep their records for a limited time only.
+        Task { [state] in
+            try? await Task.sleep(for: options.lateCallWindow)
+            withExtendedLifetime(state) {}
         }
-        return CodemodeNestedCall(id: id, name: call.name, args: call.argsJSON ?? "",
-                                  status: .rejectedAfterEnd, error: "Execution ended before dispatch")
     }
     if result.execution.failure == nil,
        !result.storeWrites.set.isEmpty || !result.storeWrites.delete.isEmpty {

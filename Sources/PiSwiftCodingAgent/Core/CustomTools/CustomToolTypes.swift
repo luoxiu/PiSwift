@@ -90,11 +90,16 @@ public struct ExecuteToolOptions: Sendable {
     public var signal: CancellationToken?
     public var onUpdate: AgentToolUpdateCallback?
     public var argumentsJSON: OrderedJSON?
+    /// The caller already ran the tool's `prepareArguments`, so the session does not run it again.
+    /// The session still validates the arguments against the tool that it executes.
+    public var argumentsPrepared: Bool
 
-    public init(signal: CancellationToken? = nil, onUpdate: AgentToolUpdateCallback? = nil, argumentsJSON: OrderedJSON? = nil) {
+    public init(signal: CancellationToken? = nil, onUpdate: AgentToolUpdateCallback? = nil, argumentsJSON: OrderedJSON? = nil,
+                argumentsPrepared: Bool = false) {
         self.signal = signal
         self.onUpdate = onUpdate
         self.argumentsJSON = argumentsJSON
+        self.argumentsPrepared = argumentsPrepared
     }
 }
 

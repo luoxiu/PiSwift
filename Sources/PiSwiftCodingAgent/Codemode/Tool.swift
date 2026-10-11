@@ -32,6 +32,8 @@ public struct CodemodeToolOptions: Sendable {
     public var appendEntry: (@Sendable (String, CodemodeStoreEntryData) -> Void)?
     /// Persist a bounded call update that arrives after the script result.
     public var recordLateCall: (@Sendable (String, CodemodeNestedCall) -> Void)?
+    /// How long an execution records calls from a JavaScriptCore thread that the host abandoned.
+    public var lateCallWindow: Duration
     public var getMode: (@Sendable () -> CodemodeMode)?
     public var getInlineBudget: (@Sendable () -> Double?)?
     /// A test can supply a model runtime without a full session.
@@ -52,8 +54,10 @@ public struct CodemodeToolOptions: Sendable {
                 getMaxTimeoutMs: (@Sendable () -> Int?)? = nil,
                 recordLateCall: (@Sendable (String, CodemodeNestedCall) -> Void)? = nil,
                 omitInlineOutputSchemas: Bool = false,
-                inlineEnumValueLimit: Int? = nil) {
+                inlineEnumValueLimit: Int? = nil,
+                lateCallWindow: Duration = .seconds(60)) {
         self.models = models
+        self.lateCallWindow = lateCallWindow
         self.omitInlineOutputSchemas = omitInlineOutputSchemas
         self.inlineEnumValueLimit = inlineEnumValueLimit.map { max(0, $0) }
         self.collisionPolicy = collisionPolicy

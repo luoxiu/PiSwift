@@ -74,6 +74,20 @@ public func createAllTools(cwd: String) -> [ToolName: Tool] {
     createAllTools(cwd: cwd, options: nil)
 }
 
+/// The built-in tools that `createAllTools` creates with these options.
+func availableBuiltInToolNames(bash: BashToolOptions?, includesSubagent: Bool) -> [ToolName] {
+    ToolName.allCases.filter { name in
+        switch name {
+        case .bash:
+            return shouldIncludeBashTool(bash)
+        case .subagent:
+            return includesSubagent
+        default:
+            return true
+        }
+    }
+}
+
 public func createAllTools(cwd: String, options: ToolsOptions?, subagentContext: SubagentToolContext?) -> [ToolName: Tool] {
     var tools: [ToolName: Tool] = [
         .read: createReadTool(cwd: cwd, options: options?.read),

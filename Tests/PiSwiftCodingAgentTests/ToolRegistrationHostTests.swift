@@ -313,3 +313,130 @@ private func registrationSession(policy: ToolNameCollisionPolicy = .overwrite,
     #expect(eventCalls.withLock { $0 } >= 1)
     #expect(result.diagnostics.contains { $0.type == "error" && $0.path == "<inline:later>" })
 }
+
+@Test func hostRegistrationRejectPolicyLetsOwnerUpdateItsTool() async throws {
+    let saved = LockedState<HookAPI?>(nil)
+    let result = try await registrationSession(policy: .reject, extensions: [InlineExtension(name: "owner") { api in
+        saved.withLock { $0 = api }
+        try api.registerTool(registrationTool("same", "first")).get()
+    }])
+    defer { result.session.dispose() }
+    let api = try #require(saved.withLock { $0 })
+    var updated = registrationTool("same", "updated")
+    updated.exposure = .codemode
+    try api.registerTool(updated).get()
+    var withdrawn = registrationTool("same", "withdrawn")
+    withdrawn.exposure = .hidden
+    try api.registerTool(withdrawn).get()
+    let info = try #require(result.session.getAllTools().first { $0.name == "same" })
+    #expect(info.ownerPath == "<inline:owner>")
+    #expect(info.exposure == .hidden)
+    #expect(info.description == "withdrawn")
+    #expect(!result.session.getCallableTools().contains { $0.name == "same" })
+}
+
+private func replaceableBuiltin(_ events: LockedState<Int>) -> InlineExtension {
+    InlineExtension(name: "replaceable-tool", builtin: true, replaceable: true) { api in
+        _ = api.registerTool(registrationTool("same", "builtin"))
+        api.onAny("session_start") { _, _ in
+            events.withLock { $0 += 1 }
+            return nil
+        }
+    }
+}
+
+@Test(arguments: [false, true])
+func hostRegistrationRejectPolicyReplacesReplaceableBuiltin(extensionFirst: Bool) async throws {
+    let events = LockedState(0)
+    let user = InlineExtension(name: "user") { api in
+        try api.registerTool(registrationTool("same", "user")).get()
+    }
+    let extensions = extensionFirst ? [user, replaceableBuiltin(events)] : [replaceableBuiltin(events), user]
+    let result = try await registrationSession(policy: .reject, extensions: extensions)
+    defer { result.session.dispose() }
+    let info = try #require(result.session.getAllTools().first { $0.name == "same" })
+    #expect(info.ownerPath == "<inline:user>")
+    #expect(info.description == "user")
+    #expect(result.session.hookRunner?.getExtensionHookPaths().contains("builtin:replaceable-tool") == false)
+    #expect(!result.diagnostics.contains { $0.type == "error" })
+    #expect(result.diagnostics.contains { $0.type == "warning" && $0.path == "builtin:replaceable-tool" })
+    await result.session.hookRunner?.emitToExtensions(SessionStartEvent(reason: .reload))
+    #expect(events.withLock { $0 } == 0)
+}
+
+@Test func hostRegistrationReservesOnlyCreatedBuiltins() {
+    let names = availableBuiltInToolNames(bash: nil, includesSubagent: false)
+    #expect(!names.contains(.subagent))
+    #expect(availableBuiltInToolNames(bash: nil, includesSubagent: true).contains(.subagent))
+    #expect(availableBuiltInToolNames(bash: BashToolOptions(operations: nil), includesSubagent: false).contains(.bash)
+        == shouldIncludeBashTool(BashToolOptions(operations: nil)))
+    let registry = ToolRegistrationRegistry(collisionPolicy: .reject)
+    for name in names {
+        _ = registry.register(name: name.rawValue, ownerPath: BUILTIN_PATH_PREFIX + name.rawValue, kind: .fixed)
+    }
+    #expect(registry.register(name: "subagent", ownerPath: "<inline:host>", kind: .extension) == nil)
+}
+
+@Test func hostRegistrationDefaultOrderFollowsCurrentTools() throws {
+    let path = "/tmp/late-tools.swift"
+    let api = HookAPI(hookPath: path)
+    let hook = LoadedHook(path: path, resolvedPath: path, handlers: [:], tools: api.tools,
+                          currentTools: { api.tools }, isExtension: true)
+    try api.registerTool(registrationTool("late", "late")).get()
+    #expect(hook.currentToolOrder() == ["late"])
+    let runner = HookRunner([hook], "/tmp", .inMemory(), ModelRegistry(AuthStorage(":memory:")))
+    #expect(runner.getExtensionToolDefinitions().map(\.tool.name) == ["late"])
+}
+
+private struct RegistrationFactoryError: Error, LocalizedError {
+    var errorDescription: String? { "factory failed" }
+}
+
+@Test(arguments: [ToolNameCollisionPolicy.overwrite, .reject])
+func hostRegistrationReportsLoadErrorsWithEachPolicy(policy: ToolNameCollisionPolicy) async throws {
+    let result = try await registrationSession(policy: policy, extensions: [InlineExtension(name: "broken") { _ in
+        throw RegistrationFactoryError()
+    }])
+    defer { result.session.dispose() }
+    #expect(result.diagnostics.contains { $0.type == "error" && $0.message.contains("factory failed") })
+}
+
+@Test func hostRegistrationPreparedCallSkipsPrepareButValidates() async throws {
+    let prepared = LockedState(0)
+    let tool = AgentTool(label: "read", name: "read", description: "Read",
+        parameters: ["type": AnyCodable("object"), "properties": AnyCodable(["path": ["type": "string"]]),
+                     "required": AnyCodable(["path"])],
+        execute: { _, _, _, _ in AgentToolResult(content: [.text(TextContent(text: "read"))]) },
+        prepareArguments: { _ in
+            prepared.withLock { $0 += 1 }
+            return nil
+        })
+    let model = try #require(getModel(provider: .openai, modelId: "gpt-4o-mini"))
+    let assistant = AssistantMessage(content: [], api: model.api, provider: model.provider, model: model.id,
+        usage: Usage(input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0), stopReason: .toolUse)
+    let run: @Sendable (AgentToolCall, Bool) async -> AgentToolCallOutcome = { call, argumentsPrepared in
+        await runToolCall(call, options: RunToolCallOptions(tools: [tool], assistantMessage: assistant,
+            context: AgentContext(messages: [], tools: [tool]), argumentsPrepared: argumentsPrepared))
+    }
+    let used = LockedState<[Bool]>([])
+    let runner = NestedToolCallRunner(host: NestedToolCallHost(getTools: { [tool] }, isSequential: { false },
+        runToolCall: { call, _, _, _ in
+            used.withLock { $0.append(false) }
+            return await run(call, false)
+        },
+        emit: { _ in },
+        runPreparedToolCall: { call, _, _, _ in
+            used.withLock { $0.append(true) }
+            return await run(call, true)
+        }))
+    let valid = await runner.execute(callerId: "outer", name: "read", args: ["path": AnyCodable("a")],
+                                     options: ExecuteToolOptions(argumentsPrepared: true))
+    #expect(!valid.isError)
+    #expect(prepared.withLock { $0 } == 0)
+    let invalid = await runner.execute(callerId: "outer", name: "read", args: [:],
+                                       options: ExecuteToolOptions(argumentsPrepared: true))
+    #expect(invalid.isError)
+    _ = await runner.execute(callerId: "outer", name: "read", args: ["path": AnyCodable("a")])
+    #expect(prepared.withLock { $0 } == 1)
+    #expect(used.withLock { $0 } == [true, true, false])
+}

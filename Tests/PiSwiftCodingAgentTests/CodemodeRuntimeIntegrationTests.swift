@@ -159,10 +159,13 @@ private func codemodeRun(_ code: String, session: SessionManager = .inMemory(),
         }, context, nil)
     #expect(codemodeValue(early) == "early")
     let rows = (early.details?.value as? [String: Any])?["calls"] as? [[String: Any]]
+    // The host dispatches a call made before the script result. It either started or was cancelled before dispatch.
     let status = rows?.first?["status"] as? String
-    #expect(status == "outcome_unknown" || status == "rejected_after_end")
+    #expect(status == "outcome_unknown" || status == "cancelled")
     if status == "outcome_unknown" {
         #expect(updates.withLock { $0 }.contains("running"))
+    } else {
+        #expect(rows?.first?["error"] as? String == "Execution ended before the tool call started")
     }
 }
 

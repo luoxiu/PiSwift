@@ -2036,8 +2036,9 @@ public struct LoadedHook: Sendable {
         self.flags = flags
         self.shortcuts = shortcuts
         self.tools = tools
-        self.currentTools = currentTools ?? { tools }
-        self.currentToolOrder = currentToolOrder ?? { tools.keys.sorted() }
+        let resolvedCurrentTools = currentTools ?? { tools }
+        self.currentTools = resolvedCurrentTools
+        self.currentToolOrder = currentToolOrder ?? { resolvedCurrentTools().keys.sorted() }
         self.toolRegistrationErrors = toolRegistrationErrors
         self.toolRenderers = toolRenderers
         self.currentToolRenderers = currentToolRenderers ?? { toolRenderers }
@@ -2128,6 +2129,8 @@ public enum HookAPIError: LocalizedError, Sendable {
 
 public final class HookAPI: Sendable {
     private let toolRegistrationRegistry: ToolRegistrationRegistry?
+    /// True for a built-in extension that another extension can replace.
+    private let replaceable: Bool
     private let isLoading = LockedState(false)
     private let registrationErrors = LockedState<[HookAPIError]>([])
     public var toolRegistrationErrors: [HookAPIError] {
@@ -2407,8 +2410,9 @@ public final class HookAPI: Sendable {
     }
 
     public init(events: EventBus = createEventBus(), hookPath: String? = nil,
-                toolRegistrationRegistry: ToolRegistrationRegistry? = nil) {
+                toolRegistrationRegistry: ToolRegistrationRegistry? = nil, replaceable: Bool = false) {
         self.toolRegistrationRegistry = toolRegistrationRegistry
+        self.replaceable = replaceable
         self.mcpServerRegistry = (events as? EventBusImpl)?.mcpServers
         let trackedEventBus = TrackedEventBus(events)
         self.trackedEventBus = trackedEventBus
@@ -2762,7 +2766,8 @@ public final class HookAPI: Sendable {
             return .failure(error)
         }
         if isLoading.withLock({ $0 }),
-           let error = toolRegistrationRegistry?.register(name: tool.name, ownerPath: hookPath, exposure: tool.exposure ?? .direct) {
+           let error = toolRegistrationRegistry?.register(name: tool.name, ownerPath: hookPath, exposure: tool.exposure ?? .direct,
+                                                          kind: replaceable ? .replaceableExtension : .extension) {
             registrationErrors.withLock { $0.append(error) }
             return .failure(error)
         }

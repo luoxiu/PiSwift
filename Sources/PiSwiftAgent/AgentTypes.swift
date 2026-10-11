@@ -168,6 +168,8 @@ public struct RunToolCallOptions: Sendable {
     public var onUpdate: ToolUpdateSink?
     public var beforeToolCall: BeforeToolCallFn?
     public var afterToolCall: AfterToolCallFn?
+    /// The caller already ran `prepareArguments`. Schema validation still runs.
+    public var argumentsPrepared: Bool
 
     public init(
         tools: [AgentTool],
@@ -176,7 +178,8 @@ public struct RunToolCallOptions: Sendable {
         signal: CancellationToken? = nil,
         onUpdate: ToolUpdateSink? = nil,
         beforeToolCall: BeforeToolCallFn? = nil,
-        afterToolCall: AfterToolCallFn? = nil
+        afterToolCall: AfterToolCallFn? = nil,
+        argumentsPrepared: Bool = false
     ) {
         self.tools = tools
         self.assistantMessage = assistantMessage
@@ -185,6 +188,7 @@ public struct RunToolCallOptions: Sendable {
         self.onUpdate = onUpdate
         self.beforeToolCall = beforeToolCall
         self.afterToolCall = afterToolCall
+        self.argumentsPrepared = argumentsPrepared
     }
 
     public var hooks: ToolCallHooks {

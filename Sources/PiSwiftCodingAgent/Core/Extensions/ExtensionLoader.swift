@@ -23,7 +23,8 @@ public struct ExtensionLoader {
         toolRegistrationRegistry: ToolRegistrationRegistry? = nil
     ) -> LoadExtensionResult {
         let path = inlineExtension.builtin ? "\(BUILTIN_PATH_PREFIX)\(inlineExtension.name)" : "<inline:\(inlineExtension.name)>"
-        let api = HookAPI(events: eventBus, hookPath: path, toolRegistrationRegistry: toolRegistrationRegistry)
+        let api = HookAPI(events: eventBus, hookPath: path, toolRegistrationRegistry: toolRegistrationRegistry,
+                          replaceable: inlineExtension.replaceable)
         api.setExecCwd(cwd)
         api.beginLoading()
         do {

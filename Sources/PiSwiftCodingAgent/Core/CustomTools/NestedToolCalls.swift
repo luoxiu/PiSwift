@@ -92,6 +92,11 @@ public struct NestedToolCallHost: Sendable {
         _ onUpdate: @escaping ToolUpdateSink
     ) async -> AgentToolCallOutcome
     public var emit: @Sendable (NestedToolExecutionEvent) async -> Void
+    /// Runs a call whose arguments the caller already prepared. Nil uses `runToolCall`.
+    public var runPreparedToolCall: (@Sendable (
+        _ toolCall: AgentToolCall, _ parentToolCallId: String, _ signal: CancellationToken?,
+        _ onUpdate: @escaping ToolUpdateSink
+    ) async -> AgentToolCallOutcome)?
 
     public init(
         getTools: @escaping @Sendable () -> [AgentTool],
@@ -99,12 +104,16 @@ public struct NestedToolCallHost: Sendable {
         runToolCall: @escaping @Sendable (
             AgentToolCall, String, CancellationToken?, @escaping ToolUpdateSink
         ) async -> AgentToolCallOutcome,
-        emit: @escaping @Sendable (NestedToolExecutionEvent) async -> Void
+        emit: @escaping @Sendable (NestedToolExecutionEvent) async -> Void,
+        runPreparedToolCall: (@Sendable (
+            AgentToolCall, String, CancellationToken?, @escaping ToolUpdateSink
+        ) async -> AgentToolCallOutcome)? = nil
     ) {
         self.getTools = getTools
         self.isSequential = isSequential
         self.runToolCall = runToolCall
         self.emit = emit
+        self.runPreparedToolCall = runPreparedToolCall
     }
 }
 
@@ -168,7 +177,8 @@ public actor NestedToolCallRunner {
         scopes[toolCall.id] = Scope(rootId: scope.rootId, nextId: 1,
                                     holdsQueue: scope.holdsQueue || exclusive)
 
-        let outcome = await host.runToolCall(toolCall, callerId, options.signal) { [host] partial in
+        let run = options.argumentsPrepared ? host.runPreparedToolCall ?? host.runToolCall : host.runToolCall
+        let outcome = await run(toolCall, callerId, options.signal) { [host] partial in
             options.onUpdate?(partial)
             await host.emit(.update(toolCallId: toolCall.id, toolName: name, args: toolCall.arguments,
                                     partialResult: partial, parentToolCallId: callerId))

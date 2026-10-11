@@ -32,26 +32,41 @@ let codeMode = createCodemodeExtension(options: CodemodeExtensionOptions(
 in `CodemodeSettings` and the `codemode` settings object. Extension options take
 precedence over settings. A script can request a timeout on its first line:
 `// @options: {"timeout_ms": 600000}`. A request above the host maximum fails with
-an error that gives the maximum. With both options unset, the existing timeout
+an error that gives the maximum. A script without `timeout_ms` uses the default,
+and the maximum also limits that default. With only `maxTimeoutMs` set, the
+maximum is the timeout. With both options unset, the existing timeout
 behavior stays in use. A host timeout ends the wait. It cannot guarantee that
 a JavaScriptCore thread or a native operation has stopped on iOS.
 
+The host dispatches each call that a script makes before its result. When the script
+ends, the host cancels the calls that are not complete. A call that did not start has
+the status `cancelled` and the error "Execution ended before the tool call started".
 After a script ends, later bridge calls are rejected before tool dispatch.
 Their bounded call records use `rejected_after_end`. `CodemodeRuntimeResult.rejectedCalls`
 remains available for attempts after the host returns. The built-in extension saves
 late call details as `codemode-late-call` session entries, with the parent tool-call
 ID and the call row. It retains at most 128 such rows per execution, with bounded
 argument and error previews. A late bridge call also rejects its JavaScript promise.
+When the host abandons a JavaScriptCore thread, it records rejected calls from that
+thread for 60 seconds (`CodemodeToolOptions.lateCallWindow`). After that time, the
+execution releases its call state, and `rejectedCalls` still holds the calls.
 For a native operation whose result is uncertain, return `AgentToolResult.details` with `{"outcome": "unknown"}`.
 Code mode records `outcome_unknown` and lists these calls separately in error and
 abort summaries. The caller must inspect the operation before a retry. Keep an
-existing error prefix in the result text. The optional `validationErrorPrefix`
-applies to code mode argument-schema failures before the host tool hook runs.
+existing error prefix in the result text. Code mode runs `prepareArguments` and
+schema validation for each nested call before the host tool hook runs. The session
+does not run `prepareArguments` again. It validates the arguments again against the
+tool that it executes, because a live registration can replace that tool. The
+optional `validationErrorPrefix` is added to the code mode argument failures.
 
 Set `CreateAgentSessionOptions.toolNameCollisionPolicy` to `.reject` to reject
 duplicate tool names and JavaScript identifiers such as `edit-node` and
 `edit_node`. The default is `.overwrite` for compatibility. A rejected extension
-registration returns `HookAPIError` and produces a diagnostic. Extension tools
+registration returns `HookAPIError` and produces a diagnostic. An extension can
+register its own tool again, for example to hide it. Only the built-in tools that the
+session creates reserve their names. An extension that registers the tool name of a
+replaceable built-in extension replaces that built-in extension, as with `.overwrite`.
+Extension load failures are `error` diagnostics with each policy. Extension tools
 retain registration order. `ToolInfo.ownerPath` identifies the owner of the
 executable registration, including live replacements. `ToolNamespace.version`
 is optional and appears as `version` in `describeNamespace` output.

@@ -61,6 +61,18 @@ public final class JSONSchemaValidator: Sendable {
                  context: ValidationContext(root: schema))
     }
 
+    /// Validate a sub-schema whose local references resolve against `root`.
+    func validate(_ value: Any?, against schema: [String: Any], root: [String: Any],
+                  coerceTypes: Bool) -> ValidationResult {
+        validate(value, against: schema, path: "root", coerceTypes: coerceTypes,
+                 context: ValidationContext(root: root))
+    }
+
+    /// Resolve a local JSON pointer reference such as `#/$defs/Item` or `#/anyOf/0`.
+    static func resolveLocalReference(_ reference: String, in root: [String: Any]) -> Any? {
+        ValidationContext(root: root).resolve(reference)
+    }
+
     private struct ReferenceLocation: Hashable {
         let reference: String
         let valueDepth: Int
@@ -94,12 +106,28 @@ public final class JSONSchemaValidator: Sendable {
                 }
                 let key = segment.replacingOccurrences(of: "~1", with: "/")
                     .replacingOccurrences(of: "~0", with: "~")
-                guard let dictionary = current as? [String: Any], let next = dictionary[key] else {
+                if let dictionary = current as? [String: Any] {
+                    guard let next = dictionary[key] else {
+                        return nil
+                    }
+                    current = next
+                } else if let array = current as? [Any], let index = Self.arrayIndex(key), index < array.count {
+                    current = array[index]
+                } else {
                     return nil
                 }
-                current = next
             }
             return current
+        }
+
+        /// RFC 6901 array indexes are "0" or digits without a leading zero.
+        private static func arrayIndex(_ segment: String) -> Int? {
+            guard let first = segment.first, first.isASCII, first.isNumber,
+                  segment.allSatisfy({ $0.isASCII && $0.isNumber }),
+                  segment == "0" || first != "0" else {
+                return nil
+            }
+            return Int(segment)
         }
     }
 

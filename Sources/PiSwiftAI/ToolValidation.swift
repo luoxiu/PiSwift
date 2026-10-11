@@ -137,12 +137,21 @@ private func convertToAnyCodable(_ dict: [String: Any]) -> [String: AnyCodable] 
 }
 
 func normalizeOptionalNulls(_ value: Any, schema: [String: Any]) -> Any {
+    normalizeOptionalNulls(value, schema: schema, root: schema)
+}
+
+private func normalizeOptionalNulls(_ value: Any, schema rawSchema: [String: Any], root: [String: Any]) -> Any {
+    guard let schema = nullNormalizationSchema(rawSchema, root: root) else {
+        return value
+    }
     if let array = value as? [Any] {
         return array.enumerated().map { index, item in
             if let tuple = schema["items"] as? [[String: Any]], index < tuple.count {
-                return normalizeOptionalNulls(item, schema: tuple[index])
+                return normalizeOptionalNulls(item, schema: tuple[index], root: root)
             }
-            if let items = schema["items"] as? [String: Any] { return normalizeOptionalNulls(item, schema: items) }
+            if let items = schema["items"] as? [String: Any] {
+                return normalizeOptionalNulls(item, schema: items, root: root)
+            }
             return item
         }
     }
@@ -150,12 +159,38 @@ func normalizeOptionalNulls(_ value: Any, schema: [String: Any]) -> Any {
     let required = Set(schema["required"] as? [String] ?? [])
     for (key, rawSchema) in properties {
         guard let item = object[key], let property = rawSchema as? [String: Any] else { continue }
-        if item is NSNull && !required.contains(key) && !(property["$ref"] is String) && !schemaAllowsNull(property)
-            && !JSONSchemaValidator.shared.validate(NSNull(), against: property, coerceTypes: false).isValid {
+        // An unresolved reference can accept null, so keep the value for the validator.
+        if item is NSNull && !required.contains(key) && !schemaAllowsNull(property),
+           nullNormalizationSchema(property, root: root) != nil,
+           !JSONSchemaValidator.shared.validate(NSNull(), against: property, root: root, coerceTypes: false).isValid {
             object.removeValue(forKey: key)
         } else {
-            object[key] = normalizeOptionalNulls(item, schema: property)
+            object[key] = normalizeOptionalNulls(item, schema: property, root: root)
         }
     }
     return object
+}
+
+/// Follow local references and the single non-null branch of an optional union.
+/// Returns nil when a reference cannot be resolved.
+private func nullNormalizationSchema(_ schema: [String: Any], root: [String: Any]) -> [String: Any]? {
+    var current = schema
+    for _ in 0..<32 {
+        if let reference = current["$ref"] {
+            guard let reference = reference as? String,
+                  let target = JSONSchemaValidator.resolveLocalReference(reference, in: root) as? [String: Any] else {
+                return nil
+            }
+            current = target
+            continue
+        }
+        let branches = current["anyOf"] as? [[String: Any]] ?? current["oneOf"] as? [[String: Any]]
+        let valueBranches = branches?.filter { $0["type"] as? String != "null" } ?? []
+        if valueBranches.count == 1 {
+            current = valueBranches[0]
+            continue
+        }
+        return current
+    }
+    return nil
 }

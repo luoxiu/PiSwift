@@ -388,3 +388,188 @@ func codemodeHostAbandonedNativeCallRemainsUnknownAndPublishesLateOutcome(abort:
     #expect(row["error"] as? String == "outcome_unknown: inspect native-1")
     #expect(late.count <= 128)
 }
+
+/// A script that only a timeout can end, even when a timer fires late under load.
+private let hostWaitingScript = "await tools.wait({})"
+
+private func hostWaitingContext() -> CustomToolContext {
+    let tool = AgentTool(label: "wait", name: "wait", description: "Wait", parameters: [:]) {
+        _, _, _, _ in AgentToolResult(content: [])
+    }
+    return hostContext(tool) { name, args, options in
+        while options.signal?.isCancelled != true {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        return AgentToolCallOutcome(toolCall: AgentToolCall(id: "wait-1", name: name, arguments: args),
+                                   result: AgentToolResult(content: []), isError: true)
+    }
+}
+
+@Test(.timeLimit(.minutes(1))) func codemodeHostMaximumLimitsScriptsWithoutTimeout() async throws {
+    let timed = try await executeCodemode(toolCallId: "maximum-only", params: ["code": AnyCodable(hostWaitingScript)],
+                                          context: hostWaitingContext(), options: CodemodeToolOptions(maxTimeoutMs: 100))
+    #expect(timed.isError == true)
+    #expect(hostText(timed).contains("100 ms"))
+}
+
+@Test(.timeLimit(.minutes(1))) func codemodeHostMaximumReducesLargerDefault() async throws {
+    let options = CodemodeToolOptions(defaultTimeoutMs: 600_000, maxTimeoutMs: 100)
+    let allowed = try await executeCodemode(toolCallId: "reduced", params: ["code": AnyCodable("return 1")], options: options)
+    #expect(allowed.isError != true)
+    let timed = try await executeCodemode(toolCallId: "reduced-wait", params: ["code": AnyCodable(hostWaitingScript)],
+                                          context: hostWaitingContext(), options: options)
+    #expect(timed.isError == true)
+    #expect(hostText(timed).contains("100 ms"))
+}
+
+@Test(.timeLimit(.minutes(1))) func codemodeHostCancelledBeforeDispatchIsNotUnknown() async throws {
+    let signal = CancellationToken()
+    let dispatches = LockedState(0)
+    let tool = AgentTool(label: "change", name: "change", description: "Change", parameters: [:],
+        execute: { _, _, _, _ in AgentToolResult(content: []) },
+        prepareArguments: { _ in
+            // The script ends while the call is still before dispatch.
+            signal.cancel()
+            try? await Task.sleep(for: .milliseconds(200))
+            return nil
+        })
+    let context = hostContext(tool) { name, args, _ in
+        dispatches.withLock { $0 += 1 }
+        return AgentToolCallOutcome(toolCall: AgentToolCall(id: "change-1", name: name, arguments: args),
+                                   result: AgentToolResult(content: []), isError: false)
+    }
+    let result = try await executeCodemode(toolCallId: "before-dispatch",
+        params: ["code": AnyCodable("await tools.change({})")], signal: signal, context: context,
+        options: CodemodeToolOptions(validationErrorPrefix: "validation: "), forceWatchdog: true)
+    try await Task.sleep(for: .milliseconds(400))
+    let rows = (result.details?.value as? [String: Any])?["calls"] as? [[String: Any]]
+    #expect(rows?.first?["status"] as? String == "cancelled")
+    #expect(!hostText(result).contains("outcome unknown"))
+    #expect(dispatches.withLock { $0 } == 0)
+}
+
+@Test(.timeLimit(.minutes(1))) func codemodeHostDispatchesCallsMadeBeforeResult() async throws {
+    let dispatched = LockedState<[String]>([])
+    let result = await CodemodeSandbox.execute(code: "", tools: [], timeoutMs: 2_000,
+        preludeSource: #"""
+        (function(bridge) {
+            return { run() {
+                bridge("call", "1", "first", "{}");
+                bridge("call", "2", "second", "{}");
+                bridge("done", "true", "null", "[]");
+            }, settle() {}, stalled() {} };
+        })
+        """#,
+        onCall: { call in
+            dispatched.withLock { $0.append(call.name) }
+            return CodemodeRuntimeReply(ok: true)
+        })
+    #expect(result.execution.failure == nil)
+    try await hostWaitUntil { dispatched.withLock { $0.count } == 2 }
+    #expect(dispatched.withLock { $0 }.sorted() == ["first", "second"])
+    #expect(result.rejectedCalls.isEmpty)
+}
+
+@Test(.timeLimit(.minutes(1))) func codemodeHostUnawaitedCallIsNotRejectedAfterEnd() async throws {
+    let statuses = LockedState<Set<String>>([])
+    let tool = AgentTool(label: "log", name: "log", description: "Log", parameters: [:]) {
+        _, _, _, _ in AgentToolResult(content: [])
+    }
+    let context = hostContext(tool) { name, args, _ in
+        AgentToolCallOutcome(toolCall: AgentToolCall(id: "log-1", name: name, arguments: args),
+                            result: AgentToolResult(content: []), isError: false)
+    }
+    let result = try await executeCodemode(toolCallId: "unawaited",
+        params: ["code": AnyCodable("tools.log({}); return 'ok'")],
+        onUpdate: { update in
+            let rows = (update.details?.value as? [String: Any])?["calls"] as? [[String: Any]] ?? []
+            statuses.withLock { $0.formUnion(rows.compactMap { $0["status"] as? String }) }
+        }, context: context)
+    #expect(result.isError != true)
+    try await hostWaitUntil { !statuses.withLock { $0 }.isDisjoint(with: ["ok", "cancelled"]) }
+    #expect(!statuses.withLock { $0 }.isDisjoint(with: ["ok", "cancelled"]))
+    #expect(!statuses.withLock { $0 }.contains("rejected_after_end"))
+}
+
+private final class HostRetentionProbe: Sendable {}
+
+private struct HostWeakProbe: Sendable {
+    weak var value: HostRetentionProbe?
+}
+
+@Test(.timeLimit(.minutes(1))) func codemodeHostAbandonedThreadReleasesCallState() async throws {
+    let weakProbe = LockedState(HostWeakProbe())
+    let started = Date()
+    let abandoned: Bool
+    do {
+        let probe = HostRetentionProbe()
+        weakProbe.withLock { $0.value = probe }
+        let timed = try await executeCodemode(toolCallId: "abandoned-state",
+            params: ["code": AnyCodable("const end = Date.now() + 5000; while (Date.now() < end) {}")],
+            onUpdate: { _ in withExtendedLifetime(probe) {} },
+            options: CodemodeToolOptions(defaultTimeoutMs: 50, lateCallWindow: .milliseconds(100)),
+            forceWatchdog: true)
+        // Under heavy load the timeout can fire late. Then the host did not abandon a running thread.
+        abandoned = timed.isError == true && Date().timeIntervalSince(started) < 2
+    }
+    guard abandoned else {
+        return
+    }
+    // The thread runs for 5 seconds. A release before that comes from the late call window.
+    while weakProbe.withLock({ $0.value != nil }) && Date().timeIntervalSince(started) < 4 {
+        try await Task.sleep(for: .milliseconds(50))
+    }
+    #expect(weakProbe.withLock { $0.value == nil })
+}
+
+@Test(.timeLimit(.minutes(1))) func codemodeHostRecordsEachLateRejectionOnce() async throws {
+    let late = LockedState<[String]>([])
+    let tool = AgentTool(label: "change", name: "change", description: "Change", parameters: [:]) {
+        _, _, _, _ in AgentToolResult(content: [])
+    }
+    let context = hostContext(tool) { name, args, _ in
+        AgentToolCallOutcome(toolCall: AgentToolCall(id: "change-1", name: name, arguments: args),
+                            result: AgentToolResult(content: []), isError: false)
+    }
+    let code = "const later = async () => { for (let i = 0; i < 50; i++) await null; try { await tools.change({}) } catch {} }; later(); return 1"
+    for run in 0..<20 {
+        late.withLock { $0.removeAll() }
+        // Watchdog mode returns at the result, as on iOS, so the rejection can arrive after completion.
+        let result = try await executeCodemode(toolCallId: "late-\(run)", params: ["code": AnyCodable(code)],
+            context: context, options: CodemodeToolOptions(recordLateCall: { _, call in
+                late.withLock { $0.append(call.id) }
+            }), forceWatchdog: true)
+        try await Task.sleep(for: .milliseconds(100))
+        let rows = (result.details?.value as? [String: Any])?["calls"] as? [[String: Any]] ?? []
+        let returned = rows.compactMap { $0["id"] as? String }.filter { $0.contains("/rejected/") }
+        let persisted = late.withLock { $0 }.filter { $0.contains("/rejected/") }
+        #expect(returned.count + persisted.count == 1)
+    }
+}
+
+@Test(.timeLimit(.minutes(1))) func codemodeHostPreparesNestedArgumentsOnce() async throws {
+    let prepared = LockedState(0)
+    let tool = AgentTool(label: "read", name: "read", description: "Read",
+        parameters: ["type": AnyCodable("object"), "properties": AnyCodable(["path": ["type": "string"]]),
+                     "required": AnyCodable(["path"])],
+        execute: { _, _, _, _ in AgentToolResult(content: [.text(TextContent(text: "read"))]) },
+        prepareArguments: { _ in
+            prepared.withLock { $0 += 1 }
+            return nil
+        })
+    let model = getModel(provider: .openai, modelId: "gpt-4o-mini")
+    let assistant = AssistantMessage(content: [], api: model.api, provider: model.provider, model: model.id,
+        usage: Usage(input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0), stopReason: .toolUse)
+    let context = hostContext(tool) { name, args, options in
+        await runToolCall(AgentToolCall(id: "read-1", name: name, arguments: args),
+            options: RunToolCallOptions(tools: [tool], assistantMessage: assistant,
+                                        context: AgentContext(messages: [], tools: [tool]),
+                                        signal: options.signal, argumentsPrepared: options.argumentsPrepared))
+    }
+    let result = try await executeCodemode(toolCallId: "prepare-once",
+        params: ["code": AnyCodable("text(await tools.read({path: 'a'}))")], context: context,
+        options: CodemodeToolOptions(validationErrorPrefix: "validation: "))
+    #expect(result.isError != true)
+    #expect(hostText(result).contains("read"))
+    #expect(prepared.withLock { $0 } == 1)
+}

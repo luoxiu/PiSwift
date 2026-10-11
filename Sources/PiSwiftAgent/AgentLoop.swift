@@ -763,7 +763,8 @@ public func runToolCall(_ toolCall: AgentToolCall, options: RunToolCallOptions) 
         toolCall: toolCall,
         config: options.hooks,
         signal: options.signal,
-        tools: options.tools
+        tools: options.tools,
+        argumentsPrepared: options.argumentsPrepared
     )
     switch preparation {
     case .immediate(let result, let isError):
@@ -791,7 +792,8 @@ private func prepareToolCall(
     toolCall: ToolCall,
     config: ToolCallHooks,
     signal: CancellationToken?,
-    tools: [AgentTool]? = nil
+    tools: [AgentTool]? = nil,
+    argumentsPrepared: Bool = false
 ) async -> ToolCallPreparation {
     let tool = (tools ?? context.tools ?? []).first { $0.name == toolCall.name }
     guard let tool else {
@@ -806,7 +808,7 @@ private func prepareToolCall(
         // (e.g., the built-in edit tool folds single-edit shape into edits[]).
         // Returning nil keeps the raw arguments unchanged.
         var rewrittenToolCall = toolCall
-        if let prepare = tool.prepareArguments,
+        if !argumentsPrepared, let prepare = tool.prepareArguments,
            let rewritten = try await prepare(toolCall.arguments) {
             rewrittenToolCall.arguments = rewritten
         }

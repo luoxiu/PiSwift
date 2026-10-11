@@ -2045,59 +2045,15 @@ public final class AgentSession: Sendable {
                 getTools: { [weak self] in self?.getCallableTools() ?? [] },
                 isSequential: { [weak self] in self?.agent.toolExecution == .sequential },
                 runToolCall: { [weak self] toolCall, parentId, signal, onUpdate in
-                    guard let self, let assistant = self.lastAssistantMessage else {
-                        return AgentToolCallOutcome(toolCall: toolCall,
-                            result: AgentToolResult(content: [.text(TextContent(text: "No assistant message issued this call"))]),
-                            isError: true)
-                    }
-                    let tools = self.getCallableTools()
-                    let context = AgentContext(messages: self.agent.state.messages, tools: self.agent.state.tools)
-                    return await runToolCall(toolCall, options: RunToolCallOptions(
-                        tools: tools, assistantMessage: assistant, context: context,
-                        signal: signal, onUpdate: onUpdate,
-                        beforeToolCall: { [weak self] context, signal in
-                            guard let self, let runner = self._hookRunner,
-                                  runner.hasHandlers("tool_call") else { return nil }
-                            let event = ToolCallEvent(toolName: context.toolCall.name,
-                                toolCallId: context.toolCall.id, input: context.args,
-                                parentToolCallId: parentId)
-                            guard let result = await runner.emitToolCall(event, signal: signal), result.block else { return nil }
-                            return BeforeToolCallResult(block: true, reason: result.reason,
-                                                        terminate: result.terminate)
-                        },
-                        afterToolCall: { [weak self] context, _ in
-                            guard let self else { return nil }
-                            let hookResult: AfterToolCallResult?
-                            if let runner = self._hookRunner, runner.hasHandlers("tool_result") {
-                                let event = ToolResultEvent(toolName: context.toolCall.name,
-                                    toolCallId: context.toolCall.id, input: context.args,
-                                    content: context.result.content, details: context.result.details,
-                                    isError: context.isError,
-                                    structuredContent: context.result.structuredContent,
-                                    usage: context.result.usage,
-                                    parentToolCallId: parentId)
-                                if let result = await runner.emitToolResult(event) {
-                                    hookResult = AfterToolCallResult(content: result.content,
-                                        details: result.details, isError: result.isError,
-                                        usage: result.usage,
-                                        structuredContent: result.structuredContent.map(StructuredContentOverride.set) ?? .absent)
-                                } else { hookResult = nil }
-                            } else { hookResult = nil }
-                            let content = hookResult?.content ?? context.result.content
-                            let normalized = normalizeToolResultImages(content,
-                                autoResizeImages: self.settingsManager.getAutoResizeImages(),
-                                resizeOptions: self.limitsModel.inputLimits?.images?.resize)
-                            guard hookResult != nil || normalized.changed else { return nil }
-                            return AfterToolCallResult(content: normalized.content,
-                                details: hookResult?.details, isError: hookResult?.isError,
-                                usage: hookResult?.usage, terminate: hookResult?.terminate,
-                                structuredContent: hookResult?.structuredContent ??
-                                    context.result.structuredContent.map(StructuredContentOverride.set) ?? .absent)
-                        }
-                    ))
+                    await self?.runNestedToolCall(toolCall, parentId: parentId, signal: signal, onUpdate: onUpdate,
+                                                  argumentsPrepared: false) ?? Self.missingAssistantOutcome(toolCall)
                 },
                 emit: { [weak self] event in
                     await self?.emitNestedToolEvent(event)
+                },
+                runPreparedToolCall: { [weak self] toolCall, parentId, signal, onUpdate in
+                    await self?.runNestedToolCall(toolCall, parentId: parentId, signal: signal, onUpdate: onUpdate,
+                                                  argumentsPrepared: true) ?? Self.missingAssistantOutcome(toolCall)
                 }
             )
             let runner = NestedToolCallRunner(host: host)
@@ -2105,6 +2061,65 @@ public final class AgentSession: Sendable {
             return runner
         }
         return await runner.execute(callerId: callerId, name: name, args: args, options: options)
+    }
+
+    private static func missingAssistantOutcome(_ toolCall: AgentToolCall) -> AgentToolCallOutcome {
+        AgentToolCallOutcome(toolCall: toolCall,
+            result: AgentToolResult(content: [.text(TextContent(text: "No assistant message issued this call"))]),
+            isError: true)
+    }
+
+    private func runNestedToolCall(_ toolCall: AgentToolCall, parentId: String, signal: CancellationToken?,
+                                   onUpdate: @escaping ToolUpdateSink, argumentsPrepared: Bool) async -> AgentToolCallOutcome {
+        guard let assistant = lastAssistantMessage else {
+            return Self.missingAssistantOutcome(toolCall)
+        }
+        let tools = getCallableTools()
+        let context = AgentContext(messages: agent.state.messages, tools: agent.state.tools)
+        return await runToolCall(toolCall, options: RunToolCallOptions(
+            tools: tools, assistantMessage: assistant, context: context,
+            signal: signal, onUpdate: onUpdate,
+            beforeToolCall: { [weak self] context, signal in
+                guard let self, let runner = self._hookRunner,
+                      runner.hasHandlers("tool_call") else { return nil }
+                let event = ToolCallEvent(toolName: context.toolCall.name,
+                    toolCallId: context.toolCall.id, input: context.args,
+                    parentToolCallId: parentId)
+                guard let result = await runner.emitToolCall(event, signal: signal), result.block else { return nil }
+                return BeforeToolCallResult(block: true, reason: result.reason,
+                                            terminate: result.terminate)
+            },
+            afterToolCall: { [weak self] context, _ in
+                guard let self else { return nil }
+                let hookResult: AfterToolCallResult?
+                if let runner = self._hookRunner, runner.hasHandlers("tool_result") {
+                    let event = ToolResultEvent(toolName: context.toolCall.name,
+                        toolCallId: context.toolCall.id, input: context.args,
+                        content: context.result.content, details: context.result.details,
+                        isError: context.isError,
+                        structuredContent: context.result.structuredContent,
+                        usage: context.result.usage,
+                        parentToolCallId: parentId)
+                    if let result = await runner.emitToolResult(event) {
+                        hookResult = AfterToolCallResult(content: result.content,
+                            details: result.details, isError: result.isError,
+                            usage: result.usage,
+                            structuredContent: result.structuredContent.map(StructuredContentOverride.set) ?? .absent)
+                    } else { hookResult = nil }
+                } else { hookResult = nil }
+                let content = hookResult?.content ?? context.result.content
+                let normalized = normalizeToolResultImages(content,
+                    autoResizeImages: self.settingsManager.getAutoResizeImages(),
+                    resizeOptions: self.limitsModel.inputLimits?.images?.resize)
+                guard hookResult != nil || normalized.changed else { return nil }
+                return AfterToolCallResult(content: normalized.content,
+                    details: hookResult?.details, isError: hookResult?.isError,
+                    usage: hookResult?.usage, terminate: hookResult?.terminate,
+                    structuredContent: hookResult?.structuredContent ??
+                        context.result.structuredContent.map(StructuredContentOverride.set) ?? .absent)
+            },
+            argumentsPrepared: argumentsPrepared
+        ))
     }
 
     private func emitNestedToolEvent(_ event: NestedToolExecutionEvent) async {
@@ -2279,22 +2294,19 @@ public final class AgentSession: Sendable {
             return .success(())
         }
         let collision = state.withLock { current -> HookAPIError? in
-            if current.toolNameCollisionPolicy == .reject, current.toolRegistry[tool.name] != nil {
-                let owner = current.toolOwnerPaths[tool.name] ?? "<sdk:\(tool.name)>"
-                return .toolNameCollision(name: tool.name, ownerPath: owner, path: ownerPath)
-            }
-            if current.toolNameCollisionPolicy == .reject, hasCodemodeIdentifier(tool.exposure ?? .direct) {
-                let identifier = toCodemodeIdentifier(tool.name)
-                for name in current.toolRegistryOrder {
-                    guard current.toolRegistry[name] != nil,
-                          hasCodemodeIdentifier(current.toolDefinitions[name]?.exposure ?? .direct) else {
-                        continue
+            if current.toolNameCollisionPolicy == .reject {
+                let existing = current.toolRegistryOrder.compactMap { name -> ToolRegistrationOwner? in
+                    guard current.toolRegistry[name] != nil else {
+                        return nil
                     }
-                    if toCodemodeIdentifier(name) == identifier {
-                        return .toolIdentifierCollision(identifier: identifier, name: tool.name,
-                            ownerName: name, ownerPath: current.toolOwnerPaths[name] ?? "<sdk:\(name)>",
-                            path: ownerPath)
-                    }
+                    return ToolRegistrationOwner(name: name, ownerPath: current.toolOwnerPaths[name] ?? "<sdk:\(name)>",
+                                                 exposure: current.toolDefinitions[name]?.exposure ?? .direct)
+                }
+                // An owner can register its tool again, for example when an MCP server withdraws the tool.
+                if let error = toolRegistrationCollision(name: tool.name, ownerPath: ownerPath,
+                                                         exposure: tool.exposure ?? .direct,
+                                                         existing: existing, allowsOwnerUpdate: true) {
+                    return error
                 }
             }
             current.toolRegistry[wrapped.name] = wrapped

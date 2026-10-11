@@ -70,6 +70,9 @@ public struct CodemodeRuntimeResult: Sendable {
     public var storeWrites: CodemodeStoreWrites
     /// True when a timeout cannot stop the JavaScriptCore thread and the host abandons it.
     public var usedWatchdog: Bool
+    /// Calls that `onCall` received and that had no reply when the script ended, in call order.
+    /// Their signals are cancelled. A call can start after the result if its task was late.
+    public var unfinishedCalls: [CodemodeRuntimeCall] = []
     private var rejectedCallSnapshot: [CodemodeRuntimeCall]
     private var rejectedCallReader: (@Sendable () -> [CodemodeRuntimeCall])?
     /// A live record of calls rejected after the script ended, including attempts after the host returns.
@@ -130,7 +133,8 @@ private final class RuntimeMailbox: Sendable {
 
 private final class RuntimeStopFlag: Sendable {
     private struct State: Sendable {
-        var ended = false
+        var hostEnded = false
+        var scriptSettled = false
         var rejected: [CodemodeRuntimeCall] = []
     }
     private let state = LockedState(State())
@@ -140,11 +144,22 @@ private final class RuntimeStopFlag: Sendable {
         self.onRejectedCall = onRejectedCall
     }
 
+    /// The host has a result, a timeout, or an abort.
     func cancel() {
-        state.withLock { $0.ended = true }
+        state.withLock { $0.hostEnded = true }
     }
 
-    var isCancelled: Bool { state.withLock { $0.ended } }
+    /// The worker posted the script result. Only the worker reads this state, so the host
+    /// still dispatches the calls that the script made before its result.
+    func settle() {
+        state.withLock { $0.scriptSettled = true }
+    }
+
+    /// True when the worker must stop and reject new calls.
+    var isCancelled: Bool { state.withLock { $0.hostEnded || $0.scriptSettled } }
+
+    /// True when the host must not dispatch more calls.
+    var hostEnded: Bool { state.withLock { $0.hostEnded } }
 
     func reject(_ call: CodemodeRuntimeCall) {
         call.signal.cancel()
@@ -185,6 +200,10 @@ public enum CodemodeSandbox {
     }
 
     /// Run one script in a new JavaScriptCore VM on its own thread.
+    ///
+    /// `onCall` runs for each call that the script makes before its result. When the script
+    /// ends, the call signals of unfinished calls are cancelled. Later calls go to `onRejectedCall`.
+    /// An abandoned thread retains `onRejectedCall` while it runs, so capture large objects weakly.
     public static func execute(
         code: String,
         tools: [CodemodeRuntimeTool],
@@ -221,9 +240,8 @@ public enum CodemodeSandbox {
                 failure: .init(kind: .aborted, message: "Execution aborted")),
                 usedWatchdog: !usesTimeLimit(forceWatchdog: forceWatchdog))
         }
-        let collision = codemodeToolIdentifierCollision(tools.map(\.name))
-            ?? codemodeToolIdentifierCollision(tools.map(\.jsName))
-        if collisionPolicy == .reject, let collision {
+        if collisionPolicy == .reject,
+           let collision = codemodeToolIdentifierCollision(tools.map { ($0.name, $0.jsName) }) {
             return CodemodeRuntimeResult(execution: .init(output: [], failure: .init(kind: .sandbox, message: collision)),
                                          usedWatchdog: !usesTimeLimit(forceWatchdog: forceWatchdog))
         }
@@ -263,7 +281,8 @@ public enum CodemodeSandbox {
             emitter.yield(.aborted)
         }
         var output: [CodemodeOutputItem] = []
-        var pending: [Int: CancellationToken] = [:]
+        var pending: [Int: CodemodeRuntimeCall] = [:]
+        var unfinished: [CodemodeRuntimeCall] = []
         var result: CodemodeRuntimeResult?
         var waitingForThread = false
         var graceTask: Task<Void, Never>?
@@ -275,6 +294,10 @@ public enum CodemodeSandbox {
                 case .stopGraceExpired:
                     // A native call can still leave a JSC thread running despite the callback.
                     result?.usedWatchdog = true
+                case .call(let id, let target, let name, let argsJSON):
+                    stopFlag.reject(CodemodeRuntimeCall(id: id, target: target, name: name,
+                                                        argsJSON: argsJSON, signal: CancellationToken()))
+                    continue
                 default:
                     continue
                 }
@@ -291,16 +314,13 @@ public enum CodemodeSandbox {
                 let callSignal = CancellationToken()
                 let call = CodemodeRuntimeCall(id: id, target: target, name: name,
                                                argsJSON: argsJSON, signal: callSignal)
-                guard !stopFlag.isCancelled else {
+                // Events arrive in order, so this call came before any result of the script.
+                guard !stopFlag.hostEnded else {
                     stopFlag.reject(call)
                     continue
                 }
-                pending[id] = callSignal
+                pending[id] = call
                 Task {
-                    guard !stopFlag.isCancelled, !call.signal.isCancelled else {
-                        stopFlag.reject(call)
-                        return
-                    }
                     let reply = await onCall(call)
                     emitter.yield(.callResult(id: id, reply))
                 }
@@ -347,7 +367,8 @@ public enum CodemodeSandbox {
                 continue
             }
             if result != nil {
-                for token in pending.values { token.cancel() }
+                unfinished = pending.values.sorted { $0.id < $1.id }
+                for call in unfinished { call.signal.cancel() }
                 stopFlag.cancel()
                 mailbox.send(.stop)
                 if watchdog { break }
@@ -362,15 +383,18 @@ public enum CodemodeSandbox {
         graceTask?.cancel()
         removeAbort?()
         if result == nil {
-            for token in pending.values { token.cancel() }
+            unfinished = pending.values.sorted { $0.id < $1.id }
+            for call in unfinished { call.signal.cancel() }
             stopFlag.cancel()
             mailbox.send(.stop)
         }
         emitter.finish()
-        result?.readRejectedCalls { stopFlag.rejectedCalls }
-        return result ?? CodemodeRuntimeResult(execution: .init(output: output,
+        var final = result ?? CodemodeRuntimeResult(execution: .init(output: output,
             failure: .init(kind: .sandbox, message: "JavaScriptCore stopped before the script settled")),
             usedWatchdog: watchdog)
+        final.readRejectedCalls { stopFlag.rejectedCalls }
+        final.unfinishedCalls = unfinished
+        return final
     }
 }
 
@@ -508,7 +532,7 @@ private func runtimeWorker(input: RuntimeInput, mailbox: RuntimeMailbox, stopFla
                 emit.yield(.bridgeBroken("unknown message from the worker"))
             }
         case "done":
-            stopFlag.cancel()
+            stopFlag.settle()
             emit.yield(.done(ok: a == "true", payload: b, writes: c))
         default:
             emit.yield(.bridgeBroken("unknown message from the worker"))

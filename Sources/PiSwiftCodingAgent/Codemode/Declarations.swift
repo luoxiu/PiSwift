@@ -48,9 +48,12 @@ public func toCodemodeIdentifier(_ name: String) -> String {
 
 /// Return a diagnostic when two names resolve to the same JavaScript property.
 public func codemodeToolIdentifierCollision(_ names: [String]) -> String? {
+    codemodeToolIdentifierCollision(names.map { ($0, toCodemodeIdentifier($0)) })
+}
+
+func codemodeToolIdentifierCollision(_ entries: [(name: String, identifier: String)]) -> String? {
     var namesByIdentifier: [String: String] = [:]
-    for name in names {
-        let identifier = toCodemodeIdentifier(name)
+    for (name, identifier) in entries {
         if let previous = namesByIdentifier[identifier] {
             return "Tools \"\(previous)\" and \"\(name)\" use the same JavaScript identifier \"\(identifier)\"."
         }
