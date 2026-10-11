@@ -36,6 +36,7 @@ func codemodeDiscoveryZeroBudgetOverridesSettingsAndCallsAllEditorTools() async 
     let auth = AuthStorage(":memory:")
     auth.setRuntimeApiKey(model.provider, "test")
     let invoked = LockedState<[String]>([])
+    let discoveryCalls = LockedState<[String]>([])
     let native = InlineExtension(name: "editor") { api in
         for name in discoveryEditorToolNames {
             try api.registerTool(CustomTool(name: name, label: name, description: "Inspect editor state.",
@@ -49,7 +50,10 @@ func codemodeDiscoveryZeroBudgetOverridesSettingsAndCallsAllEditorTools() async 
     let created = try await createAgentSession(CreateAgentSessionOptions(authStorage: auth,
         model: model, offline: true, toolNames: ["codemode"] + discoveryEditorToolNames,
         resourceLoader: TestResourceLoader(),
-        inlineExtensions: [createCodemodeExtension(options: .init(mode: .only, inlineBudget: 0)), native],
+        inlineExtensions: [createCodemodeExtension(options: .init(mode: .only, inlineBudget: 0,
+            recordDiscoveryCall: { name in
+                discoveryCalls.withLock { $0.append(name) }
+            })), native],
         sessionManager: .inMemory(), settingsManager: settings))
     let session = created.session
     defer {
@@ -68,11 +72,15 @@ func codemodeDiscoveryZeroBudgetOverridesSettingsAndCallsAllEditorTools() async 
             value += 1
             return value
         }
-        let script = discoveryEditorToolNames.map { "text(await tools.\($0)({}));" }.joined(separator: "\n")
+        let script = "await searchTools('editor'); await describeNamespace('editor');\n" +
+            discoveryEditorToolNames.map { "await describeTool('\($0)'); text(await tools.\($0)({}));" }.joined(separator: "\n")
         return discoveryResponse(model, script: turn == 1 ? script : nil)
     }
     try await session.prompt("Inspect the editor.")
     #expect(invoked.withLock { $0 } == discoveryEditorToolNames)
+    #expect(discoveryCalls.withLock { $0.filter { $0 == "searchTools" }.count } == 1)
+    #expect(discoveryCalls.withLock { $0.filter { $0 == "describeTool" }.count } == 6)
+    #expect(discoveryCalls.withLock { $0.filter { $0 == "describeNamespace" }.count } == 1)
     #expect(settings.getCodemodeInlineBudget() == defaultCodemodeInlineBudget)
 }
 
@@ -141,4 +149,19 @@ func codemodeDiscoverySearchDetailKeepsFullDescribeTool(detail: CodemodeSearchRe
     #expect(!full.contains("returns short summaries"))
     #expect(summary.contains("returns short summaries"))
     #expect(summary.contains("call `describeTool(name)` for their full schemas"))
+}
+
+@Test(.timeLimit(.minutes(1)))
+func codemodeDiscoveryObserverCountsLoopsAndInvalidCalls() async throws {
+    let calls = LockedState<[String]>([])
+    let result = try await executeCodemode(toolCallId: "discovery-count", params: ["code": AnyCodable("""
+        for (let i = 0; i < 4; i++) await describeTool('absent');
+        await describeNamespace('absent');
+        try { await searchTools(42); } catch {}
+        return 'done';
+        """)], options: CodemodeToolOptions(recordDiscoveryCall: { name in
+            calls.withLock { $0.append(name) }
+        }))
+    #expect(result.isError != true)
+    #expect(calls.withLock { $0 } == ["describeTool", "describeTool", "describeTool", "describeTool", "describeNamespace", "searchTools"])
 }

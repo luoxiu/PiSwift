@@ -48,6 +48,11 @@ selected tool, then execute calls and return selected results. `describeTool`
 keeps the full description, guidance, input declaration, and output schema.
 Ranking, namespace filters, and `ALL_TOOLS` keep their existing behavior.
 
+The optional `recordDiscoveryCall` callback on each options type receives
+`searchTools`, `describeTool`, or `describeNamespace` once per runtime dispatch.
+Use it to measure actual discovery calls, including loops and invalid arguments.
+The default is `nil`; the callback does not change results or native call records.
+
 `defaultTimeoutMs` and `maxTimeoutMs` are optional. The same fields are available
 in `CodemodeSettings` and the `codemode` settings object. Extension options take
 precedence over settings. A script can request a timeout on its first line:

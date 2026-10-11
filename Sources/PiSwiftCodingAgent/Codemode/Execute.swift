@@ -517,6 +517,9 @@ private func handleGlobal(_ call: CodemodeRuntimeCall, callable: [AgentTool],
                           samples: [String: String], options: CodemodeToolOptions,
                           modelRuntime: (any CodemodeModelRuntime)?, state: CodemodeCallState,
                           limit: ClassifyLimit) async -> CodemodeRuntimeReply {
+    if ["searchTools", "describeTool", "describeNamespace"].contains(call.name) {
+        options.recordDiscoveryCall?(call.name)
+    }
     do {
         let args = try arguments(call.argsJSON ?? "[]")
         let raw = args.map { $0.value }

@@ -10,6 +10,8 @@ public struct CodemodeExtensionOptions: Sendable {
     public var mode: CodemodeMode?
     public var inlineBudget: Double?
     public var searchResultDetail: CodemodeSearchResultDetail
+    /// Observe each discovery helper call without changes to its results.
+    public var recordDiscoveryCall: (@Sendable (String) -> Void)?
     public var models: Bool
     /// Keep full return schemas in discovery but omit them from the inline catalog.
     public var omitInlineOutputSchemas: Bool
@@ -23,10 +25,12 @@ public struct CodemodeExtensionOptions: Sendable {
                 collisionPolicy: ToolNameCollisionPolicy? = nil,
                 defaultTimeoutMs: Int? = nil, maxTimeoutMs: Int? = nil,
                 validationErrorPrefix: String? = nil, omitInlineOutputSchemas: Bool = false,
-                inlineEnumValueLimit: Int? = nil, searchResultDetail: CodemodeSearchResultDetail = .full) {
+                inlineEnumValueLimit: Int? = nil, searchResultDetail: CodemodeSearchResultDetail = .full,
+                recordDiscoveryCall: (@Sendable (String) -> Void)? = nil) {
         self.mode = mode
         self.inlineBudget = inlineBudget
         self.searchResultDetail = searchResultDetail
+        self.recordDiscoveryCall = recordDiscoveryCall
         self.models = models
         self.omitInlineOutputSchemas = omitInlineOutputSchemas
         self.inlineEnumValueLimit = inlineEnumValueLimit.map { max(0, $0) }
@@ -76,7 +80,8 @@ public func createCodemodeExtension(options: CodemodeExtensionOptions = .init())
             },
             omitInlineOutputSchemas: options.omitInlineOutputSchemas,
             inlineEnumValueLimit: options.inlineEnumValueLimit,
-            searchResultDetail: options.searchResultDetail)
+            searchResultDetail: options.searchResultDetail,
+            recordDiscoveryCall: options.recordDiscoveryCall)
         _ = api.registerTool(createCodemodeToolDefinition(options: toolOptions))
     }
 }

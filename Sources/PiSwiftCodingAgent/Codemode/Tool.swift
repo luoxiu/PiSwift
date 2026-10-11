@@ -19,6 +19,8 @@ public struct CodemodeStoreEntryData: Sendable {
 public struct CodemodeToolOptions: Sendable {
     public var models: Bool
     public var searchResultDetail: CodemodeSearchResultDetail
+    /// Observe each searchTools, describeTool, and describeNamespace dispatch.
+    public var recordDiscoveryCall: (@Sendable (String) -> Void)?
     public var omitInlineOutputSchemas: Bool
     public var inlineEnumValueLimit: Int?
     public var collisionPolicy: ToolNameCollisionPolicy
@@ -57,9 +59,11 @@ public struct CodemodeToolOptions: Sendable {
                 omitInlineOutputSchemas: Bool = false,
                 inlineEnumValueLimit: Int? = nil,
                 lateCallWindow: Duration = .seconds(60),
-                searchResultDetail: CodemodeSearchResultDetail = .full) {
+                searchResultDetail: CodemodeSearchResultDetail = .full,
+                recordDiscoveryCall: (@Sendable (String) -> Void)? = nil) {
         self.models = models
         self.searchResultDetail = searchResultDetail
+        self.recordDiscoveryCall = recordDiscoveryCall
         self.lateCallWindow = lateCallWindow
         self.omitInlineOutputSchemas = omitInlineOutputSchemas
         self.inlineEnumValueLimit = inlineEnumValueLimit.map { max(0, $0) }
