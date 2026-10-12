@@ -304,14 +304,15 @@ private actor CodemodeCallState {
         return index
     }
 
-    /// Marks the row as dispatched to the native tool. A row that was never dispatched
+    /// Marks the row as dispatched to a native tool or model. A row that was never dispatched
     /// cannot have an unknown outcome.
-    func beginNativeCall(index: Int, signal: CancellationToken) -> Bool {
+    func beginNativeCall(index: Int, signal: CancellationToken,
+                         notStartedMessage: String = codemodeNotStartedMessage) -> Bool {
         guard calls.indices.contains(index), !closed else {
             return false
         }
         guard !signal.isCancelled else {
-            cancelBeforeDispatch(index: index)
+            cancelBeforeDispatch(index: index, error: notStartedMessage)
             return false
         }
         nativeCallIndexes.insert(index)
@@ -633,11 +634,11 @@ private func handleGlobal(_ call: CodemodeRuntimeCall, callable: [AgentTool],
                                               args: "\(providerName)/\(id)")
                 let started = Date()
                 await limit.acquire()
-                guard index >= 0, !call.signal.isCancelled else {
+                let notStarted = "Execution ended before the model call started"
+                guard await state.beginNativeCall(index: index, signal: call.signal,
+                                                  notStartedMessage: notStarted) else {
                     await limit.release()
-                    let message = "Execution ended before the model call started"
-                    await state.cancelBeforeDispatch(index: index, error: message)
-                    return failure(message)
+                    return failure(notStarted)
                 }
                 let reply: AnyCodable
                 let stopReason: String

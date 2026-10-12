@@ -401,6 +401,121 @@ func hostRegistrationReportsLoadErrorsWithEachPolicy(policy: ToolNameCollisionPo
     #expect(result.diagnostics.contains { $0.type == "error" && $0.message.contains("factory failed") })
 }
 
+@Test(arguments: [ToolNameCollisionPolicy.overwrite, .reject])
+func hostRegistrationFailedFactoryRestoresPriorReservations(policy: ToolNameCollisionPolicy) throws {
+    let registry = ToolRegistrationRegistry(collisionPolicy: policy)
+    let bus = createEventBus()
+    let original = ExtensionLoader.load(InlineExtension(name: "original", builtin: true, replaceable: true) { api in
+        try api.registerTool(registrationTool("foo-bar", "original")).get()
+        try api.registerTool(registrationTool("second", "original second")).get()
+    }, cwd: "/tmp", eventBus: bus, toolRegistrationRegistry: registry)
+    #expect(original.hook != nil)
+    let failed = ExtensionLoader.load(InlineExtension(name: "failed") { api in
+        var replacement = registrationTool("foo-bar", "replacement")
+        replacement.exposure = .hidden
+        try api.registerTool(replacement).get()
+        try api.registerTool(registrationTool("temporary", "temporary")).get()
+        try api.registerTool(registrationTool("second", "replacement second")).get()
+        throw RegistrationFactoryError()
+    }, cwd: "/tmp", eventBus: bus, toolRegistrationRegistry: registry)
+    #expect(failed.hook == nil)
+    let error = registry.register(name: "foo_bar", ownerPath: "probe", kind: .fixed)
+    if policy == .reject {
+        if case .toolIdentifierCollision(_, _, let ownerName, let ownerPath, _) = error {
+            #expect(ownerName == "foo-bar")
+            #expect(ownerPath == "builtin:original")
+        } else {
+            Issue.record("Expected the original identifier owner")
+        }
+        for name in ["foo-bar", "second"] {
+            if case .toolNameCollision(_, let ownerPath, _) = registry.register(name: name, ownerPath: "probe", kind: .fixed) {
+                #expect(ownerPath == "builtin:original")
+            } else {
+                Issue.record("Expected the original name owner")
+            }
+        }
+    } else {
+        #expect(error == nil)
+    }
+    #expect(registry.register(name: "temporary", ownerPath: "next", kind: .fixed) == nil)
+}
+
+@Test(arguments: [false, true])
+func hostRegistrationFailedReplacementKeepsBuiltinAndIdentifierOwner(replacementFirst: Bool) async throws {
+    let events = LockedState(0)
+    let rejected = LockedState(false)
+    let original = InlineExtension(name: "original", builtin: true, replaceable: true) { api in
+        try api.registerTool(registrationTool("foo-bar", "original")).get()
+        api.onAny("session_start") { _, _ in
+            events.withLock { $0 += 1 }
+            return nil
+        }
+    }
+    let failed = InlineExtension(name: "failed") { api in
+        try api.registerTool(registrationTool("foo-bar", "replacement")).get()
+        throw RegistrationFactoryError()
+    }
+    let next = InlineExtension(name: "next") { api in
+        if case .failure(.toolIdentifierCollision(_, _, _, let ownerPath, _)) = api.registerTool(registrationTool("foo_bar", "next")) {
+            rejected.withLock { $0 = ownerPath == "builtin:original" }
+        }
+    }
+    let extensions = replacementFirst ? [failed, original, next] : [original, failed, next]
+    let result = try await registrationSession(policy: .reject, extensions: extensions)
+    defer { result.session.dispose() }
+    #expect(rejected.withLock { $0 })
+    #expect(result.session.getAllTools().first { $0.name == "foo-bar" }?.ownerPath == "builtin:original")
+    #expect(!result.session.getAllTools().contains { $0.name == "foo_bar" })
+    #expect(result.session.hookRunner?.getExtensionHookPaths().contains("builtin:original") == true)
+    await result.session.hookRunner?.emitToExtensions(SessionStartEvent(reason: .reload))
+    #expect(events.withLock { $0 } >= 1)
+}
+
+@Test func hostRegistrationFactoryRemovalRestoresPriorReservation() throws {
+    let registry = ToolRegistrationRegistry(collisionPolicy: .reject)
+    let bus = createEventBus()
+    let original = ExtensionLoader.load(InlineExtension(name: "original", builtin: true, replaceable: true) { api in
+        try api.registerTool(registrationTool("foo-bar", "original")).get()
+    }, cwd: "/tmp", eventBus: bus, toolRegistrationRegistry: registry)
+    #expect(original.hook != nil)
+    let replacement = ExtensionLoader.load(InlineExtension(name: "removed") { api in
+        try api.registerTool(registrationTool("foo-bar", "replacement")).get()
+        #expect(api.unregisterTool("foo-bar"))
+        if case .failure(.toolIdentifierCollision(_, _, _, let ownerPath, _)) = api.registerTool(registrationTool("foo_bar", "next")) {
+            #expect(ownerPath == "builtin:original")
+        } else {
+            Issue.record("Expected the original owner after factory removal")
+        }
+    }, cwd: "/tmp", eventBus: bus, toolRegistrationRegistry: registry)
+    #expect(replacement.hook != nil)
+    if case .toolNameCollision(_, let ownerPath, _) = registry.register(name: "foo-bar", ownerPath: "probe", kind: .fixed) {
+        #expect(ownerPath == "builtin:original")
+    } else {
+        Issue.record("Expected the original owner after factory commit")
+    }
+}
+
+@Test(arguments: [ToolNameCollisionPolicy.overwrite, .reject])
+func hostRegistrationCommittedReplacementRemovalDoesNotRestoreBuiltin(policy: ToolNameCollisionPolicy) throws {
+    let registry = ToolRegistrationRegistry(collisionPolicy: policy)
+    let bus = createEventBus()
+    let original = ExtensionLoader.load(InlineExtension(name: "original", builtin: true, replaceable: true) { api in
+        try api.registerTool(registrationTool("foo-bar", "original")).get()
+    }, cwd: "/tmp", eventBus: bus, toolRegistrationRegistry: registry)
+    let saved = LockedState<HookAPI?>(nil)
+    let replacement = ExtensionLoader.load(InlineExtension(name: "replacement") { api in
+        saved.withLock { $0 = api }
+        try api.registerTool(registrationTool("foo-bar", "replacement")).get()
+    }, cwd: "/tmp", eventBus: bus, toolRegistrationRegistry: registry)
+    let originalHook = try #require(original.hook)
+    let replacementHook = try #require(replacement.hook)
+    let kept = omitReplacedExtensions([originalHook, replacementHook])
+    #expect(kept.hooks.map(\.path) == ["<inline:replacement>"])
+    let api = try #require(saved.withLock { $0 })
+    #expect(api.unregisterTool("foo-bar"))
+    #expect(registry.register(name: "foo_bar", ownerPath: "next", kind: .fixed) == nil)
+}
+
 @Test func hostRegistrationPreparedCallSkipsPrepareButValidates() async throws {
     let prepared = LockedState(0)
     let tool = AgentTool(label: "read", name: "read", description: "Read",

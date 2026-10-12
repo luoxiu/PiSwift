@@ -55,6 +55,123 @@ private actor HostNativeRelease {
     }
 }
 
+private final class HostPendingModels: CodemodeModelRuntime, Sendable {
+    let release = HostNativeRelease()
+    private let counts = LockedState((started: 0, completed: 0))
+    let onStart: @Sendable () -> Void
+    let classifier = ClassifierModel(id: "judge", name: "Judge", api: .typesafeSystemOne,
+        provider: "host-test", baseUrl: "https://classifier.test", input: [.text],
+        cost: ModelCost(input: 0, output: 0, cacheRead: 0, cacheWrite: 0), contextWindow: 1000)
+    let image = ImageModel(id: "painter", name: "Painter", api: .openrouterImages,
+        provider: "host-test", baseUrl: "https://image.test", input: [.text], output: [.image],
+        cost: ModelCost(input: 0, output: 0, cacheRead: 0, cacheWrite: 0))
+
+    init(onStart: @escaping @Sendable () -> Void = {}) { self.onStart = onStart }
+    var started: Int { counts.withLock { $0.started } }
+    var completed: Int { counts.withLock { $0.completed } }
+
+    func getModelsOfType(_ type: ModelType, provider: String?) -> [AnyModel] {
+        guard provider == nil || provider == "host-test" else { return [] }
+        switch type {
+        case .classifier: return [.classifier(classifier)]
+        case .image: return [.image(image)]
+        case .chat: return []
+        }
+    }
+
+    func getAvailableOfType(_ type: ModelType, provider: String?) async -> [AnyModel] {
+        getModelsOfType(type, provider: provider)
+    }
+
+    func getModelOfType(_ type: ModelType, provider: String, modelId: String) -> AnyModel? {
+        getModelsOfType(type, provider: provider).first { $0.catalog.id == modelId }
+    }
+
+    private func waitForResult() async {
+        counts.withLock { $0.started += 1 }
+        onStart()
+        // This provider continues after cancellation. The host must keep its outcome unknown.
+        await release.wait()
+        counts.withLock { $0.completed += 1 }
+    }
+
+    func classify(_ model: ClassifierModel, context: ClassifierContext,
+                  options: ClassifierOptions?) async -> ClassifierResult {
+        await waitForResult()
+        return ClassifierResult(api: model.api, provider: model.provider, model: model.id,
+                                usage: Usage(input: 1, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1))
+    }
+
+    func generateImages(_ model: ImageModel, context: ImagesContext,
+                        options: ImagesOptions?) async -> AssistantImages {
+        await waitForResult()
+        return AssistantImages(api: model.api, provider: model.provider, model: model.id,
+                               usage: Usage(input: 1, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1),
+                               stopReason: .stop)
+    }
+}
+
+private func hostModelCall(_ type: ModelType) -> String {
+    if type == .image {
+        return #"models.generateImages({provider:'host-test',id:'painter'}, {input:[{type:'text',text:'Draw'}]})"#
+    }
+    return #"models.classify({provider:'host-test',id:'judge'}, {state:{},questions:{ok:{type:'bool',instructions:'Check',criteria:{true:'yes',false:'no'}}}})"#
+}
+
+@Test(.timeLimit(.minutes(1)), arguments: [ModelType.classifier, .image], [false, true])
+func codemodeHostPendingModelOutcomeIsUnknown(type: ModelType, abort: Bool) async throws {
+    let signal = CancellationToken()
+    let models = HostPendingModels(onStart: { if abort { signal.cancel() } })
+    defer { Task { await models.release.release() } }
+    let lateCalls = LockedState<[CodemodeNestedCall]>([])
+    let result = try await executeCodemode(toolCallId: "pending-model",
+        params: ["code": AnyCodable("await \(hostModelCall(type))")], signal: signal,
+        options: CodemodeToolOptions(models: true, modelRuntime: models, defaultTimeoutMs: 3_000,
+            recordLateCall: { _, call in lateCalls.withLock { $0.append(call) } }), forceWatchdog: true)
+    #expect(result.isError == true)
+    #expect(models.started == 1)
+    #expect(models.completed == 0)
+    let rows = try #require((result.details?.value as? [String: Any])?["calls"] as? [[String: Any]])
+    #expect(rows.count == 1)
+    #expect(rows.first?["status"] as? String == "outcome_unknown")
+    #expect(hostText(result).contains("outcome unknown"))
+    await models.release.release()
+    try await hostWaitUntil { lateCalls.withLock { $0.contains { $0.status == .ok } } }
+    let completed = try #require(lateCalls.withLock { $0.first { $0.status == .ok } })
+    #expect(completed.name == (type == .image ? "models.generateImages" : "models.classify"))
+    #expect(completed.error == nil)
+    #expect(models.completed == 1)
+}
+
+@Test(.timeLimit(.minutes(1)), arguments: [ModelType.classifier, .image])
+func codemodeHostQueuedModelsStayCancelled(type: ModelType) async throws {
+    let signal = CancellationToken()
+    let models = HostPendingModels()
+    defer { Task { await models.release.release() } }
+    let rowCount = LockedState(0)
+    let lateCalls = LockedState<[CodemodeNestedCall]>([])
+    let task = Task {
+        try await executeCodemode(toolCallId: "queued-models",
+            params: ["code": AnyCodable("await Promise.all(Array.from({length:5}, () => \(hostModelCall(type))))")],
+            signal: signal, onUpdate: { update in
+                let rows = (update.details?.value as? [String: Any])?["calls"] as? [[String: Any]] ?? []
+                rowCount.withLock { $0 = rows.count }
+            }, options: CodemodeToolOptions(models: true, modelRuntime: models, defaultTimeoutMs: 10_000,
+                recordLateCall: { _, call in lateCalls.withLock { $0.append(call) } }), forceWatchdog: true)
+    }
+    try await hostWaitUntil { models.started == 4 && rowCount.withLock { $0 } == 5 }
+    signal.cancel()
+    let result = try await task.value
+    let rows = try #require((result.details?.value as? [String: Any])?["calls"] as? [[String: Any]])
+    #expect(models.started == 4)
+    #expect(rows.filter { $0["status"] as? String == "outcome_unknown" }.count == 4)
+    #expect(rows.filter { $0["status"] as? String == "cancelled" }.count == 1)
+    await models.release.release()
+    try await hostWaitUntil { lateCalls.withLock { $0.filter { $0.status == .ok }.count } == 4 }
+    #expect(models.started == 4)
+    #expect(models.completed == 4)
+}
+
 @Test(.timeLimit(.minutes(1))) func codemodeHostTimeoutOptions() async throws {
     #expect(CodemodeToolOptions().defaultTimeoutMs == nil)
     #expect(CodemodeToolOptions().maxTimeoutMs == nil)

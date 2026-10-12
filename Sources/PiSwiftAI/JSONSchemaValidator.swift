@@ -162,6 +162,8 @@ public final class JSONSchemaValidator: Sendable {
             guard result.isValid else {
                 return result
             }
+            // The reference is complete. Siblings can use the same target again.
+            context.references.remove(location)
             var siblings = schema
             siblings.removeValue(forKey: "$ref")
             guard !siblings.isEmpty else {
@@ -287,8 +289,21 @@ public final class JSONSchemaValidator: Sendable {
             return .valid(value)
         }
 
-        // If no type specified and no other constraints, accept the value
+        // Without a type, assertions apply only to values of the relevant type.
         if expectedTypes.isEmpty {
+            if value is String {
+                return validateString(value, schema: schema, path: path, coerceTypes: false)
+            }
+            if value is [String: Any] {
+                return validateObject(value, schema: schema, path: path, coerceTypes: coerceTypes, context: context)
+            }
+            if value is [Any] {
+                return validateArray(value, schema: schema, path: path, coerceTypes: coerceTypes, context: context)
+            }
+            if let number = value as? NSNumber, CFGetTypeID(number as CFTypeRef) != CFBooleanGetTypeID() {
+                let result = validateNumber(value, schema: schema, path: path, coerceTypes: false, allowInteger: false)
+                return result.isValid ? .valid(value) : result
+            }
             return .valid(value)
         }
 
@@ -447,7 +462,7 @@ public final class JSONSchemaValidator: Sendable {
         var isInteger = false
 
         // Reject booleans - they bridge to NSNumber but shouldn't be treated as numbers
-        if value is Bool {
+        if let number = value as? NSNumber, CFGetTypeID(number as CFTypeRef) == CFBooleanGetTypeID() {
             return .invalid(SchemaValidationError(path: path, message: "must be a number"))
         }
 

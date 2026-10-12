@@ -600,7 +600,10 @@ public func createAgentSession(_ options: CreateAgentSessionOptions = CreateAgen
     let configuredExtensionPaths = settingsManager.getExtensionPaths()
     let explicitExtensionPaths = options.additionalExtensionPaths ?? []
     let extensionPaths = (noExtensions ? explicitExtensionPaths : configuredExtensionPaths + explicitExtensionPaths)
-        .filter { !$0.hasPrefix(BUILTIN_PATH_PREFIX) && !$0.hasPrefix("-" + BUILTIN_PATH_PREFIX) }
+        .filter { path in
+            // Built-in selectors belong to inline extension selection, not the file loader.
+            !["", "+", "-", "!"].contains { path.hasPrefix($0 + BUILTIN_PATH_PREFIX) }
+        }
     let inlineExtensions = options.inlineExtensions ?? []
     let globalExtensionEntries = settingsManager.getGlobalSettings().extensions ?? []
     let projectExtensionEntries = projectTrusted ? settingsManager.getProjectSettings().extensions ?? [] : []

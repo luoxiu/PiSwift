@@ -65,10 +65,135 @@ func localSchemaReferencesRejectUnresolvedReferences(reference: String) {
     #expect(result.errors.first?.message == "cyclic schema reference without value progress")
 }
 
+@Test func localSchemaReferencesRejectSelfCycles() {
+    let schema: [String: Any] = ["$ref": "#/$defs/A", "$defs": ["A": ["$ref": "#/$defs/A"]]]
+    let result = JSONSchemaValidator.shared.validate("value", against: schema)
+    #expect(!result.isValid)
+    #expect(result.errors.first?.message == "cyclic schema reference without value progress")
+}
+
+@Test func localSchemaReferencesAllowCompletedTargetsInSiblingBranches() {
+    let schema: [String: Any] = [
+        "$ref": "#/$defs/Text",
+        "allOf": [["$ref": "#/$defs/Text"], ["$ref": "#/$defs/Text"]],
+        "$defs": ["Text": ["type": "string"]]
+    ]
+    #expect(JSONSchemaValidator.shared.validate("ok", against: schema, coerceTypes: false).isValid)
+    #expect(!JSONSchemaValidator.shared.validate(2, against: schema, coerceTypes: false).isValid)
+    let result = JSONSchemaValidator.shared.validate(2, against: schema)
+    #expect(result.isValid)
+    #expect(result.coercedValue as? String == "2")
+}
+
 @Test func localSchemaReferencesApplySiblingAssertions() {
-    let schema: [String: Any] = ["$ref": "#/$defs/Text", "maxLength": 3, "type": "string", "$defs": ["Text": ["type": "string", "minLength": 2]]]
+    let schema: [String: Any] = ["$ref": "#/$defs/Text", "maxLength": 3, "$defs": ["Text": ["type": "string", "minLength": 2]]]
     #expect(JSONSchemaValidator.shared.validate("ok", against: schema, coerceTypes: false).isValid)
     #expect(!JSONSchemaValidator.shared.validate("long", against: schema, coerceTypes: false).isValid)
+}
+
+@Test func localSchemaReferencesApplyObjectSiblingsWithoutType() {
+    let schema: [String: Any] = [
+        "$ref": "#/$defs/Object",
+        "required": ["count"],
+        "properties": ["count": ["type": "integer", "minimum": 2]],
+        "additionalProperties": false,
+        "$defs": ["Object": ["type": "object"]]
+    ]
+    #expect(JSONSchemaValidator.shared.validate(["count": 2], against: schema, coerceTypes: false).isValid)
+    #expect(!JSONSchemaValidator.shared.validate([:] as [String: Any], against: schema, coerceTypes: false).isValid)
+    #expect(!JSONSchemaValidator.shared.validate(["count": 1], against: schema, coerceTypes: false).isValid)
+    #expect(!JSONSchemaValidator.shared.validate(["count": 2, "extra": 3], against: schema, coerceTypes: false).isValid)
+    let result = JSONSchemaValidator.shared.validate(["count": "2"], against: schema)
+    #expect(result.isValid)
+    #expect((result.coercedValue as? [String: Any])?["count"] as? Int == 2)
+}
+
+@Test func localSchemaReferencesApplyNumericSiblingsWithoutType() {
+    let schema: [String: Any] = [
+        "$ref": "#/$defs/Number",
+        "minimum": 2,
+        "maximum": 4,
+        "$defs": ["Number": ["type": "number"]]
+    ]
+    #expect(JSONSchemaValidator.shared.validate(2, against: schema, coerceTypes: false).isValid)
+    #expect(JSONSchemaValidator.shared.validate(4, against: schema, coerceTypes: false).isValid)
+    #expect(!JSONSchemaValidator.shared.validate(1, against: schema, coerceTypes: false).isValid)
+    #expect(!JSONSchemaValidator.shared.validate(5, against: schema, coerceTypes: false).isValid)
+    let result = JSONSchemaValidator.shared.validate("3", against: schema)
+    #expect(result.isValid)
+    #expect(result.coercedValue as? Double == 3)
+}
+
+@Test(arguments: [0, 1, 2])
+func localSchemaReferencesApplyNumericSiblingsToDecodedNumbers(number: Int) throws {
+    let decoded = try #require(JSONSerialization.jsonObject(with: Data("{\"value\":\(number)}".utf8)) as? [String: Any])
+    let value = try #require(decoded["value"])
+    let schema: [String: Any] = [
+        "$ref": "#/$defs/Number",
+        "minimum": 0,
+        "maximum": 2,
+        "$defs": ["Number": ["type": "number"]]
+    ]
+    let result = JSONSchemaValidator.shared.validate(value, against: schema, coerceTypes: false)
+    #expect(result.isValid)
+    #expect(result.coercedValue as? Double == Double(number))
+    #expect(JSONSchemaValidator.shared.validate(value, against: ["minimum": 0, "maximum": 2], coerceTypes: false).isValid)
+    #expect(!JSONSchemaValidator.shared.validate(value, against: ["minimum": number + 1], coerceTypes: false).isValid)
+}
+
+@Test(arguments: [false, true])
+func localSchemaReferencesRejectDecodedBooleansAsNumbers(boolean: Bool) throws {
+    let decoded = try #require(JSONSerialization.jsonObject(with: Data("{\"value\":\(boolean)}".utf8)) as? [String: Any])
+    let value = try #require(decoded["value"])
+    let schema: [String: Any] = [
+        "$ref": "#/$defs/Number",
+        "minimum": 0,
+        "maximum": 2,
+        "$defs": ["Number": ["type": "number"]]
+    ]
+    #expect(!JSONSchemaValidator.shared.validate(value, against: schema, coerceTypes: false).isValid)
+    #expect(JSONSchemaValidator.shared.validate(value, against: ["minimum": 2], coerceTypes: false).isValid)
+}
+
+@Test func assertionsWithoutTypeApplyOnlyToMatchingValues() {
+    let validator = JSONSchemaValidator.shared
+    #expect(!validator.validate("long", against: ["maxLength": 3]).isValid)
+    #expect(validator.validate(1234, against: ["maxLength": 3]).isValid)
+    #expect(!validator.validate(1, against: ["minimum": 2]).isValid)
+    let unchanged = validator.validate("1", against: ["minimum": 2])
+    #expect(unchanged.isValid)
+    #expect(unchanged.coercedValue as? String == "1")
+    #expect(validator.validate(true, against: ["minimum": 2]).isValid)
+    #expect(validator.validate("value", against: ["required": ["count"]]).isValid)
+    #expect(!validator.validate([1, 2], against: ["maxItems": 1]).isValid)
+    #expect(validator.validate("value", against: ["maxItems": 1]).isValid)
+}
+
+@Test func toolValidationAppliesReferenceSiblingsToDecodedArguments() throws {
+    // These cases also pass through pi-mono's validateToolArguments with TypeBox 1.3.27.
+    let schema: [String: Any] = [
+        "$ref": "#/$defs/Args",
+        "allOf": [["$ref": "#/$defs/Args"]],
+        "$defs": [
+            "Args": ["type": "object", "required": ["text", "count"], "properties": [
+                "text": ["$ref": "#/$defs/Text", "maxLength": 3],
+                "count": ["$ref": "#/$defs/Count", "minimum": 0, "maximum": 2]
+            ]],
+            "Text": ["type": "string"],
+            "Count": ["type": "integer"]
+        ]
+    ]
+    let tool = AITool(name: "probe", description: "Check arguments", parameters: schema.mapValues(AnyCodable.init))
+    let valid = try JSONDecoder().decode([String: AnyCodable].self, from: Data(#"{"text":"ok","count":0}"#.utf8))
+    let result = try validateToolArguments(tool: tool, toolCall: ToolCall(id: "valid", name: tool.name, arguments: valid))
+    #expect(result["text"]?.value as? String == "ok")
+    #expect(result["count"]?.value as? Int == 0)
+    for json in [#"{"text":"long","count":0}"#, #"{"text":"ok","count":3}"#, #"{"text":"ok"}"#] {
+        let invalid = try JSONDecoder().decode([String: AnyCodable].self, from: Data(json.utf8))
+        #expect(throws: ValidationError.self) {
+            try validateToolArguments(tool: tool, toolCall: ToolCall(id: "invalid", name: tool.name, arguments: invalid))
+        }
+    }
 }
 
 @Test func localSchemaReferencesKeepProgressSeparateFromErrorPaths() {

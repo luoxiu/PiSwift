@@ -2132,6 +2132,7 @@ public final class HookAPI: Sendable {
     /// True for a built-in extension that another extension can replace.
     private let replaceable: Bool
     private let isLoading = LockedState(false)
+    private let toolRegistrationTransaction = UUID()
     private let registrationErrors = LockedState<[HookAPIError]>([])
     public var toolRegistrationErrors: [HookAPIError] {
         registrationErrors.withLock { $0 }
@@ -2152,9 +2153,8 @@ public final class HookAPI: Sendable {
 
     func invalidateAfterLoadFailure() {
         loadFailure.withLock { $0 = .inactive(hookPath) }
-        for name in toolRegistrationOrder {
-            toolRegistrationRegistry?.unregister(name: name, ownerPath: hookPath)
-        }
+        toolRegistrationRegistry?.rollback(transaction: toolRegistrationTransaction)
+        isLoading.withLock { $0 = false }
         mcpServerRegistry?.unregisterAll(extensionPath: hookPath)
         disposeEventBusListeners()
         state.withLock { state in
@@ -2468,6 +2468,7 @@ public final class HookAPI: Sendable {
         trackedEventBus.beginLoading()
     }
     func commitLoading() {
+        toolRegistrationRegistry?.commit(transaction: toolRegistrationTransaction)
         isLoading.withLock { $0 = false }
         trackedEventBus.commitLoading()
     }
@@ -2767,7 +2768,8 @@ public final class HookAPI: Sendable {
         }
         if isLoading.withLock({ $0 }),
            let error = toolRegistrationRegistry?.register(name: tool.name, ownerPath: hookPath, exposure: tool.exposure ?? .direct,
-                                                          kind: replaceable ? .replaceableExtension : .extension) {
+                                                          kind: replaceable ? .replaceableExtension : .extension,
+                                                          transaction: toolRegistrationTransaction) {
             registrationErrors.withLock { $0.append(error) }
             return .failure(error)
         }
@@ -2798,7 +2800,8 @@ public final class HookAPI: Sendable {
             return true
         }
         if removed {
-            toolRegistrationRegistry?.unregister(name: name, ownerPath: hookPath)
+            toolRegistrationRegistry?.unregister(name: name, ownerPath: hookPath,
+                transaction: isLoading.withLock { $0 } ? toolRegistrationTransaction : nil)
             state.withLock { $0.unregisterOwnedToolHandler }?(name, hookPath)
             unregisterToolHandler(name)
         }

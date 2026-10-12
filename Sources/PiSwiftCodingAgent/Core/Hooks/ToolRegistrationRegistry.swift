@@ -51,10 +51,16 @@ public final class ToolRegistrationRegistry: Sendable {
         var ownerPath: String
         var exposure: ToolExposure
         var kind: OwnerKind
+        var transaction: UUID?
+    }
+    private struct Reservation: Sendable {
+        var previous: Entry?
+        var orderIndex: Int?
     }
     private struct State: Sendable {
         var entries: [String: Entry] = [:]
         var order: [String] = []
+        var reservations: [UUID: [String: Reservation]] = [:]
     }
     private let state = LockedState(State())
 
@@ -67,7 +73,7 @@ public final class ToolRegistrationRegistry: Sendable {
     /// An extension and a replaceable built-in extension with the same tool name are not a collision.
     /// The extension owns the name and `omitReplacedExtensions` removes the built-in extension.
     func register(name: String, ownerPath: String, exposure: ToolExposure = .direct,
-                  kind: OwnerKind) -> HookAPIError? {
+                  kind: OwnerKind, transaction: UUID? = nil) -> HookAPIError? {
         state.withLock { state in
             var yields = false
             if collisionPolicy == .reject {
@@ -91,20 +97,60 @@ public final class ToolRegistrationRegistry: Sendable {
             guard !yields else {
                 return nil
             }
+            if let transaction, state.reservations[transaction]?[name] == nil {
+                state.reservations[transaction, default: [:]][name] = Reservation(
+                    previous: state.entries[name], orderIndex: state.order.firstIndex(of: name))
+            }
             if state.entries[name] == nil {
                 state.order.append(name)
             }
-            state.entries[name] = Entry(ownerPath: ownerPath, exposure: exposure, kind: kind)
+            state.entries[name] = Entry(ownerPath: ownerPath, exposure: exposure, kind: kind, transaction: transaction)
             return nil
         }
     }
 
-    func unregister(name: String, ownerPath: String) {
+    /// Keep successful factory registrations, with no prior owner left to restore.
+    func commit(transaction: UUID) {
+        state.withLock { state in
+            let reservations = state.reservations.removeValue(forKey: transaction) ?? [:]
+            for name in reservations.keys where state.entries[name]?.transaction == transaction {
+                state.entries[name]?.transaction = nil
+            }
+        }
+    }
+
+    /// Restore reservations that the failed factory changed.
+    func rollback(transaction: UUID) {
+        state.withLock { state in
+            let reservations = state.reservations.removeValue(forKey: transaction) ?? [:]
+            let owned = reservations.filter { state.entries[$0.key]?.transaction == transaction }
+            for name in owned.keys {
+                state.entries.removeValue(forKey: name)
+                state.order.removeAll { $0 == name }
+            }
+            for (name, reservation) in owned.sorted(by: {
+                ($0.value.orderIndex ?? Int.max) < ($1.value.orderIndex ?? Int.max)
+            }) {
+                Self.restore(name: name, reservation: reservation, state: &state)
+            }
+        }
+    }
+
+    func unregister(name: String, ownerPath: String, transaction: UUID? = nil) {
         state.withLock { state in
             if state.entries[name]?.ownerPath == ownerPath {
                 state.entries.removeValue(forKey: name)
                 state.order.removeAll { $0 == name }
+                if let transaction, let reservation = state.reservations[transaction]?[name] {
+                    Self.restore(name: name, reservation: reservation, state: &state)
+                }
             }
         }
+    }
+
+    private static func restore(name: String, reservation: Reservation, state: inout State) {
+        guard let previous = reservation.previous else { return }
+        state.entries[name] = previous
+        state.order.insert(name, at: min(reservation.orderIndex ?? state.order.count, state.order.count))
     }
 }
