@@ -943,13 +943,18 @@ public final class SessionManager: Sendable {
         return SessionManager(cwd, dir, nil, true, sessionId)
     }
 
-    public static func open(_ path: String, _ sessionDir: String? = nil) -> SessionManager {
+    /// Open a specific session file.
+    /// - Parameters:
+    ///   - path: Path to session file.
+    ///   - sessionDir: Optional session directory for /new or /branch. If omitted, derives from file's parent.
+    ///   - cwdOverride: Optional cwd override instead of the session header cwd.
+    public static func open(_ path: String, _ sessionDir: String? = nil, _ cwdOverride: String? = nil) -> SessionManager {
         let entries = loadEntriesFromFile(path)
         let header = entries.compactMap { entry -> SessionHeader? in
             if case .session(let header) = entry { return header }
             return nil
         }.first
-        let cwd = header?.cwd ?? FileManager.default.currentDirectoryPath
+        let cwd = cwdOverride ?? header?.cwd ?? FileManager.default.currentDirectoryPath
         let dir = sessionDir ?? URL(fileURLWithPath: path).deletingLastPathComponent().path
 
         // If the file exists but produced no valid entries (empty, or a torn/garbled header
@@ -973,7 +978,9 @@ public final class SessionManager: Sendable {
     }
 
     /// Open a session without changing a nonempty file that is not a session.
-    public static func openValidated(_ path: String, _ sessionDir: String? = nil) throws -> SessionManager {
+    public static func openValidated(
+        _ path: String, _ sessionDir: String? = nil, _ cwdOverride: String? = nil
+    ) throws -> SessionManager {
         let resolvedPath = (path as NSString).expandingTildeInPath
         if FileManager.default.fileExists(atPath: resolvedPath) {
             let attributes = try FileManager.default.attributesOfItem(atPath: resolvedPath)
@@ -982,7 +989,7 @@ public final class SessionManager: Sendable {
                 throw SessionManagerError.invalidSessionFile(resolvedPath)
             }
         }
-        return open(resolvedPath, sessionDir)
+        return open(resolvedPath, sessionDir, cwdOverride)
     }
 
     public static func continueRecent(_ cwd: String, _ sessionDir: String? = nil) -> SessionManager {

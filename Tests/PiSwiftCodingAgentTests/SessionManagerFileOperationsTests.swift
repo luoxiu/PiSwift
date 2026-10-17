@@ -254,6 +254,53 @@ import Testing
     #expect(sm.getSessionFile() == explicitPath.path)
 }
 
+@Test func openUsesCwdOverrideInsteadOfHeaderCwd() throws {
+    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("session-test-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tempDir) }
+
+    let storedCwd = tempDir.appendingPathComponent("stored-project").path
+    let overrideCwd = tempDir.appendingPathComponent("override-project").path
+    let file = tempDir.appendingPathComponent("session.jsonl")
+    let header = #"{"type":"session","version":3,"id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"\#(storedCwd)"}"#
+    try (header + "\n").write(to: file, atomically: true, encoding: .utf8)
+
+    for cwdOverride in [nil, overrideCwd] {
+        let opened = SessionManager.open(file.path, tempDir.path, cwdOverride)
+        #expect(opened.getSessionId() == "abc")
+        #expect(opened.getCwd() == (cwdOverride ?? storedCwd))
+        // The override does not change the header of the file.
+        #expect(opened.getHeader()?.cwd == storedCwd)
+
+        let validated = try SessionManager.openValidated(file.path, tempDir.path, cwdOverride)
+        #expect(validated.getCwd() == (cwdOverride ?? storedCwd))
+    }
+}
+
+@Test func sessionStartedAfterOpenWithCwdOverrideRecordsTheOverride() throws {
+    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("session-test-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tempDir) }
+
+    // The project folder moved after the session was written, so the stored cwd is stale.
+    let staleCwd = tempDir.appendingPathComponent("old-container/project").path
+    let currentCwd = tempDir.appendingPathComponent("new-container/project").path
+    let file = tempDir.appendingPathComponent("session.jsonl")
+    let header = #"{"type":"session","version":3,"id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"\#(staleCwd)"}"#
+    try (header + "\n").write(to: file, atomically: true, encoding: .utf8)
+
+    let sm = SessionManager.open(file.path, tempDir.path, currentCwd)
+    guard let newFile = sm.newSession() else {
+        Issue.record("expected persisted session file")
+        return
+    }
+    #expect(sm.getHeader()?.cwd == currentCwd)
+    let content = try String(contentsOfFile: newFile, encoding: .utf8)
+    let firstLine = content.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? ""
+    let newHeader = try JSONSerialization.jsonObject(with: Data(firstLine.utf8)) as? [String: Any]
+    #expect(newHeader?["cwd"] as? String == currentCwd)
+}
+
 @Test func createUsesExplicitSessionIdForPersistedHeader() throws {
     let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("session-test-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
