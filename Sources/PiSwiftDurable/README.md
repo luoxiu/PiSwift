@@ -5,7 +5,8 @@
 PiSwiftDurable ports the library core of `@earendil-works/pi-durable` at
 [v1.1.0](https://github.com/earendil-works/pi/tree/v1.1.0/packages/durable),
 plus the later upstream commits that `FLEET_FORK.md` lists as ported.
-It uses PiSwiftAI for model types and PiSwiftChord for JSON state and observation.
+It uses PiSwiftAI for model types and PiSwiftChord for JSON state, observation, and
+bounded output (`OutputBuffer` and `Progress`, upstream's `@earendil-works/chord/output`).
 The package requires macOS 15 or iOS 18. It uses Swift 6 strict concurrency.
 
 ## Concepts
@@ -500,6 +501,9 @@ until a compaction produces a summary. The event snapshot carries it as
 - `ListFilesOptions.timeout` is a Duration, for upstream's `timeoutMs`. A negative bound is invalid;
   a fractional millisecond is not. An environment without `listFiles` gets the protocol's default,
   which fails with `notSupported`, where upstream leaves the method out.
+- `ShellOutputSkip` is a type alias of PiSwiftChord's `OutputSkip`, where upstream declares the same shape
+  twice. `Progress` takes a `ProgressClock`, which `DurableClock` refines, so a Harness clock paces it.
+  A file that also imports Foundation names it `PiSwiftChord.Progress`.
 - This library has no CLI or TUI code. PowerShell and Windows process support are outside scope.
 
 Upstream examples 00–31 have Swift integration tests with assertions for the library

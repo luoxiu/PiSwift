@@ -1,4 +1,27 @@
+import Foundation
 import Synchronization
+
+/// Time for `Progress`, in epoch milliseconds. Tests supply a manual clock.
+public protocol ProgressClock: Sendable {
+    /// Returns the clock time in milliseconds.
+    func now() -> Int64
+    /// Waits until the millisecond deadline and supports Swift task cancellation.
+    func sleep(until deadline: Int64) async throws
+}
+
+/// A wall clock with Swift task cancellation during sleep.
+public struct SystemProgressClock: ProgressClock {
+    /// Creates a wall clock backed by the system time source.
+    public init() {}
+    /// Returns the current system time in epoch milliseconds.
+    public func now() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
+    /// Waits until the millisecond deadline or Swift task cancellation.
+    public func sleep(until deadline: Int64) async throws {
+        let delay = deadline - now()
+        if delay > 0 { try await Task.sleep(for: .milliseconds(delay)) }
+        try Task.checkCancellation()
+    }
+}
 
 /// The byte rate used to delay progress writes after a large publication.
 public let progressBytesPerSecond = 100 * 1024
@@ -9,7 +32,7 @@ public final class ProgressWaiter: Sendable {
     internal init(_ continuation: CheckedContinuation<Void, any Error>) {
         self.continuation = Mutex({ continuation.resume(with: $0) })
     }
-    internal init(notify: @escaping @Sendable (Result<Void, any Error>) -> Void) { continuation = Mutex(notify) }
+    package init(notify: @escaping @Sendable (Result<Void, any Error>) -> Void) { continuation = Mutex(notify) }
     /// Completes this progress wait successfully once. Later resolve or reject calls have no effect.
     public func resolve() { take()?(.success(())) }
     /// Completes this progress wait with an error once. Later resolve or reject calls have no effect.
@@ -18,12 +41,14 @@ public final class ProgressWaiter: Sendable {
         continuation.withLock { value in let result = value; value = nil; return result }
     }
 }
-/// Commits the first idle change immediately, and coalesces later changes while a commit or timer runs.
+/// Adaptive progress commits: the first change after an idle period commits at once; each commit then delays the next
+/// by at least `minIntervalMs` and by its written size at 100 KiB/s. At most one commit is in flight; changes made
+/// meanwhile coalesce into the next one.
 public actor Progress {
     private let write: @Sendable () async throws -> Int
     private let onError: @Sendable (any Error) -> Void
     private let minIntervalMs: Int64
-    private let clock: any DurableClock
+    private let clock: any ProgressClock
     private var waiters: [ProgressWaiter] = []
     private var timer: Task<Void, Never>?
     private var inFlight: Task<Void, Never>?
@@ -35,12 +60,13 @@ public actor Progress {
     var isStopped: Bool { stopped }
     /// Creates a rate-limited writer with error reporting and a replaceable clock.
     public init(write: @escaping @Sendable () async throws -> Int, onError: @escaping @Sendable (any Error) -> Void,
-                minIntervalMs: Int64, clock: any DurableClock = SystemDurableClock()) {
+                minIntervalMs: Int64, clock: any ProgressClock = SystemProgressClock()) {
         self.write = write; self.onError = onError; self.minIntervalMs = minIntervalMs; self.clock = clock
     }
     /// Marks output as changed and schedules a progress write when the rate limit permits.
     public func mark() { dirty = true; schedule() }
-    internal func mark(waiter: ProgressWaiter) { waiters.append(waiter); mark() }
+    /// Marks output as changed; `waiter` settles with the commit that includes this change.
+    package func mark(waiter: ProgressWaiter) { waiters.append(waiter); mark() }
     /// Marks output as changed and waits for the progress write that includes this mark.
     public func markAndWait() async throws {
         try await withCheckedThrowingContinuation { continuation in

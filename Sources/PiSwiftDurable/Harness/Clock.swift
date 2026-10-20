@@ -1,12 +1,9 @@
 import Foundation
+import PiSwiftChord
 
-/// Time is measured in epoch milliseconds.
-public protocol DurableClock: Sendable {
-    /// Returns the clock time in milliseconds.
-    func now() -> Int64
-    /// Waits until the millisecond deadline and supports Swift task cancellation.
-    func sleep(until deadline: Int64) async throws
-}
+/// Time is measured in epoch milliseconds: `now()` and a cancellable `sleep(until:)`, as `ProgressClock` declares them,
+/// so a Harness clock also paces tool progress.
+public protocol DurableClock: ProgressClock {}
 
 /// A wall clock with Swift task cancellation during sleep.
 public struct SystemDurableClock: DurableClock {

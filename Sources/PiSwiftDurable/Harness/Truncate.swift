@@ -1,4 +1,8 @@
 import Foundation
+import PiSwiftChord
+
+// Never returns partial lines. Tool output streams are bounded by `OutputBuffer` from PiSwiftChord instead, and
+// `utf8ByteLength` is PiSwiftChord's, shared with the output buffer.
 
 /// The default maximum retained output line count.
 public let defaultMaxLines = 2000
@@ -56,7 +60,6 @@ public struct TruncationResult: Sendable, Equatable {
     /// The maximum UTF-8 byte count to retain.
     public let maxBytes: Int
 }
-internal func utf8ByteLength(_ content: String) -> Int { content.utf8.count }
 /// Formats a byte count using B, KB, or MB units.
 public func formatSize(_ bytes: Int) -> String {
     if bytes < 1024 { return "\(bytes)B" }

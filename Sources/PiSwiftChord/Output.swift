@@ -1,6 +1,9 @@
 import Foundation
 import Synchronization
 
+// Bounded output streams and adaptive progress commits: `OutputBuffer` keeps a head or tail window of a stream at a
+// cost proportional to each chunk, and `Progress` paces commits of a changing value by their size.
+
 /// Selects whether limits keep the beginning or the end of output.
 public enum OutputRetention: String, Sendable, Equatable {
     /// Keeps the beginning of output when limits remove content.
@@ -8,7 +11,7 @@ public enum OutputRetention: String, Sendable, Equatable {
     /// Keeps the end of output when limits remove content.
     case tail
 }
-/// Maximum retained bytes and lines, and which end of the output to keep.
+/// Retention limits of one output stream: maximum retained bytes and lines, and which end of the output to keep.
 public struct OutputLimits: Sendable, Equatable {
     /// The maximum UTF-8 byte count to retain.
     public var maxBytes: Int
@@ -22,7 +25,7 @@ public struct OutputLimits: Sendable, Equatable {
         self.maxBytes = maxBytes; self.maxLines = maxLines; self.retain = retain
     }
 }
-/// Retained tool output with the byte and line counts removed by its limits.
+/// Retained output with the byte and line counts removed by its limits.
 public struct BoundedOutput: Sendable, Equatable {
     /// The retained text of this output or result.
     public let text: String
@@ -46,13 +49,26 @@ public struct OutputSlice: Sendable, Equatable {
     /// The number of lines removed from the full output.
     public let droppedLines: Int
 }
-/// Removes control characters that must not enter visible tool output.
+/// Output a producer omitted before a chunk, measured on the decoded text: every U+FFFD counts as three bytes, and no
+/// sanitizing is applied.
+public struct OutputSkip: Sendable, Equatable {
+    /// The UTF-8 byte length of the omitted text.
+    public var bytes: Int
+    /// The newlines (U+000A) in the omitted text.
+    public var newlines: Int
+    /// Whether the omitted text ends with a newline.
+    public var endsWithNewline: Bool
+    /// Creates OutputSkip with the supplied values.
+    public init(bytes: Int, newlines: Int, endsWithNewline: Bool) { self.bytes = bytes; self.newlines = newlines; self.endsWithNewline = endsWithNewline }
+}
+/// Removes control characters that must not enter visible output.
 public func sanitizeOutput(_ text: String) -> String {
     String(String.UnicodeScalarView(text.unicodeScalars.filter {
         !((0...8).contains($0.value) || (11...31).contains($0.value) || (0xfff9...0xfffb).contains($0.value))
     }))
 }
-internal func characterEnd(_ bytes: [UInt8], at index: Int) -> Int {
+/// The last character boundary at or before `index`.
+public func characterEnd(_ bytes: [UInt8], at index: Int) -> Int {
     var end = index
     while end > 0 && end < bytes.count && bytes[end] & 0xc0 == 0x80 { end -= 1 }
     return end
@@ -102,7 +118,10 @@ public func boundOutput(_ text: String, limits: OutputLimits) -> OutputSlice {
                  droppedLines: lineCount(bytes[...]) - lineCount(kept))
 }
 
-/// Output state is protected by a mutex. Snapshots preserve the margin needed to locate a later tail line.
+/// Bounded running output of one stream, such as a tool call's or a process's. Accepting a chunk costs time
+/// proportional to the chunk: head retention stops storing once the window is full, and tail retention drops stored
+/// text the window no longer needs when it snapshots. Counts of the whole stream are kept so the dropped totals stay
+/// exact. Output state is protected by a mutex. Snapshots preserve the margin needed to locate a later tail line.
 public final class OutputBuffer: Sendable {
     private struct Chunk: Sendable { let text: String; let bytes: Int; let newlines: Int }
     private struct State: Sendable {
@@ -122,8 +141,9 @@ public final class OutputBuffer: Sendable {
     public init(_ limits: OutputLimits) { self.limits = limits }
     /// The byte count currently retained in the output buffer.
     public var storedBytes: Int { state.withLock { $0.storedBytes } }
-    /// Adds output to the buffer and returns whether visible output changed.
-    @discardableResult public func push(_ text: String, skipped: ShellOutputSkip? = nil) throws -> Bool {
+    /// Adds output to the buffer and returns whether visible output changed. `skipped` is output omitted right before
+    /// the chunk, which must be more than the tail window by at least one byte or line; only tail retention accepts it.
+    @discardableResult public func push(_ text: String, skipped: OutputSkip? = nil) throws -> Bool {
         try state.withLock { state in
             let pending = String(decoding: state.pending, as: UTF8.self)
             state.pending = []
@@ -131,11 +151,11 @@ public final class OutputBuffer: Sendable {
         }
     }
     /// Adds output to the buffer and returns whether visible output changed.
-    @discardableResult public func push(_ bytes: Data, skipped: ShellOutputSkip? = nil) throws -> Bool {
+    @discardableResult public func push(_ bytes: Data, skipped: OutputSkip? = nil) throws -> Bool {
         try push(Array(bytes), skipped: skipped)
     }
     /// Adds output to the buffer and returns whether visible output changed.
-    @discardableResult public func push(_ bytes: [UInt8], skipped: ShellOutputSkip? = nil) throws -> Bool {
+    @discardableResult public func push(_ bytes: [UInt8], skipped: OutputSkip? = nil) throws -> Bool {
         try state.withLock { state in
             var pending = ""
             if skipped != nil { pending = String(decoding: state.pending, as: UTF8.self); state.pending = [] }
@@ -146,7 +166,7 @@ public final class OutputBuffer: Sendable {
             return try pushDecoded(pending: pending, text: text, bytes: true, skipped: skipped, state: &state)
         }
     }
-    private func pushDecoded(pending: String, text: String, bytes: Bool, skipped: ShellOutputSkip?, state: inout State) throws -> Bool {
+    private func pushDecoded(pending: String, text: String, bytes: Bool, skipped: OutputSkip?, state: inout State) throws -> Bool {
         let first = !state.started && pending.isEmpty && skipped == nil
         var text = text
         if !pending.isEmpty || !text.isEmpty || skipped != nil { state.started = true }
@@ -238,3 +258,5 @@ private func completeUTF8End(_ bytes: [UInt8]) -> Int {
     }
     return start
 }
+/// The UTF-8 byte length of `content`. A Swift string holds no lone surrogate, which upstream counts as U+FFFD.
+public func utf8ByteLength(_ content: String) -> Int { content.utf8.count }

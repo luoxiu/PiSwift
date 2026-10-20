@@ -1,5 +1,5 @@
 import Testing
-import PiSwiftDurable
+import PiSwiftChord
 
 private struct OutputRandom {
     var state: UInt32
@@ -17,10 +17,11 @@ private struct OutputRandom {
     }
     mutating func limits() -> OutputLimits { .init(maxBytes: 1 + integer(40), maxLines: 1 + integer(5), retain: .tail) }
 }
-private func measureOutput(_ text: String) -> ShellOutputSkip {
+private func measureOutput(_ text: String) -> OutputSkip {
     .init(bytes: text.utf8.count, newlines: text.utf8.filter { $0 == 10 }.count, endsWithNewline: text.hasSuffix("\n"))
 }
-@Suite("Harness output skips") struct HarnessOutputSkipTests {
+// upstream chord output-skip.test.ts (durable harness-output-skip.test.ts before 4a5d37291).
+@Suite("Output skips") struct OutputSkipTests {
     @Test("keeps the same tail whenever progress snapshots happen") func sampledTail() throws {
         for seed in 1...3000 {
             var random = OutputRandom(state: UInt32(seed)); let limits = random.limits()

@@ -1,9 +1,44 @@
 import Testing
 import Synchronization
-@testable import PiSwiftDurable
-import PiSwiftDurableTesting
+@testable import PiSwiftChord
 
-@Suite("Harness output") struct HarnessOutputTests {
+/// A manually advanced clock, as PiSwiftDurableTesting's `TestClock`, which these tests used in PiSwiftDurable.
+private final class OutputTestClock: ProgressClock, Sendable {
+    private struct Sleeper: Sendable { let deadline: Int64; let continuation: CheckedContinuation<Void, any Error> }
+    private struct State: Sendable { var now: Int64 = 0; var nextID = 0; var sleepers: [Int: Sleeper] = [:] }
+    private let state = Mutex(State())
+    func now() -> Int64 { state.withLock { $0.now } }
+    var pendingSleeperCount: Int { state.withLock { $0.sleepers.count } }
+    func advance(by milliseconds: Int64) {
+        let ready = state.withLock { state in
+            state.now += milliseconds
+            let ready = state.sleepers.filter { $0.value.deadline <= state.now }
+            for id in ready.keys { state.sleepers.removeValue(forKey: id) }
+            return Array(ready.values)
+        }
+        for sleeper in ready { sleeper.continuation.resume() }
+    }
+    func sleep(until deadline: Int64) async throws {
+        let id = state.withLock { state in state.nextID += 1; return state.nextID }
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                let result = state.withLock { state -> Int in
+                    if Task.isCancelled { return 1 }
+                    if deadline <= state.now { return 2 }
+                    state.sleepers[id] = Sleeper(deadline: deadline, continuation: continuation)
+                    return 0
+                }
+                if result == 1 { continuation.resume(throwing: CancellationError()) } else if result == 2 { continuation.resume() }
+            }
+        } onCancel: {
+            let sleeper = self.state.withLock { $0.sleepers.removeValue(forKey: id) }
+            sleeper?.continuation.resume(throwing: CancellationError())
+        }
+    }
+}
+
+// upstream chord output.test.ts (durable harness-output.test.ts before 4a5d37291).
+@Suite("Output") struct OutputTests {
     private func head(_ lines: Int, _ bytes: Int = 1000) -> OutputLimits { .init(maxBytes: bytes, maxLines: lines, retain: .head) }
     private func tail(_ lines: Int, _ bytes: Int = 1000) -> OutputLimits { .init(maxBytes: bytes, maxLines: lines, retain: .tail) }
     private func check(_ input: String, _ limits: OutputLimits, _ text: String, _ bytes: Int, _ lines: Int) {
@@ -108,7 +143,7 @@ import PiSwiftDurableTesting
         }
     }
     @Test("commits the first change at once, then waits at least 100 ms and the written size at 100 KiB/s") func adaptiveProgress() async {
-        let clock = TestClock(); let state = Mutex((commits: [Int64](), size: 50 * 1024))
+        let clock = OutputTestClock(); let state = Mutex((commits: [Int64](), size: 50 * 1024))
         let progress = Progress(write: { state.withLock { $0.commits.append(clock.now()); return $0.size } }, onError: { _ in }, minIntervalMs: 100, clock: clock)
         await progress.mark(); await eventually { state.withLock { $0.commits == [0] } }
         state.withLock { $0.size = 10 }
@@ -121,7 +156,7 @@ import PiSwiftDurableTesting
         _ = await progress.stop()
     }
     @Test("waits the configured minimum interval between small commits") func minimumProgress() async {
-        let clock = TestClock(); let commits = Mutex<[Int64]>([])
+        let clock = OutputTestClock(); let commits = Mutex<[Int64]>([])
         let progress = Progress(write: { commits.withLock { $0.append(clock.now()) }; return 10 }, onError: { _ in }, minIntervalMs: 500, clock: clock)
         await progress.mark(); await eventually { commits.withLock { $0 == [0] } }
         await progress.mark(); await eventually { clock.pendingSleeperCount == 1 }
@@ -137,7 +172,7 @@ import PiSwiftDurableTesting
         _ = await progress.stop()
     }
     @Test("stops: waits for the commit in flight and hands back waiters no commit covered yet") func stoppedProgress() async throws {
-        let clock = TestClock(); let gate = OutputTestGate(); let entered = Mutex(false)
+        let clock = OutputTestClock(); let gate = OutputTestGate(); let entered = Mutex(false)
         let progress = Progress(write: { entered.withLock { $0 = true }; await gate.wait(); return 0 }, onError: { _ in }, minIntervalMs: 100, clock: clock)
         let first = Task { try await progress.markAndWait() }
         await eventually { entered.withLock { $0 } }
