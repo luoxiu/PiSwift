@@ -115,3 +115,31 @@
   于是不 arm 计时器，要等下一次 kick 的 pass 才跑（上游 microtask 紧跟 commit，没有这个窗口）。测试里只有「宿主谢绝前台计时器」那条
   会因此失败，`5654374` 把它改到测试时钟上（fork 自己的测试改动，不涉及库代码）。对齐要么在 wake 发现到期的睡眠时 kick，要么让
   计时器也覆盖已到期的睡眠；先确认生产里 sleep 提交之后总有一次晚于到期的 pass（invocation 结束时的 kick 通常就是）。
+
+## 上游 telemetry 移植（`packages/telemetry`）
+
+PiSwift 原来没有 `@earendil-works/pi-telemetry` 的移植：原作者跳过了这个包，`grep -ri telemetry Sources` 只找到注释。
+上游 pi-ai 从 `04d6447f7`（v0.84.0）起依赖它，durable 从 `48909d987` 起依赖它。所以先按 `48909d987^` 补一个基线，
+再按上表的顺序移植 `48909d987`、`2ec55d808`。基线之后改 telemetry 的提交仍记在上表，偏差也写在那一行。
+
+基线是上游 `482c1381a`（`48909d987^`，2026-10-18）的 `packages/telemetry`。`git log --oneline 48909d987^ -- packages/telemetry`
+共 49 个提交，改源码、测试或 README 的只有两个：`6b461b75b` feat: extract telemetry package 和
+`35f5c265d` feat: add telemetry reference adapter and span composition（都在 v0.84.0；之后 `src`、`test`、README 再没变过，
+`git diff 35f5c265d 48909d987^` 在这三处为空）。`ca7460d16`（TypeScript 7 构建）、`8eb2bccf2`（vitest 版本）、`f8f03460a`（workspace 依赖）
+只改 `package.json`，其余 44 个是发版号和 CHANGELOG 的 [Unreleased] 段落，都没有 Swift 对应。
+
+| 上游 | 日期 | 标题 | 决定 | 状态 |
+| --- | --- | --- | --- | --- |
+| `482c1381a` | 2026-10-18 | `packages/telemetry` 基线（`48909d987^`，源码同 `35f5c265d`） | 跟。新 target 和 product `PiSwiftTelemetry`（不依赖别的 target，同上游没有依赖）和 `PiSwiftTelemetryTesting`（上游 `/testing` 子路径，照 `PiSwiftDurableTesting` 单设 target）；文件对应：`index.ts` → `Telemetry.swift`（契约）加 `TelemetrySchema.swift`（schema 和 typed starter），`noop.ts` → `Noop.swift`，`memory.ts` → `Memory.swift`，`testing/types.ts` → `Types.swift`，`testing/conformance.ts` → `Conformance.swift`，`testing/index.ts` 只是转出，没有对应；README 在 `Sources/PiSwiftTelemetry/README.md`。偏差：`startSpan<T, E>(_:_:)` 是 `nonisolated(nonsending)` 的 async 方法，typed throws：回调在调用方的 task 和 executor 上跑一次（对应上游「同步调用回调一次」），抛出的错误原样传出，不抛错的回调调用时不用 `try`；JS 的同步 throw 和异步 rejection 在 Swift 是同一条路；`TelemetryContext` 是 class-bound 协议，span 有身份，no-op span 就是 `noopTelemetryContext` 本身（上游 `NOOP_TELEMETRY_CONTEXT` 也就是那个 span），上游查 `Object.isFrozen` 的地方改查 `===`；`AttributeValue` 是带字面量的 enum，数字是 `Double`；`SpanAttributes` 是 `[String: AttributeValue?]`，nil 对应 `undefined`、被忽略，快照里是 `[String: AttributeValue]`；`SpanStatus` 是 enum，`.error(nil)` 即 `{ status: "error" }`；`addEvent` 的属性带 `attributes:` 标签，另有无属性的重载；`InMemoryTelemetryContext` 的状态在一把 Mutex 里（Swift 的 span 可以在多个线程上同时记录），ID 和 end sequence 同上游；自动错误状态记错误的类型名和 `errorDescription`（没有就 `String(describing:)`，同 `toolErrorText`），每个 Swift 错误都有这两样，上游只对 `Error` 对象记 name 和 message；错误描述只在没有显式状态时、在锁外算（宿主代码不在锁里跑）。上游靠 Proxy「一读就抛错」测的路径 Swift 没有：conformance 的两条 `passivity` 和 `recording: ignores failed attribute calls atomically` 不移植，rejection 那条去掉 `undefined` 和两个 unreadable 值，`createSpan` 抛错退回 no-op 的分支没有对应；`telemetry.test.ts` 的 no-op「does not inspect or retain telemetry payloads」和 typed starter 的 `unreadable(schemas)` 不移植。「admits once synchronously」：Swift 没有「返回之前还没 await」这个可观察的时刻，改成断言回调在调用方的 task 里跑（比较 `withUnsafeCurrentTask`），照旧断言只调一次、返回同一个对象；parentage 那条上游第一个子 span 同步开始、挂在门上之后才开始第二个，Swift 用 `async let`，先等第一个子 span 进了回调再开始第二个。Schema 是 Codable struct，JSON 是上游的形状（手写 coding）：属性定义里按 `type` 区分的 union 换成 `TelemetryAttributeKind`（六个 case，带 `values` / `elementValues` / `examples`）；Swift 没有交叉类型，`TelemetryStartAttributeDefinition` 重复属性字段再加 `required`（同 `CompactionSettings` 的处理），`TelemetryEventAttributeDefinition` 是它的 typealias；`TelemetryParentDefinition`、`TelemetryStatusDefinition` 分别对应 parents 和 status；TypeScript 从 schema 推类型的那一整套（`InferStartAttributes`、`ExactTelemetryAttributes`、`SchemaTelemetrySpan`、`TelemetrySchemaSpanUnion`、其余 `TelemetrySchemaSpan*`、逐个 span 名的重载、重复 span 名检查）没有对应：`TypedSpanStarter` 收 `String` 名字和 `SpanAttributes`，回调拿到 `any TelemetrySpan` 和绑在它上面的子 starter，运行时行为同上游（不校验、不合并、不保留 schema）。`TelemetryAdapterFixture` 是闭包组成的 struct，`dispose` 代替 `AsyncDisposable`，case 失败时也调，两者都失败时抛 case 的错误（上游是 `SuppressedError`）；检查失败抛 `TelemetryConformanceFailure`（同 Storage、Env conformance），上游用 `node:assert`。上游 README「Pi Package Integration」说 pi-agent-core 导出 `AGENT_TELEMETRY_SCHEMAS`，但上游这时的 `packages/agent` 里没有它（只有 vitest 的 alias），Swift README 不写。测试：conformance 六条（上游九条去掉上面三条）照上游注册成一个参数化测试，snapshot 一条；`telemetry.test.ts` 的 schema 两条（编译期断言不移植，`JSON.stringify` 不抛错换成断言排好键的 JSON 和往返解码相等）、no-op 两条；Swift 另加：六种属性类型和三种 parent 规则的 JSON 形状和往返、conformance 的组名和名字清单、README 代码块（`ReadmeExamplesTests` 四条，加 README 里那段 conformance 注册，六个用例）。分别把 in-memory 改成自动状态覆盖显式状态、`setAttributes` 替换而不合并、settle 之后照记、丢掉 `parentId`、settled 的 parent 下照记子 span、抛错不设错误状态、end sequence 不前进，对应的 conformance 用例都失败；一个把回调放进新 Task 的适配器让「admits once」失败 | 已移植 90ff70c |
+
+验证：`swift test --filter PiSwiftTelemetryTests`（13 个测试，4 个 suite，加一个全局参数化测试）通过；整包 `swift build` 通过；
+`xcodebuild -scheme PiSwiftTelemetry` 和 `-scheme PiSwiftTelemetryTesting`（`generic/platform=iOS Simulator`）都 BUILD SUCCEEDED。
+「约定」里的两条测试命令合并后要加上 `PiSwiftTelemetryTests`：这一节追加在文件末尾，是为了不和同时改上表的提交冲突，约定那段留给合并之后改。
+
+后续（随 `48909d987` / `2ec55d808` 做，不在基线里）：
+
+- PiSwiftAI 缺 pi-ai 的 `telemetryContext`。上游从 `04d6447f7`（v0.84.0）起 `ProviderRequestOptions.telemetryContext?: TelemetryContext`
+  （`packages/ai/src/types.ts:160`），`buildBaseOptions` 把它转进 `StreamOptions`（`packages/ai/src/api/simple-options.ts:48`），
+  `stream`、`streamSimple`、`fetchDeferred`、`cancelDeferred`、`generateImages` 原样传给 provider（`packages/ai/test/telemetry-options.test.ts`）。
+  在 `48909d987^` 它只是传递，没有任何 span。PiSwiftAI 本该有，原作者没移植 telemetry 包所以没有。`2ec55d808` 把它改名成 `telemetry`
+  （一个父 span）并加上 `pi.ai.request` / `pi.ai.poll` span，所以随 `2ec55d808` 一起做，直接用改名后的形状，不先补旧名。
