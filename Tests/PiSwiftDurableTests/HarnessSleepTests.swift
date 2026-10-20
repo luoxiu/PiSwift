@@ -260,15 +260,21 @@ private final class Flag: Sendable {
         try await harness.close(context: .background)
     }
 
-    // Swift: naps of 300 ms, not 10. Under parallel load the wake could be computed after a 10 ms sleep is already due,
-    // and a due sleep runs at the next pass without any timer, so nothing would be declined.
+    // Swift: the naps sleep on a test clock. Under parallel load the wake could be computed after a sleep on the system
+    // clock is already due, and a due sleep needs no timer, so nothing would be declined; 300 ms naps were not enough once
+    // the suite grew. The declined timer falls back to the default one, which fires on the system clock and finds the
+    // sleeps due once the test clock has advanced.
     @Test func armsAForegroundTimerTheHostDeclinesWithTheDefaultTimerReportingItOnce() async throws {
-        let nap = napTask(300)
-        let opened = try await openTasks(tasks: [AnyTaskDefinition(nap)], setTimer: { _, _, _ in nil })
+        let clock = TestClock(now: 1_000)
+        let nap = napTask(10)
+        let opened = try await openTasks(tasks: [AnyTaskDefinition(nap)], now: clock.nowFunction, setTimer: { _, _, _ in nil })
         let harness = opened.harness
         let first = try await startNap(harness, nap)
         let second = try await startNap(harness, nap)
         try harness.resume()
+        let reports = opened.reports
+        try await eventually { reports.count > 0 }
+        clock.advance(by: 10)
         #expect(try await harness.waitForTask(id: first, context: .background).outcome.status == "completed")
         #expect(try await harness.waitForTask(id: second, context: .background).outcome.status == "completed")
         #expect(opened.reports.values.map { String(describing: $0) } == [
