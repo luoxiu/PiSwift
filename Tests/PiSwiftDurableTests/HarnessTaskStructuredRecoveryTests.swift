@@ -50,7 +50,7 @@ import PiSwiftDurableTesting
                 #expect(!outcomes.isEmpty)
                 try await runtime.commit({ _, _ in .terminal(outcome: .completed(result: .number(7))) }, context: context)
             } else {
-                try await runtime.sleep(until: 1_000, context: context)
+                try await harnessClockHold(until: 1_000, clock: clock, signal: runtime.signal)
                 try await runtime.commit({ _, _ in .terminal(outcome: .completed(result: .number(2))) }, context: context)
             }
         }, abort: { task, runtime, context in
@@ -73,7 +73,7 @@ import PiSwiftDurableTesting
         if mode == "held-live" {
             try harness.resume()
             let idle = settled { try await root.waitForIdle(context: .background) }
-            try await harnessEventually { clock.pendingSleeperCount == 2 }
+            try await harnessEventually { clock.pendingTimerCount == 2 }
             #expect(!idle.isSettled)
             #expect(try await harness.getTask(id: parent, context: .background)?.state.status == "completing")
             clock.advance(by: 1_000)
@@ -101,6 +101,8 @@ import PiSwiftDurableTesting
         let childKind = TaskKind<Int, HarnessTaskCheckpoint>(name: name, version: 1, initial: { _ in HarnessTaskCheckpoint() })
         let log = SessionTestLog<Int>()
         let joined = SessionTestLog<TaskOutcome>()
+        // One clock for both Harnesses: closing the first one ends its holds, so each count is its own Harness's.
+        let clock = TestClock()
         let definition = HarnessTestTask(name: name, version: 1, initial: { _ in HarnessTaskCheckpoint() }, phase: { task, runtime, context in
             switch task.checkpoint.phase {
             case .run:
@@ -113,7 +115,7 @@ import PiSwiftDurableTesting
                         return .waiting(checkpoint: try JSONValue(encoding: checkpoint), on: [first, second], policy: .failFast)
                     }, context: context)
                 } else {
-                    try await runtime.sleep(until: 1_000, context: context)
+                    try await harnessClockHold(until: 1_000, clock: clock, signal: runtime.signal)
                     try await runtime.commit({ _, _ in .terminal(outcome: .completed(result: .number(Double(task.input)))) }, context: context)
                 }
             case .joined:
@@ -126,13 +128,12 @@ import PiSwiftDurableTesting
             Issue.record("Recovery of live payments must not invoke an abort handler")
             try await runtime.commit({ _, _ in .terminal(outcome: .aborted(reason: "unexpected")) }, context: context)
         })
-        let firstClock = TestClock()
         let firstStorage = try await SqliteStorage.open(path: path)
-        let first = try await harnessOpen([AnyTaskDefinition(definition)], storage: firstStorage, clock: firstClock)
+        let first = try await harnessOpen([AnyTaskDefinition(definition)], storage: firstStorage, clock: clock)
         let root = try await first.root(context: .background)
         let parent = try await harnessStart(root, definition, input: 1)
         try first.resume()
-        try await harnessEventually { firstClock.pendingSleeperCount == 2 }
+        try await harnessEventually { clock.pendingTimerCount == 2 }
         let waiting = try #require(await first.getTask(id: parent, context: .background))
         guard case .waiting(_, let children, let policy, _) = waiting.state else {
             Issue.record("Checkout must wait before close")
@@ -145,9 +146,8 @@ import PiSwiftDurableTesting
         let beforeReopen = log.values
         #expect(beforeReopen.filter { $0 == 1 }.count == 1)
 
-        let secondClock = TestClock()
         let secondStorage = try await SqliteStorage.open(path: path)
-        let second = try await harnessOpen([AnyTaskDefinition(definition)], storage: secondStorage, clock: secondClock)
+        let second = try await harnessOpen([AnyTaskDefinition(definition)], storage: secondStorage, clock: clock)
         #expect(log.values == beforeReopen)
         let reopenedParent = try #require(await second.getTask(id: parent, context: .background))
         #expect(reopenedParent.state == waiting.state)
@@ -156,10 +156,10 @@ import PiSwiftDurableTesting
             #expect(record.state.status == "pending"); #expect(!record.abortRequested)
         }
         let result = Task { try await second.waitForTask(id: parent, context: .background) }
-        try await harnessEventually { secondClock.pendingSleeperCount == 2 }
+        try await harnessEventually { clock.pendingTimerCount == 2 }
         #expect(joined.values.isEmpty)
         #expect(try await second.getTask(id: parent, context: .background)?.state.status == "waiting")
-        secondClock.advance(by: 1_000)
+        clock.advance(by: 1_000)
         let receipt = try await result.value
         #expect(receipt.outcome == .completed(result: .number(7)))
         #expect(joined.values == [.completed(result: .number(2)), .completed(result: .number(3))])

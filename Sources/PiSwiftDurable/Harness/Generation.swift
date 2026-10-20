@@ -116,20 +116,24 @@ private func runGeneration(_ checkpoint: GenerationCheckpoint, _ runtime: TaskRu
     switch checkpoint.phase {
     case .prepare: try await prepareGeneration(checkpoint, runtime, context)
     case .request: try await requestGeneration(checkpoint, runtime, context)
+    // After the backoff's sleep; a run before `until` (an early wake, or a record of an earlier version) sleeps again.
     case .retry:
-        try await runtime.sleep(until: required(checkpoint.until, "until"), context: context)
+        let until = try required(checkpoint.until, "until")
+        if until > (try runtime.now()) { return try await runtime.sleepUntil(until, checkpoint: checkpoint, context: context) }
         let attempt = try required(checkpoint.attempt, "attempt") + 1
         try await runtime.commit({ tx, _ in
             let live = try await tx.doc(LiveDoc, conversationId: runtime.conversationId)
             try live.set("generation", .object(["attempt": .number(Double(attempt))]))
             return try generationTask.running(GenerationCheckpoint(phase: .prepare, attempt: attempt, compacted: checkpoint.compacted))
         }, context: context)
+    // After the sleep until `pollAt`; a run before it (an early wake, or a record of an earlier version) sleeps again.
     case .poll:
         let ref = try required(checkpoint.model, "model")
         guard let model = runtime.models.getModel(provider: ref.provider, modelId: ref.modelId) else {
             return try await failGeneration(runtime, ref: ref, context: context)
         }
-        try await runtime.sleep(until: required(checkpoint.pollAt, "pollAt"), context: context)
+        let pollAt = try required(checkpoint.pollAt, "pollAt")
+        if pollAt > (try runtime.now()) { return try await runtime.sleepUntil(pollAt, checkpoint: checkpoint, context: context) }
         let bridge = ContextCancellationBridge(context: context.withAbortSignal(runtime.signal))
         defer { withExtendedLifetime(bridge) {} }
         let message = await runtime.models.fetchDeferred(model: model, handle: try required(checkpoint.handle, "handle").handle,

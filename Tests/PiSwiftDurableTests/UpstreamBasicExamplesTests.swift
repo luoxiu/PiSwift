@@ -377,8 +377,7 @@ private func exampleShow(_ message: Message) -> String {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let path = directory.appendingPathComponent("session.sqlite").path
-        let ticks = ExampleLog<String>(), tickTwo = ExampleGate()
-        let clock = TestClock()
+        let ticks = ExampleLog<String>(), tickTwo = ExampleGate(), held = ExampleLog<Int>()
         let ticker = TaskDefinition<Int, ExampleTickerCheckpoint, String, NoTaskHooks>(name: "example.ticker", version: 1,
             initial: { _ in ExampleTickerCheckpoint() }, phase: { task, runtime, context in
                 let n = task.checkpoint.n
@@ -386,17 +385,24 @@ private func exampleShow(_ message: Message) -> String {
                     _ = try await runtime.memo("printed-\(n)", value: .bool(true), context: context)
                     ticks.append("tick \(n)")
                 }
-                // Hold tick 2 before its outcome commit. This makes the crash point deterministic.
-                if n == 2 && ticks.count == 2 && clock.now() == 0 {
+                // Hold the first run of tick 2 until close, before its next checkpoint is saved. This makes the crash
+                // point deterministic; upstream closes right after tick 2 prints, racing its sleep commit.
+                if n == 2 && held.count == 0 {
+                    held.append(n)
                     tickTwo.release()
-                    try await runtime.sleep(until: 1, context: context)
+                    try await aborted(runtime.signal)
                 }
-                try await runtime.commit({ _, _ in
-                    n == task.input ? try completed("counted to \(n)") : .running(checkpoint: try JSONValue(encoding: ExampleTickerCheckpoint(n: n + 1)))
-                }, context: context)
+                // Save the outcome: the final result, or the next tick after a short sleep. The sleep is stored with the
+                // checkpoint, so the task holds no invocation meanwhile, and a Harness opened later continues it once
+                // its time has come.
+                if n == task.input {
+                    try await runtime.commit({ _, _ in try completed("counted to \(n)") }, context: context)
+                    return
+                }
+                try await runtime.sleepUntil(try runtime.now() + 50, checkpoint: ExampleTickerCheckpoint(n: n + 1), context: context)
             }, abort: { _, runtime, context in try await runtime.commit({ _, _ in .terminal(outcome: .aborted()) }, context: context) })
         let registry = createRegistry(); try registry.install(Extension(name: "ticker", tasks: [AnyTaskDefinition(ticker)]))
-        let options = HarnessOptions(models: FakeDurableModels(), registry: registry, clock: clock)
+        let options = HarnessOptions(models: FakeDurableModels(), registry: registry)
         let first = try await Harness.open(storage: SqliteStorage.open(path: path), options: options, context: .background)
         let root = try await first.root(context: .background)
         let id = try await root.commit({ tx in try await tx.createTask(ticker, input: 5, options: .init(ownership: .conversation())) }, context: .background)
@@ -407,7 +413,6 @@ private func exampleShow(_ message: Message) -> String {
         #expect(checkpoint == .object(["phase": "tick", "n": 2]))
         #expect(saved.memos == ["printed-1": true, "printed-2": true])
         try await reader.close(context: .background)
-        clock.advance(by: 1)
         let second = try await Harness.open(storage: SqliteStorage.open(path: path), options: options, context: .background)
         let counted = try await second.waitForTask(id: id, context: .background)
         #expect(counted.outcome == .completed(result: "counted to 5"))

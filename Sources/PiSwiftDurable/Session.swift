@@ -67,25 +67,29 @@ public final class Session: Sendable {
     // Capture cached revisions atomically with all adoption, eviction, and installation.
     private let committedRead = Mutex(())
     private let documentRetentionSetting: @Sendable () -> DocumentRetention?
-    private let timer: SessionTimer
-    /// `documentRetention` is read at each use; nil means the default. `timer` arms the eviction timer.
+    private let timers: Timers
+    /// `documentRetention` is read at each use; nil means the default. `setTimer` arms the eviction timer; nil means
+    /// a task that sleeps.
     internal init(storage: any DurableStorage, now: @escaping @Sendable () -> Int64, hooks: any SessionHooks = DefaultSessionHooks(),
                   documentRetention: @escaping @Sendable () -> DocumentRetention? = { nil },
-                  timer: @escaping SessionTimer = sessionTaskTimer) {
+                  setTimer: SetTimer? = nil) {
         let guarded = GuardedStorage(storage)
         self.guarded = guarded; self.storage = guarded; self.now = now; self.hooks = hooks
-        self.documentRetentionSetting = documentRetention; self.timer = timer
+        self.documentRetentionSetting = documentRetention
+        timers = hostTimers(setTimer, report: { [hooks] error in hooks.report(error) })
         guarded.onFailure { [weak self] error in self?.failed(error) }
     }
-    /// Creates a session over the supplied storage without reading persisted records. The first error a Storage method
-    /// throws fails the Session (`SessionFailed`). `documentRetentionMs` bounds the document cache; nil means the default,
-    /// ten minutes.
+    /// Creates a session over the supplied storage without reading persisted records. `now` is the wall clock for task
+    /// times. `setTimer` arms the timers that evict idle documents; nil means a task that sleeps (see `HarnessOptions.setTimer`).
+    /// The first error a Storage method throws fails the Session (`SessionFailed`). `documentRetentionMs` bounds the
+    /// document cache; nil means the default, ten minutes.
     public static func open(storage: any DurableStorage,
                             now: @escaping @Sendable () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) },
                             documentRetentionMs: DocumentRetention? = nil,
+                            setTimer: SetTimer? = nil,
                             hooks: any SessionHooks = DefaultSessionHooks(),
                             context: ChordContext) async throws -> Session {
-        Session(storage: storage, now: now, hooks: hooks, documentRetention: { documentRetentionMs })
+        Session(storage: storage, now: now, hooks: hooks, documentRetention: { documentRetentionMs }, setTimer: setTimer)
     }
     /// Settles once the Session has closed, Storage included: after `close()`, or after the first failed Storage call,
     /// which closes the Session itself. A failed Session is reopened from Storage; nothing else is left to clean up.
@@ -410,8 +414,8 @@ public final class Session: Sendable {
         scheduleDocumentSweep(&state, now: now, retention: retention)
     }
     /// Schedule the eviction of the oldest idle document: on the line at once when it is due, otherwise when it expires,
-    /// by a timer that holds nothing alive. Where the host declines the timer, none is kept: the end of each commit evicts
-    /// what expired. `forever` schedules nothing.
+    /// by a background timer (`HarnessOptions.setTimer`), which never keeps the process alive. Where the host declines it,
+    /// none is kept: the end of each commit evicts what expired. `forever` schedules nothing.
     private func scheduleDocumentSweep(_ state: inout State, now: Int64, retention: DocumentRetention) {
         guard state.closing == nil, let oldest = state.cache.idle.oldest(), let at = documentExpiry(oldest, retention) else { return }
         if let pending = state.cache.sweep, pending.at <= at { return }
@@ -423,13 +427,13 @@ public final class Session: Sendable {
         let (delay, overflow) = at.subtractingReportingOverflow(now)
         if !overflow, delay <= 0 { queueDocumentSweep(id, in: &state); return }
         if state.cache.timersUnavailable { state.cache.sweep = nil; return }
-        // Longest delay upstream's `setTimeout` supports; a longer retention waits in several steps.
-        guard let cancel = timer(overflow ? 2_147_483_647 : min(delay, 2_147_483_647), { [weak self] in
+        // A timer that fires early sweeps nothing and arms the next one.
+        guard let cancel = timers.background({ [weak self] in
             self?.state.withLock { state in
                 guard state.closing == nil else { return }
                 self?.queueDocumentSweep(id, in: &state)
             }
-        }) else {
+        }, overflow ? .max : delay) else {
             state.cache.timersUnavailable = true
             state.cache.sweep = nil
             return

@@ -20,7 +20,7 @@ func harnessHoldingTask(clock: TestClock, slowAbort: SessionTestGate? = nil) -> 
             try await runtime.commit({ _, _ in
                 .terminal(outcome: task.input == 1 ? .completed(result: .number(1)) : .failed(error: .init(message: "owner failed")))
             }, context: context)
-        } else { try await runtime.sleep(until: 1_000_000, context: context) }
+        } else { try await aborted(runtime.signal) }
     }, abort: { task, runtime, context in
         if task.input == 99 { await slowAbort?.wait() }
         try await runtime.commit({ _, _ in .terminal(outcome: .aborted(reason: "owned")) }, context: context)

@@ -18,8 +18,11 @@ private typealias HarnessExampleJob = TaskDefinition<Int, HarnessExampleWork, In
         let path = directory.appendingPathComponent("public-example.sqlite").path
         let child = HarnessExampleJob(name: "app.child", version: 1,
             initial: { _ in HarnessExampleWork() }, phase: { task, runtime, context in
-                try await runtime.sleep(until: Int64(task.input), context: context)
-                try await runtime.commit({ _, _ in try completed(1) }, context: context)
+                switch task.checkpoint.phase {
+                // Sleeps without an invocation until the Harness clock reaches the input time.
+                case .start: try await runtime.sleepUntil(Int64(task.input), checkpoint: HarnessExampleWork(phase: .joined), context: context)
+                case .joined: try await runtime.commit({ _, _ in try completed(1) }, context: context)
+                }
             }, abort: { _, runtime, context in
                 try await runtime.commit({ _, _ in abortedWith("stop") }, context: context)
             })
@@ -46,7 +49,8 @@ private typealias HarnessExampleJob = TaskDefinition<Int, HarnessExampleWork, In
         try registry.install(Extension(name: "app", tasks:
             [AnyTaskDefinition(parent), AnyTaskDefinition(child)]))
         let clock = TestClock()
-        let options = HarnessOptions(models: FakeDurableModels(), registry: registry, clock: clock)
+        let options = HarnessOptions(models: FakeDurableModels(), registry: registry, now: clock.nowFunction,
+                                     setTimer: clock.setTimer)
         let context = ChordContext.background
         let harness = try await Harness.open(storage: SqliteStorage.open(path: path),
             options: options, context: context)

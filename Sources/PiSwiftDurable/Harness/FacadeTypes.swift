@@ -26,6 +26,8 @@ public enum TaskInspectionState: Sendable {
     case ready(migrates: Bool)
     /// Work waits for the selected tasks under its join policy.
     case waiting(on: [TaskID])
+    /// Sleeps until the Harness clock reaches `until`.
+    case sleeping(until: Int64)
     /// An outcome is saved while ordinary owned work finishes.
     case completing
     /// The task cannot run until its definition problem is resolved.
@@ -132,32 +134,43 @@ public struct HarnessOptions: Sendable {
     public var settings: HarnessSettingsProvider?
     /// The optional execution environment for the conversation.
     public var env: HarnessEnvFactory?
-    /// The time source used for task sleeps and retry deadlines.
-    public var clock: any DurableClock
-    /// An optional callback for the current time in milliseconds.
+    /// The Harness clock, epoch milliseconds; nil means the system time. Sleeping tasks store deadlines on it, so every
+    /// process that opens the same storage must use the same clock.
     public var now: (@Sendable () -> Int64)?
+    /// Arms every timer the Harness uses: pacing progress commits, freeing idle memory (`background`), and, without
+    /// `onWake`, resuming sleeping tasks; and the timers of `TaskRuntime.setTimer()`. Nil means a task that sleeps
+    /// (upstream `setTimeout`). Tests can pass fake timers; a host can keep timers off a process that should be suspended.
+    public var setTimer: SetTimer?
+    /// Wakes the process for sleeping tasks instead of a `setTimer` timer. Without it, while scheduling runs, a timer
+    /// resumes sleeping tasks when they are due. With it, the Harness arms no timer for them: it calls `onWake` after open
+    /// and whenever `Harness.wake()` changes, and the host arms its own wakeup and calls `resume()` when it fires. Called
+    /// off the Session line; it may call `wake()` and `resume()`, and must not block. A throw is reported and ignored.
+    public var onWake: (@Sendable (Wake) throws -> Void)?
     /// Runs inside the transaction that creates a conversation.
     public var conversationCreated: (@Sendable (Transaction, ConversationRecord) async throws -> Void)?
     /// Receives failures that do not fail the calling operation, such as a throwing hook or listener, and the error that
     /// fails the Session, once.
     public var onReport: (@Sendable (any Error) -> Void)?
-    /// Supplies host model, registry, clock, settings, and environment services.
+    /// Supplies host model, registry, clock, timer, settings, and environment services.
     public init(models: any DurableModels, registry: any RegistryReader,
                 settings: HarnessSettingsProvider? = nil, env: HarnessEnvFactory? = nil,
-                clock: any DurableClock = SystemDurableClock(), now: (@Sendable () -> Int64)? = nil,
+                now: (@Sendable () -> Int64)? = nil, setTimer: SetTimer? = nil,
+                onWake: (@Sendable (Wake) throws -> Void)? = nil,
                 conversationCreated: (@Sendable (Transaction, ConversationRecord) async throws -> Void)? = nil,
                 onReport: (@Sendable (any Error) -> Void)? = nil) {
-        self.init(models: { models }, registry: registry, settings: settings, env: env, clock: clock, now: now,
-                  conversationCreated: conversationCreated, onReport: onReport)
+        self.init(models: { models }, registry: registry, settings: settings, env: env, now: now, setTimer: setTimer,
+                  onWake: onWake, conversationCreated: conversationCreated, onReport: onReport)
     }
     /// Supplies a function returning the current model service, called at each use, with the other host services.
     public init(models: @escaping @Sendable () -> any DurableModels, registry: any RegistryReader,
                 settings: HarnessSettingsProvider? = nil, env: HarnessEnvFactory? = nil,
-                clock: any DurableClock = SystemDurableClock(), now: (@Sendable () -> Int64)? = nil,
+                now: (@Sendable () -> Int64)? = nil, setTimer: SetTimer? = nil,
+                onWake: (@Sendable (Wake) throws -> Void)? = nil,
                 conversationCreated: (@Sendable (Transaction, ConversationRecord) async throws -> Void)? = nil,
                 onReport: (@Sendable (any Error) -> Void)? = nil) {
         self.currentModels = models; self.registry = registry; self.settings = settings; self.env = env
-        self.clock = clock; self.now = now; self.conversationCreated = conversationCreated; self.onReport = onReport
+        self.now = now; self.setTimer = setTimer; self.onWake = onWake
+        self.conversationCreated = conversationCreated; self.onReport = onReport
     }
 }
 

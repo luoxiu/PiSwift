@@ -155,6 +155,7 @@ private func expectRuntimeEnded<Value>(_ operation: () async throws -> Value) as
         #expect(delivered.values.isEmpty)
         await expectRuntimeEnded { try await runtime.snapshot(tokens.session, context: .background) }
         await expectRuntimeEnded { try await runtime.watchDoc(tokens.session, context: .background) }
+        await expectRuntimeEnded { try await runtime.sleepUntil(0, checkpoint: HarnessTaskCheckpoint(), context: .background) }
         await expectRuntimeEnded { try await runtime.agent(context: runtime.context) }
         #expect(throws: (any Error).self) { _ = try runtime.now() }
         #expect(throws: (any Error).self) { try runtime.report(TaskDefinitionError("late")) }
@@ -198,30 +199,6 @@ private func expectRuntimeEnded<Value>(_ operation: () async throws -> Value) as
         try await harness.close(context: .background)
     }
 
-    // upstream harness-tasks.test.ts:712
-    @Test func sleepHonorsOwnContextCancellationAndInvocationAbort() async throws {
-        let clock = TestClock(now: 1000), entered = SessionTestGate(), results = SessionTestLog<String>()
-        let signalled = harnessOneStep("test.runtime-sleep-abort") { _, runtime, context in
-            entered.release()
-            do { try await runtime.sleep(until: 60_000, context: context); Issue.record("Sleep returned") }
-            catch { results.append("signalled"); throw error }
-        }
-        let cancelled = harnessOneStep("test.runtime-sleep-cancel") { _, runtime, context in
-            let caller = context.withCancel(); caller.cancel(TaskDefinitionError("stop sleeping"))
-            do { try await runtime.sleep(until: 60_000, context: caller.context); Issue.record("Sleep returned") }
-            catch { results.append(String(describing: error)) }
-            try await runtime.commit({ _, _ in .terminal(outcome: .completed(result: .number(1))) }, context: context)
-        }
-        let harness = try await harnessOpen([AnyTaskDefinition(signalled), AnyTaskDefinition(cancelled)], clock: clock)
-        let root = try await harness.root(context: .background)
-        let a = try await harnessStart(root, signalled), b = try await harnessStart(root, cancelled)
-        _ = try await harness.waitForTask(id: b, context: .background)
-        await entered.wait()
-        _ = try await harness.abortTask(id: a, context: .background)
-        #expect(try await harness.waitForTask(id: a, context: .background).outcome == .aborted(reason: "test"))
-        #expect(Set(results.values) == ["stop sleeping", "signalled"])
-        try await harness.close(context: .background)
-    }
     // upstream harness-tasks.test.ts:655. Hold acquisition and end the invocation explicitly to fix the race order.
     @Test func lateWatchAcquisitionStopsAndRejects() async throws {
         let storage = ControlledStorage(), entered = SessionTestGate(), release = SessionTestGate()
@@ -279,7 +256,8 @@ private func expectRuntimeEnded<Value>(_ operation: () async throws -> Value) as
         #expect(try await runtime.context(root.id, context: .background).entries.count == 2)
         #expect(harness.tasks.state.withLock { $0.contexts[root.id]?.range.bounds.tail == latest.id })
         if retention > 0 {
-            try await harnessEventually { clock.pendingSleeperCount == 1 }
+            // The context expiry timer is a background one now (`f75b3240a`), apart from the clock's foreground count.
+            try await harnessEventually { harness.tasks.state.withLock { $0.expiry != nil } }
             clock.advance(by: 9)
             _ = try await runtime.context(other.id, context: .background)
             #expect(harness.tasks.state.withLock { $0.contexts[other.id]?.idleSince == 1000 })
@@ -291,13 +269,14 @@ private func expectRuntimeEnded<Value>(_ operation: () async throws -> Value) as
         _ = try await harness.waitForTask(id: id, context: .background)
         if retention > 0 {
             try await harnessEventually { harness.tasks.state.withLock { $0.contexts[root.id]?.idleSince == clock.now() } }
-            try await harnessEventually { clock.pendingSleeperCount == 1 }
+            // The context expiry timer is a background one now (`f75b3240a`), apart from the clock's foreground count.
+            try await harnessEventually { harness.tasks.state.withLock { $0.expiry != nil } }
             clock.advance(by: retention)
         }
         try await harnessEventually { harness.tasks.state.withLock { $0.contexts.isEmpty } }
         try await harness.close(context: .background)
         #expect(harness.tasks.state.withLock { $0.expiry == nil && $0.contexts.isEmpty })
-        try await harnessEventually { clock.pendingSleeperCount == 0 }
+        try await harnessEventually { clock.pendingBackgroundTimerCount == 0 }
     }
 
 }

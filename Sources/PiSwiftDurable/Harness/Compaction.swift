@@ -101,8 +101,9 @@ public let compactionTask = TaskDefinition<CompactionInput, CompactionCheckpoint
         switch task.checkpoint {
         case .select: try await selectCompaction(task, runtime, context)
         case .summarize(let request): try await summarizeCompaction(task, request, runtime, context)
+        // After the backoff's sleep; a run before `until` (an early wake, or a record of an earlier version) sleeps again.
         case .retry(var request, let until):
-            try await runtime.sleep(until: until, context: context)
+            if until > (try runtime.now()) { return try await runtime.sleepUntil(until, checkpoint: task.checkpoint, context: context) }
             request.attempt += 1
             let next = request
             try await runtime.commit({ tx, _ in
@@ -224,7 +225,7 @@ private func summarizeCompaction(_ task: RunningTask<CompactionInput, Compaction
             if let status = try compactionStatus(live: live, taskId: runtime.taskId) {
                 try status.set("retry", JSONValue(encoding: LiveRetry(at: until, error: message.errorMessage ?? "")))
             }
-            return try compactionTask.running(.retry(request, until: until))
+            return try compactionTask.sleeping(.retry(request, until: until), until: until)
         }
         let text = compactionSummaryFailure(message)
         try failCompactionStatus(live: live, taskId: runtime.taskId, error: text)

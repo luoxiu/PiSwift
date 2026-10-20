@@ -55,7 +55,7 @@ struct HarnessGenerationTests {
             }, .factory { _, options, _, _ in seen.withLock { $0.append(options?.timeoutMs) }; return chatAssistant("ok") }
         ])
         let opened = try await openChat(setup: setup), submission = try await generationSubmit(opened)
-        try await eventually { try await generationLive(opened)?.generation?.retry?.at == 30 && clock.pendingSleeperCount > 0 }
+        try await eventually { try await generationLive(opened)?.generation?.retry?.at == 30 && clock.pendingTimerCount > 0 }
         #expect(setup.models.state().callCount == 1)
         clock.advance(by: 19); #expect(setup.models.state().callCount == 1)
         clock.advance(by: 1)
@@ -90,9 +90,9 @@ struct HarnessGenerationTests {
             settings: .init(stream: .init(deferred: DeferredRequest())), clock: clock)
         setup.models.setResponses([.message(chatAssistant("ready"))])
         let opened = try await openChat(setup: setup), submission = try await generationSubmit(opened)
-        try await eventually { try await generationLive(opened)?.generation?.deferred?.pollAt == 30 && clock.pendingSleeperCount > 0 }
+        try await eventually { try await generationLive(opened)?.generation?.deferred?.pollAt == 30 && clock.pendingTimerCount > 0 }
         clock.advance(by: 20)
-        try await eventually { try await generationLive(opened)?.generation?.deferred?.pollAt == 50 && clock.pendingSleeperCount > 0 }
+        try await eventually { try await generationLive(opened)?.generation?.deferred?.pollAt == 50 && clock.pendingTimerCount > 0 }
         clock.advance(by: 20)
         #expect(try await submission.wait(context: .background).status == "done")
         #expect(setup.models.state().deferredFetchCount == 2)
@@ -104,7 +104,7 @@ struct HarnessGenerationTests {
         let setup = HarnessChatSetup(settings: .init(stream: .init(deferred: DeferredRequest())), clock: clock)
         setup.models.setResponses([.message(chatAssistant("ready"))])
         let opened = try await openChat(setup: setup), submission = try await generationSubmit(opened)
-        try await eventually { try await generationLive(opened)?.generation?.deferred != nil && clock.pendingSleeperCount > 0 }
+        try await eventually { try await generationLive(opened)?.generation?.deferred != nil && clock.pendingTimerCount > 0 }
         try await opened.root.abort(context: .background)
         #expect(try await submission.wait(context: .background).reason == "aborted")
         #expect(setup.models.state().cancelledDeferred.count == 1)

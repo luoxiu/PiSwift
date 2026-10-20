@@ -92,11 +92,11 @@ private func h6FacadeTree(_ harness: Harness, _ root: Conversation, _ owner: Har
     // H5 deferred harness-ownership.test.ts:200,286.
     @Test func taskAbortWithdrawsChildInputsKeepsOwnInputsAndAllWrites() async throws {
         let clock = TestClock(), definition = harnessOneStep("test.h6-held") { _, runtime, context in
-            try await runtime.sleep(until: 1_000_000, context: context)
+            try await aborted(runtime.signal)
         }
         let registry = Registry()
         try registry.install(Extension(name: "held", tasks: [AnyTaskDefinition(definition)]))
-        let harness = try await Harness.open(storage: MemoryStorage(), options: .init(models: FakeDurableModels(), registry: registry, clock: clock), context: .background)
+        let harness = try await Harness.open(storage: MemoryStorage(), options: .init(models: FakeDurableModels(), registry: registry, now: clock.nowFunction, setTimer: clock.setTimer), context: .background)
         let root = try await harness.root(context: .background)
         let (owner, child, inner) = try await h6FacadeTree(harness, root, definition, definition)
         try await root.commit({ tx in try await tx.doc(LiveDoc, conversationId: root.id).set("run", JSONValue(encoding: LiveRun(taskId: owner, inputs: []))) }, context: .background)
@@ -114,11 +114,11 @@ private func h6FacadeTree(_ harness: Harness, _ root: Conversation, _ owner: Har
     // H5 deferred harness-ownership.test.ts:247.
     @Test func conversationAbortWithdrawsInputsKeepsWritesAndBackgroundTasks() async throws {
         let clock = TestClock(), definition = harnessOneStep("test.h6-conversation-hold") { _, runtime, context in
-            try await runtime.sleep(until: 1_000_000, context: context)
+            try await aborted(runtime.signal)
         }
         let registry = Registry()
         try registry.install(Extension(name: "held", tasks: [AnyTaskDefinition(definition)]))
-        let harness = try await Harness.open(storage: MemoryStorage(), options: .init(models: FakeDurableModels(), registry: registry, clock: clock), context: .background)
+        let harness = try await Harness.open(storage: MemoryStorage(), options: .init(models: FakeDurableModels(), registry: registry, now: clock.nowFunction, setTimer: clock.setTimer), context: .background)
         let root = try await harness.root(context: .background)
         let foreground = try await h6FacadeTree(harness, root, definition, definition)
         let background = try await h6FacadeTree(harness, root, definition, definition, background: true)
@@ -142,14 +142,14 @@ private func h6FacadeTree(_ harness: Harness, _ root: Conversation, _ owner: Har
             try await runtime.commit({ _, _ in .terminal(outcome: .failed(error: TaskOutcomeError(message: "failed"))) }, context: context)
         }
         let inner = harnessOneStep("test.h6-slow-abort", run: { _, runtime, context in
-            try await runtime.sleep(until: 1_000_000, context: context)
+            try await aborted(runtime.signal)
         }, abort: { _, runtime, context in
             abortReached.release(); await abortGate.wait()
             try await runtime.commit({ _, _ in .terminal(outcome: .aborted()) }, context: context)
         })
         let registry = Registry()
         try registry.install(Extension(name: "held", tasks: [AnyTaskDefinition(owner), AnyTaskDefinition(inner)]))
-        let harness = try await Harness.open(storage: MemoryStorage(), options: .init(models: FakeDurableModels(), registry: registry, clock: clock), context: .background)
+        let harness = try await Harness.open(storage: MemoryStorage(), options: .init(models: FakeDurableModels(), registry: registry, now: clock.nowFunction, setTimer: clock.setTimer), context: .background)
         let root = try await harness.root(context: .background)
         let tree = try await h6FacadeTree(harness, root, owner, inner)
         try harness.resume(); failGate.release()
@@ -206,7 +206,7 @@ private func h6FacadeTree(_ harness: Harness, _ root: Conversation, _ owner: Har
     @Test func faultedGenerationKeepsRunUntilOwnedWorkDrainsAndFailedFinalCommitFailsHarness() async throws {
         let abortGate = SessionTestGate(), abortReached = SessionTestGate(), clock = TestClock()
         let child = harnessOneStep("test.h6-hooked-child", run: { _, runtime, context in
-            try await runtime.sleep(until: 1_000_000, context: context)
+            try await aborted(runtime.signal)
         }, abort: { _, runtime, context in
             abortReached.release(); await abortGate.wait()
             try await runtime.commit({ _, _ in .terminal(outcome: .aborted()) }, context: context)

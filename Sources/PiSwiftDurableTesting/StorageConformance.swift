@@ -51,6 +51,7 @@ public func storageConformanceCases(
         ("scans tables in either ID order and continues a cursor in its order", StorageChecks.case10),
         ("replaces complete task records and pages filtered task scans", StorageChecks.case11),
         ("stores owners and scans waiting and completing tasks by status", StorageChecks.case12),
+        ("stores and scans sleeping tasks by status", StorageChecks.caseSleeping),
         ("indexes request IDs per conversation and replaces complete submission records", StorageChecks.case13),
         ("stores passive write submissions without input-only lifecycle states", StorageChecks.case14),
         ("reconstructs rewindable documents and preserves half-open incarnations", StorageChecks.case15),

@@ -98,7 +98,7 @@ import PiSwiftDurableTesting
     @Test func cancelledCallerWaitDoesNotCancelSharedWork() async throws {
         let clock = TestClock()
         let definition = harnessOneStep("test.wait-cancel") { _, runtime, context in
-            try await runtime.sleep(until: 1_000, context: context)
+            try await harnessClockHold(until: 1_000, clock: clock, signal: runtime.signal)
             try await runtime.commit({ _, _ in .terminal(outcome: .completed(result: .number(1))) }, context: context)
         }
         let harness = try await harnessOpen([AnyTaskDefinition(definition)], clock: clock)
@@ -106,7 +106,7 @@ import PiSwiftDurableTesting
         let id = try await harnessStart(root, definition)
         let caller = ChordContext.background.withCancel()
         let wait = Task { try await harness.waitForTask(id: id, context: caller.context) }
-        try await harnessEventually { clock.pendingSleeperCount > 0 }
+        try await harnessEventually { clock.pendingTimerCount > 0 }
         caller.cancel()
         await #expect(throws: (any Error).self) { _ = try await wait.value }
         #expect(try await harness.getTask(id: id, context: .background)?.abortRequested == false)

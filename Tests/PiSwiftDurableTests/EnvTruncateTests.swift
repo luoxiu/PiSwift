@@ -40,16 +40,15 @@ import PiSwiftDurableTesting
         #expect(truncateHeadOf("one\ntwo\n", totals: .init(lines: 4, bytes: whole.utf8.count), options: .init(maxLines: 2, maxBytes: 100))
             == truncateHead(whole, options: .init(maxLines: 2, maxBytes: 100)))
     }
-    @Test("test clock wakes due sleepers and removes cancelled sleepers") func testClock() async throws {
-        let clock = TestClock(now: 10)
-        let first = Task { try await clock.sleep(until: 20) }
-        for _ in 0..<10000 { if clock.pendingSleeperCount == 1 { break }; await Task.yield() }
-        #expect(clock.pendingSleeperCount == 1); clock.advance(by: 9); #expect(clock.pendingSleeperCount == 1)
-        clock.advance(by: 1); try await first.value; #expect(clock.now() == 20); #expect(clock.pendingSleeperCount == 0)
-        let second = Task { try await clock.sleep(until: 30) }
-        for _ in 0..<10000 { if clock.pendingSleeperCount == 1 { break }; await Task.yield() }
-        second.cancel()
-        do { try await second.value; Issue.record("Cancelled sleep must fail") } catch { #expect(error is CancellationError) }
-        #expect(clock.pendingSleeperCount == 0)
+    @Test("test clock fires due timers and drops disarmed ones") func testClock() throws {
+        let clock = TestClock(now: 10), fired = SessionTestLog<String>()
+        _ = try clock.setTimer({ fired.append("first") }, 10, TimerOptions(background: false))
+        #expect(clock.pendingTimerCount == 1); clock.advance(by: 9); #expect(clock.pendingTimerCount == 1)
+        #expect(fired.values.isEmpty)
+        clock.advance(by: 1); #expect(fired.values == ["first"]); #expect(clock.now() == 20); #expect(clock.pendingTimerCount == 0)
+        let disarm = try clock.setTimer({ fired.append("second") }, 10, TimerOptions(background: true))
+        #expect(clock.pendingTimerCount == 0); #expect(clock.pendingBackgroundTimerCount == 1)
+        disarm?(); clock.advance(by: 10)
+        #expect(fired.values == ["first"]); #expect(clock.pendingBackgroundTimerCount == 0)
     }
 }

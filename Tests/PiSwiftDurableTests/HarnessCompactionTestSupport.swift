@@ -58,7 +58,7 @@ struct CompactionChat: Sendable {
 }
 
 func compactionOpen(policy: CompactionPolicy = compactionManualPolicy, contextWindow: Int = 100_000,
-                    storage: any DurableStorage = MemoryStorage(), clock: any DurableClock = TestClock(now: 1000),
+                    storage: any DurableStorage = MemoryStorage(), clock: TestClock? = TestClock(now: 1000),
                     setup supplied: HarnessChatSetup? = nil, script suppliedScript: CompactionScript? = nil,
                     models: (any DurableModels)? = nil, resume: Bool = true) async throws -> CompactionChat {
     let setup = supplied ?? HarnessChatSetup(options: .init(models: [.init(id: "faux-1", contextWindow: contextWindow, maxTokens: 900)]), clock: clock)

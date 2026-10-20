@@ -9,7 +9,7 @@ import PiSwiftDurableTesting
 @Suite struct HarnessCompactionEdgeTests {
     // Upstream :1818.
     @Test func declinedBlockingCompactionIsNotRepeatedDuringRetry() async throws {
-        let chat = try await compactionOpen(contextWindow: 1000, clock: SystemDurableClock())
+        let chat = try await compactionOpen(contextWindow: 1000, clock: nil)
         try await compactionHistory(chat)
         chat.setup.updateSettings { $0.compaction = compactionOverrides(interactionBlocking) }
         let asked = Mutex(0)
@@ -203,7 +203,7 @@ import PiSwiftDurableTesting
     }
     // Upstream :2147.
     @Test func retryKeepsPinnedModelAndAdvancesLiveAttempt() async throws {
-        let setup = HarnessChatSetup(options: .init(models: [.init(id: "faux-1", contextWindow: 100_000, maxTokens: 900), .init(id: "faux-2", contextWindow: 100_000, maxTokens: 900)]), clock: SystemDurableClock())
+        let setup = HarnessChatSetup(options: .init(models: [.init(id: "faux-1", contextWindow: 100_000, maxTokens: 900), .init(id: "faux-2", contextWindow: 100_000, maxTokens: 900)]))
         let chat = try await compactionOpen(setup: setup); try await compactionHistory(chat)
         let attempt = Mutex<Int?>(nil)
         chat.script.appendSummary([

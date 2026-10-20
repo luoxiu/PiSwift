@@ -33,7 +33,7 @@ private func h6Checkpoint(_ harness: Harness, _ id: TaskID) async throws -> Gene
     let record = try #require(try await harness.getTask(id: id, context: .background))
     let raw: JSONValue
     switch record.state {
-    case .pending(let checkpoint, _), .running(let checkpoint, _), .waiting(let checkpoint, _, _, _): raw = checkpoint
+    case .pending(let checkpoint, _), .running(let checkpoint, _), .waiting(let checkpoint, _, _, _), .sleeping(let checkpoint, _, _): raw = checkpoint
     default: throw TaskDefinitionError("Expected a recoverable generation")
     }
     return try raw.decode(GenerationCheckpoint.self)
@@ -161,9 +161,55 @@ private func h6Reacquire(_ harness: Harness, _ id: SubmissionID) async throws ->
         opened = try await openChat(storage: SqliteStorage.open(path: path.path), setup: retained)
         let checkpoint = try await h6Checkpoint(opened.harness, taskId)
         #expect(checkpoint.phase == .retry && checkpoint.until == 61000 && checkpoint.attempt == 1)
+        #expect(try await opened.harness.getTask(id: taskId, context: .background)?.state
+            == .sleeping(checkpoint: ["phase": "retry", "attempt": 1, "until": 61000], until: 61000))
+        #expect(try opened.harness.wake() == Wake(active: false, at: 61000))
+        // An early wake retries nothing.
+        try opened.harness.resume()
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(retained.models.calls().streamSimple == 1)
         clock.advance(by: 60000)
         #expect(try await h6Reacquire(opened.harness, submitted.id).wait(context: .background).status == "done")
         #expect(try await allEntries(opened.root).map(\.kind) == ["pi.user", "pi.assistant", "pi.assistant"])
+        try await opened.harness.close(context: .background)
+    }
+
+    // upstream harness-generation-recovery.test.ts:211.
+    @Test func retryStoredAsARunningPhaseByAnEarlierVersionSleepsAgain() async throws {
+        let path = try h6RecoveryPath()
+        defer { try? FileManager.default.removeItem(at: path.deletingLastPathComponent()) }
+        let clock = TestClock(now: 1000)
+        let setup = HarnessChatSetup(clock: clock)
+        setup.updateSettings { $0.retry = .init(enabled: true, maxRetries: 2, baseDelayMs: 60000) }
+        setup.models.setResponses([.message(chatAssistant("", reason: .error, error: "503 Service Unavailable")), .message(chatAssistant("recovered"))])
+        var opened = try await openChat(storage: SqliteStorage.open(path: path.path), setup: setup)
+        let submitted = try await opened.root.submit(.input(content: .text("hi")), context: .background)
+        let first = opened
+        try await eventually {
+            guard let id = try await first.harness.snapshot(LiveDoc, conversationId: first.root.id, context: .background)?.run?.taskId else { return false }
+            return try await first.harness.getTask(id: id, context: .background)?.state.status == "sleeping"
+        }
+        let taskId = try await h6RunTask(opened)
+        try await opened.harness.close(context: .background)
+        // Earlier versions slept inside a running `retry` phase.
+        let database = try AppleSqliteDatabase(path: path.path)
+        try database.run("UPDATE tasks SET status = 'running', record = json_set(json_remove(record, '$.state.until'), '$.state.status', 'running') WHERE id = ?",
+                         [.integer(taskId.rawValue)])
+        try database.close()
+
+        opened = try await openChat(storage: SqliteStorage.open(path: path.path), setup: setup)
+        try opened.harness.resume()
+        let reopened = opened
+        try await eventually { try await reopened.harness.getTask(id: taskId, context: .background)?.state.status == "sleeping" }
+        guard case .sleeping(_, let until, _)? = try await opened.harness.getTask(id: taskId, context: .background)?.state else {
+            Issue.record("The retry must sleep again"); return
+        }
+        #expect(until == 61000)
+        #expect(setup.models.calls().streamSimple == 1)
+        clock.advance(by: 60000)
+        try opened.harness.resume()
+        #expect(try await h6Reacquire(opened.harness, submitted.id).wait(context: .background).status == "done")
+        #expect(setup.models.calls().streamSimple == 2)
         try await opened.harness.close(context: .background)
     }
 
@@ -184,6 +230,11 @@ private func h6Reacquire(_ harness: Harness, _ id: SubmissionID) async throws ->
         opened = try await openChat(storage: SqliteStorage.open(path: path.path), setup: setup)
         let checkpoint = try await h6Checkpoint(opened.harness, taskId)
         #expect(checkpoint.phase == .poll && checkpoint.pollAt == 61000 && checkpoint.attempt == 1)
+        guard case .sleeping(_, let until, _)? = try await opened.harness.getTask(id: taskId, context: .background)?.state else {
+            Issue.record("The poll must sleep"); return
+        }
+        #expect(until == 61000)
+        #expect(try opened.harness.wake() == Wake(active: false, at: 61000))
         clock.advance(by: 60000)
         let receipt = try await h6Reacquire(opened.harness, submitted.id).wait(context: .background)
         #expect(receipt.status == "done")
@@ -210,6 +261,8 @@ private func h6Reacquire(_ harness: Harness, _ id: SubmissionID) async throws ->
             try await eventually { try await firstHarness.snapshot(LiveDoc, conversationId: rootId, context: .background)?.generation?.deferred != nil }
         } else { await reached.wait() }
         try await opened.harness.close(context: .background)
+        // The poll sleeps until it is due; then the model is resolved.
+        if poll { clock.advance(by: 60000) }
         let empty = FakeDurableModels(options: .init(provider: "empty"))
         opened = try await openChat(storage: SqliteStorage.open(path: path.path), setup: setup, models: empty)
         let receipt = try await h6Reacquire(opened.harness, submitted.id).wait(context: .background)

@@ -15,6 +15,37 @@ struct SqliteMigrationTests {
         #expect(try db.get("SELECT next_id, next_seq FROM durable_metadata WHERE singleton = 1") == ["next_id": .text("2"), "next_seq": .integer(1)])
     }
 
+    // upstream sqlite-migrations.test.ts:47
+    @Test func migratesAVersion1DatabaseToStoreSleepingTasksKeepingItsTasksAndIndexes() async throws {
+        let directory = try sqliteTestDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("storage.sqlite").path
+        let database = try AppleSqliteDatabase(path: path)
+        try applySqliteMigrations(database, migrations: Array(sqliteMigrations.prefix(1)))
+        let waiting: JSONValue = ["id": 5, "conversationId": 1, "kind": "test.task", "version": 1, "input": .null, "background": false,
+                                  "abortRequested": false, "state": ["status": "waiting", "checkpoint": ["phase": "run"], "on": [], "policy": "allSettled"]]
+        let record = try waiting.jsonText()
+        try database.run("INSERT INTO tasks (id, conversation_id, kind, status, abort_requested, background, record) VALUES (5, 1, 'test.task', 'waiting', 0, 0, ?)",
+                         [.text(record)])
+        #expect(throws: (any Error).self) {
+            try database.run("INSERT INTO tasks (id, conversation_id, kind, status, abort_requested, background, record) VALUES (6, 1, 'test.task', 'sleeping', 0, 0, '{}')")
+        }
+        try database.close()
+
+        let storage = try await SqliteStorage.open(path: path)
+        try await storage.close(context: .background)
+        let migrated = try AppleSqliteDatabase(path: path)
+        defer { try? migrated.close() }
+        #expect(try migrated.get("SELECT version FROM durable_schema WHERE singleton = 1") == ["version": .integer(2)])
+        #expect(try migrated.get("SELECT status, record FROM tasks WHERE id = 5") == ["status": .text("waiting"), "record": .text(record)])
+        try migrated.run("INSERT INTO tasks (id, conversation_id, kind, status, abort_requested, background, record) VALUES (6, 1, 'test.task', 'sleeping', 0, 0, '{}')")
+        let indexes = try migrated.all("SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'tasks' ORDER BY name")
+        #expect(indexes.compactMap { $0["name"]?.textValue } == [
+            "tasks_by_abort_requested", "tasks_by_background", "tasks_by_conversation", "tasks_by_kind", "tasks_by_status",
+        ])
+        #expect(try migrated.get("SELECT count(*) AS count FROM sqlite_schema WHERE name = 'tasks_v2'") == ["count": .integer(0)])
+    }
+
     @Test func rejectsNewerDatabase() throws {
         let db = try AppleSqliteDatabase(path: ":memory:")
         defer { try? db.close() }

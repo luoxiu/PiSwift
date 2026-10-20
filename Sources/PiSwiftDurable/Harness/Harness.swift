@@ -1,3 +1,4 @@
+import Foundation
 import PiSwiftChord
 import Synchronization
 
@@ -52,16 +53,16 @@ public final class Harness: Sendable {
             if !missing.isEmpty { throw HarnessOpenError.missingBuiltins(missing) }
             let report: @Sendable (any Error) -> Void = options.onReport ?? { _ in }
             let hooks = HarnessSessionHooks(app: options.conversationCreated, onReport: report)
-            let now = options.now ?? { options.clock.now() }
+            let now = options.now ?? { Int64(Date().timeIntervalSince1970 * 1000) }
             // Read at each use, as all settings are, but only this field: it is read on every commit.
             let session = Session(storage: rawStorage, now: now, hooks: hooks,
-                                  documentRetention: { options.settings?.documentRetentionMs })
+                                  documentRetention: { options.settings?.documentRetentionMs }, setTimer: options.setTimer)
             // Every component reads and writes through the Session's failure guard: `rawStorage` serves only the Session.
             let storage = session.storage
             let settings: @Sendable () -> Settings = { options.settings?.resolve() ?? resolveSettings() }
             let reference = Mutex(WeakHarness())
             let scheduler = TaskScheduler(session: session, registry: options.registry, models: options.currentModels,
-                clock: options.clock, now: now, settings: settings,
+                now: now, onWake: options.onWake, timers: hostTimers(options.setTimer, report: report), settings: settings,
                 agent: { id, snapshot, callContext in
                     let state = try await session.snapshot(AgentDoc, conversationId: id, context: callContext)
                     return resolveAgent(state: state, snapshot: snapshot, settings: settings(), report: report)
@@ -96,8 +97,13 @@ public final class Harness: Sendable {
         try session.assertHealthy()
         if closing.withLock({ $0 }) || session.isClosing { throw closedError(session) }
     }
-    /// Starts task scheduling after a harness is opened or paused.
+    /// Starts task scheduling after a harness is opened or paused, and makes sleeping tasks whose time has come runnable,
+    /// which is how a host wakeup resumes them.
     public func resume() throws { try assertOpen(); tasks.resume() }
+    /// When this Session next needs a running process, from the scheduler's memory: `active` while some task can run now
+    /// or is running, `at` for the earliest sleep. Answers also while scheduling is paused. A host that wakes the process
+    /// itself arms from it and calls `resume()` when woken; see `HarnessOptions.onWake`.
+    public func wake() throws -> Wake { try assertOpen(); return tasks.wake() }
     /// Releases this object's resources and rejects later operations.
     public func close(context: ChordContext) async throws {
         closing.withLock { $0 = true }

@@ -21,7 +21,7 @@ import PiSwiftDurableTesting
         try await eventually { models.seen.withLock { !$0.isEmpty } }
         for text in ["hel", "hello", "hello world"] {
             generationPartial(models, text: text)
-            try await eventually { clock.pendingSleeperCount > 0 }; clock.advance(by: 100)
+            try await eventually { clock.pendingTimerCount > 0 }; clock.advance(by: 100)
             try await eventually { try await generationLive(opened)?.generation?.message?["content"]?[0]?["text"] == .string(text) }
         }
         generationFinal(models, text: "hello world")
@@ -65,7 +65,7 @@ import PiSwiftDurableTesting
         let opened = try await openChat(setup: setup), (stream, log) = try await eventListen(opened)
         _ = try await generationSubmit(opened, "a"); await held.reached.wait(); let follow = try await generationSubmit(opened, "f")
         try await log.waitForType("inbox_update"); #expect(log.events.first { $0["type"] == "inbox_update" }?["items"] == [["id": .number(Double(follow.id.rawValue)), "mode": "followUp"]])
-        held.release(); try await log.waitForType("auto_retry_start"); try await eventually { clock.pendingSleeperCount > 0 }; clock.advance(by: 100)
+        held.release(); try await log.waitForType("auto_retry_start"); try await eventually { clock.pendingTimerCount > 0 }; clock.advance(by: 100)
         _ = try await follow.wait(context: .background); try await log.waitForDone(follow.id)
         #expect(log.types.contains("auto_retry_end")); #expect(log.types.filter { $0 == "run_start" }.count == 2)
         #expect(log.events.filter { $0["type"] == "submission" }.compactMap { $0["record"]?["status"]?.stringValue } == ["placed", "queued", "done", "placed", "done"])
@@ -205,7 +205,7 @@ import PiSwiftDurableTesting
     @Test func firstPartialStartsOnceAndAbortEndsConvertedEntry() async throws {
         let clock = TestClock(), setup = HarnessChatSetup(clock: clock), models = HarnessManualModels(base: FakeDurableModels()), opened = try await openChat(setup: setup, models: models), (stream, log) = try await eventListen(opened)
         let input = try await generationSubmit(opened); try await eventually { models.seen.withLock { !$0.isEmpty } }; generationPartial(models)
-        try await eventually { clock.pendingSleeperCount > 0 }; clock.advance(by: 100); try await log.waitForType("message_start", count: 2)
+        try await eventually { clock.pendingTimerCount > 0 }; clock.advance(by: 100); try await log.waitForType("message_start", count: 2)
         try await opened.root.abort(context: .background); _ = try await input.wait(context: .background); try await log.waitForType("run_end")
         #expect(log.events.filter { $0["type"] == "message_start" && $0["message"]?["role"] == "assistant" }.count == 1)
         #expect(log.events.filter { $0["type"] == "message_end" && $0["entry"]?["kind"] == "pi.assistant" }.count == 1)
@@ -227,8 +227,8 @@ import PiSwiftDurableTesting
     @Test func realDeferredGenerationUsesClockPollDeadlines() async throws {
         let clock = TestClock(now: 10), setup = HarnessChatSetup(options: .init(deferred: .init(pendingFetches: 1, pollAfterMs: 20)), settings: .init(stream: .init(deferred: DeferredRequest())), clock: clock)
         setup.models.setResponses([.message(chatAssistant("ready"))]); let opened = try await openChat(setup: setup), (stream, log) = try await eventListen(opened), input = try await generationSubmit(opened)
-        try await eventually { clock.pendingSleeperCount > 0 }; try await log.waitForType("deferred_poll"); clock.advance(by: 20)
-        try await log.waitForType("deferred_poll", count: 2); try await eventually { clock.pendingSleeperCount > 0 }; clock.advance(by: 20)
+        try await eventually { clock.pendingTimerCount > 0 }; try await log.waitForType("deferred_poll"); clock.advance(by: 20)
+        try await log.waitForType("deferred_poll", count: 2); try await eventually { clock.pendingTimerCount > 0 }; clock.advance(by: 20)
         _ = try await input.wait(context: .background); try await log.waitForDone(input.id)
         #expect(log.events.filter { $0["type"] == "deferred_poll" }.map { $0["pollAt"] } == [30, 50])
         #expect(setup.models.state().deferredFetchCount == 2); _ = await stream.stop(); try await opened.harness.close(context: .background)

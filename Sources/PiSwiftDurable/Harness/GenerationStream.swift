@@ -8,7 +8,9 @@ private actor GenerationPartialThrottle {
     let interval: Int64
     let context: ChordContext
     var pending: JSONValue?
-    var timer: Task<Void, Never>?
+    var timer: (@Sendable () -> Void)?
+    var nextTimer = 0
+    var timerID = 0
     var inFlight: Task<Void, Never>?
     var stopped = false
     init(runtime: TaskRuntime, attempt: Int, context: ChordContext) {
@@ -22,11 +24,15 @@ private actor GenerationPartialThrottle {
     }
     private func schedule() {
         guard !stopped, timer == nil, inFlight == nil, pending != nil else { return }
-        let deadline = runtime.scheduler.clock.now() + interval
-        timer = Task {
-            do { try await runtime.scheduler.clock.sleep(until: deadline) } catch { return }
-            flush()
-        }
+        nextTimer += 1
+        let id = nextTimer
+        timerID = id
+        // The callback hops onto the actor; `fired` drops it once this timer was disarmed or replaced.
+        timer = runtime.setTimer({ [weak self] in Task { await self?.fired(id) } }, delayMs: interval)
+    }
+    private func fired(_ id: Int) {
+        guard timer != nil, timerID == id else { return }
+        flush()
     }
     private func flush() {
         timer = nil
@@ -47,7 +53,7 @@ private actor GenerationPartialThrottle {
     }
     private func finished() { inFlight = nil; schedule() }
     func stop() async {
-        stopped = true; timer?.cancel(); timer = nil
+        stopped = true; timer?(); timer = nil
         let write = inFlight
         await write?.value
         pending = nil

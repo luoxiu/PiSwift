@@ -184,6 +184,8 @@ public struct ToolExecutionApi: Sendable {
     private var currentModels: @Sendable () -> any DurableModels
     /// The optional execution environment for the conversation.
     public var env: (any ExecutionEnv)?
+    /// The Harness clock (`HarnessOptions.now`), for times a rerun after a restart compares against.
+    public var now: @Sendable () throws -> Int64
     /// Document snapshot services available to this hook or renderer.
     public var read: HarnessDocumentReader
     /// Publishes incremental output from this tool invocation.
@@ -205,10 +207,12 @@ public struct ToolExecutionApi: Sendable {
     }
     /// Whether the calling tool is replay-safe, so it reattaches to its child tasks after a restart.
     internal var resumes = true
-    /// Binds tool services and publication callbacks to one task invocation.
+    /// Binds tool services and publication callbacks to one task invocation. `now` defaults to the runtime's clock, or
+    /// the system time without a runtime.
     public init(taskId: TaskID, conversationId: ConversationID, callId: String, registry: RegistrySnapshot,
                 models: any DurableModels, env: (any ExecutionEnv)? = nil, read: HarnessDocumentReader = .init(),
                 outputWindow: ShellOutputWindow? = nil, runtime: TaskRuntime? = nil,
+                now: (@Sendable () throws -> Int64)? = nil,
                 agent: @escaping @Sendable (ChordContext) async throws -> Agent,
                 output: @escaping @Sendable (ToolOutputChunk, ShellOutputSkip?) throws -> Void = { _, _ in },
                 diagnostic: @escaping @Sendable (ToolDiagnostic) throws -> Void = { _ in },
@@ -218,6 +222,7 @@ public struct ToolExecutionApi: Sendable {
         self.runtime = runtime
         self.taskId = taskId; self.conversationId = conversationId; self.callId = callId; self.registry = registry
         currentModels = { models }; self.env = env; self.read = read; self.outputWindow = outputWindow; self.agent = agent
+        self.now = now ?? { try runtime?.now() ?? Int64(Date().timeIntervalSince1970 * 1000) }
         self.output = output; self.diagnostic = diagnostic; self.details = details; self.memo = memo
         self.retainedOutput = retainedOutput
     }
@@ -238,7 +243,7 @@ public struct ToolExecutionApi: Sendable {
         }
         self.init(taskId: taskId, conversationId: conversationId, callId: callId, registry: registry,
                   models: models(), env: env, read: toolBoundReader(read, check: check),
-                  outputWindow: outputWindow, runtime: runtime,
+                  outputWindow: outputWindow, runtime: runtime, now: { try runtime.now() },
                   agent: { context in try check(); return try await agent(context) },
                   output: { chunk, skipped in try lifetime.check(); try check(); try output(chunk, skipped) },
                   diagnostic: { value in try lifetime.check(); try check(); try diagnostic(value) },

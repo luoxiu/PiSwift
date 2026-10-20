@@ -15,7 +15,7 @@ import PiSwiftDurableTesting
         let definition = harnessOneStep("test.late-owner-edge", run: { _, _, _ in
             Issue.record("Cancelled work ran")
         }, abort: { task, runtime, context in
-            if task.input == 0 { try await runtime.sleep(until: 100, context: context) }
+            if task.input == 0 { try await harnessClockHold(until: 100, clock: clock, signal: runtime.signal) }
             try await runtime.commit({ _, _ in .terminal(outcome: .aborted(reason: "owner")) }, context: context)
         })
         let first = try await harnessOpen([AnyTaskDefinition(definition)], storage: SqliteStorage.open(path: path), clock: clock)
@@ -36,7 +36,7 @@ import PiSwiftDurableTesting
         #expect(try await harness.getTask(id: tree.0, context: .background)?.abortRequested == true)
         let late = try await harnessStart(conversation, definition, input: 1)
         #expect(try await harness.waitForTask(id: late, context: .background).outcome.status == "aborted")
-        try await harnessEventually { clock.pendingSleeperCount == 1 }
+        try await harnessEventually { clock.pendingTimerCount == 1 }
         #expect(try await harness.getTask(id: tree.0, context: .background)?.state.status == "running")
         clock.advance(by: 100)
         #expect(try await harness.waitForTask(id: tree.0, context: .background).outcome.status == "aborted")
@@ -80,7 +80,7 @@ import PiSwiftDurableTesting
         try await original.close(context: .background)
         let clock = TestClock()
         let definition = harnessOneStep("test.edge-recovery") { task, runtime, context in
-            try await runtime.sleep(until: task.input == 1 ? 100 : 1_000, context: context)
+            try await harnessClockHold(until: task.input == 1 ? 100 : 1_000, clock: clock, signal: runtime.signal)
             try await runtime.commit({ _, _ in .terminal(outcome: .completed(result: .number(1))) }, context: context)
         }
         let reopened = try await SqliteStorage.open(path: path)
@@ -88,7 +88,7 @@ import PiSwiftDurableTesting
         let root = try await harness.root(context: .background)
         if mode == "foreground" {
             let idle = settled { try await root.waitForIdle(context: .background) }
-            try await harnessEventually { clock.pendingSleeperCount == 2 }
+            try await harnessEventually { clock.pendingTimerCount == 2 }
             #expect(!idle.isSettled)
             clock.advance(by: 100)
             try await harnessEventually { idle.isSettled }

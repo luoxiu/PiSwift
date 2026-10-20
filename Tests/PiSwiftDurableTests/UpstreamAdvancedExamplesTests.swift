@@ -481,9 +481,8 @@ extension UpstreamAdvancedExamplesTests {
 
 private struct AdvancedPaymentInput: Codable, Sendable { let card: String }
 private struct AdvancedPaymentCheckpoint: TaskCheckpoint {
-    enum Phase: String, Codable, Sendable { case charge }
+    enum Phase: String, Codable, Sendable { case charge, confirm }
     var phase: Phase = .charge
-    let at: Int64
 }
 private struct AdvancedCheckoutCheckpoint: TaskCheckpoint {
     enum Phase: String, Codable, Sendable { case pay, decide }
@@ -499,15 +498,20 @@ extension UpstreamAdvancedExamplesTests {
         let charged = Mutex<Set<String>>([]), refunds = AdvancedExampleLog<String>()
         let paymentOutcomes = AdvancedExampleLog<[String]>(), clock = TestClock()
         let payment = AdvancedPayment(name: "example.payment", version: 1,
-            initial: { _ in .init(at: clock.now() + 100) }, phase: { task, runtime, context in
+            initial: { _ in .init() }, phase: { task, runtime, context in
                 let card = task.input.card
-                if card.hasPrefix("expired") {
-                    try await runtime.commit({ _, _ in .terminal(outcome: .failed(error: .init(message: "\(card) declined"))) }, context: context)
-                    return
+                switch task.checkpoint.phase {
+                case .charge:
+                    if card.hasPrefix("expired") {
+                        try await runtime.commit({ _, _ in .terminal(outcome: .failed(error: .init(message: "\(card) declined"))) }, context: context)
+                        return
+                    }
+                    charged.withLock { _ = $0.insert(card) }
+                    // The bank confirms after a moment: wait for it without holding an invocation.
+                    try await runtime.sleepUntil(try runtime.now() + 100, checkpoint: AdvancedPaymentCheckpoint(phase: .confirm), context: context)
+                case .confirm:
+                    try await runtime.commit({ _, _ in try completed(task.input) }, context: context)
                 }
-                charged.withLock { _ = $0.insert(card) }
-                try await runtime.sleep(until: task.checkpoint.at, context: context)
-                try await runtime.commit({ _, _ in try completed(task.input) }, context: context)
             }, abort: { task, runtime, context in
                 let refunded = charged.withLock { $0.remove(task.input.card) != nil }
                 refunds.append("payment \(task.input.card) aborted\(refunded ? ", refunded" : "")")
@@ -540,7 +544,7 @@ extension UpstreamAdvancedExamplesTests {
             })
         let registry = createRegistry()
         try registry.install(Extension(name: "checkout", tasks: [AnyTaskDefinition(payment), AnyTaskDefinition(checkout)]))
-        let options = HarnessOptions(models: FakeDurableModels(), registry: registry, clock: clock)
+        let options = HarnessOptions(models: FakeDurableModels(), registry: registry, now: clock.nowFunction, setTimer: clock.setTimer)
         let directory = try advancedDatabase()
         defer { try? FileManager.default.removeItem(at: directory) }
         let path = directory.appendingPathComponent("session.sqlite").path
@@ -555,13 +559,15 @@ extension UpstreamAdvancedExamplesTests {
         #expect(charged.withLock { $0.isEmpty })
         let cancelled = try await start(["visa-5", "visa-6", "visa-7", "visa-8"])
         try first.resume()
-        try await eventually { charged.withLock { $0.count == 4 } && clock.pendingSleeperCount == 4 }
         let graph = try await first.taskGraph(context: .background)
+        // The payments sleep, holding no invocation, until the bank confirms.
+        try await eventually { graph.value.tasks.values.filter { $0.owner == cancelled && $0.state.status == "sleeping" }.count == 4 }
         let nodes = Array(graph.value.tasks.values)
+        #expect(charged.withLock { $0.count == 4 })
         #expect(nodes.count == 5)
         #expect(nodes.first { $0.id == cancelled }?.state.status == "waiting")
         #expect(nodes.filter { $0.owner == cancelled }.count == 4)
-        #expect(nodes.filter { $0.owner == cancelled }.allSatisfy { $0.kind == "example.payment" && $0.state.status == "running" })
+        #expect(nodes.filter { $0.owner == cancelled }.allSatisfy { $0.kind == "example.payment" && $0.state == .sleeping(phase: "confirm", until: 100) })
         graph.dispose()
         _ = try await first.abortTask(id: cancelled, context: .background)
         #expect(try await first.waitForTask(id: cancelled, context: .background).outcome.status == "aborted")
@@ -569,7 +575,10 @@ extension UpstreamAdvancedExamplesTests {
         #expect(refunds.values.filter { $0.contains(", refunded") && ["visa-5", "visa-6", "visa-7", "visa-8"].contains(where: $0.contains) }.count == 4)
         #expect(refunds.values.last == "checkout aborted")
         let resumed = try await start(["visa-9", "visa-10", "visa-11", "visa-12"])
-        try await eventually { charged.withLock { $0.count == 4 } && clock.pendingSleeperCount == 4 }
+        try await eventually {
+            let payments = try await first.inspect(context: .background).tasks.filter { $0.record.kind == "example.payment" }
+            return charged.withLock { $0.count == 4 } && payments.count == 4 && payments.allSatisfy { $0.record.state.status == "sleeping" }
+        }
         try await first.close(context: .background)
         let reopened = try await Harness.open(storage: SqliteStorage.open(path: path), options: options, context: .background)
         clock.advance(by: 100)

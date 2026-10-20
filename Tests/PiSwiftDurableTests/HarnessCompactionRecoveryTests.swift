@@ -17,7 +17,7 @@ private func compactionReopen(_ chat: CompactionChat, path: URL) async throws ->
 private func compactionStoredCheckpoint(_ chat: CompactionChat, _ id: TaskID) async throws -> JSONValue {
     let record = try #require(await chat.harness.getTask(id: id, context: .background))
     switch record.state {
-    case .pending(let value, _), .running(let value, _), .waiting(let value, _, _, _): return value
+    case .pending(let value, _), .running(let value, _), .waiting(let value, _, _, _), .sleeping(let value, _, _): return value
     default: throw TaskDefinitionError("Expected stored compaction checkpoint")
     }
 }

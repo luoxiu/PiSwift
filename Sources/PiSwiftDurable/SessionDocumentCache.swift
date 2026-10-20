@@ -34,19 +34,6 @@ internal func documentRetention(_ retention: DocumentRetention?) -> DocumentRete
     }
 }
 
-/// Arms a timer that only frees memory and returns what cancels it, or nil when the host declines it. It must not call
-/// `fire` before it returns.
-internal typealias SessionTimer = @Sendable (_ delayMs: Int64, _ fire: @escaping @Sendable () async -> Void) -> (@Sendable () -> Void)?
-
-/// The default timer: a task that sleeps and holds nothing else.
-internal let sessionTaskTimer: SessionTimer = { delayMs, fire in
-    let task = Task {
-        do { try await Task.sleep(for: .milliseconds(delayMs)) } catch { return }
-        await fire()
-    }
-    return { task.cancel() }
-}
-
 /// Cached documents with no observer attached, by address, oldest use first, with the time of that use. A Swift
 /// dictionary keeps no insertion order: `order` lists the uses as they happen, and skips a use that a later one of the
 /// same document replaced. Replaced uses are dropped once they outnumber the live ones.
@@ -116,7 +103,7 @@ internal struct SessionDocumentCache: Sendable {
     var sweep: PendingDocumentSweep?
     var nextSweep = 0
     var sweepJobs = 0
-    /// Set once the timer was declined: then none is kept, and the end of each commit evicts what expired.
+    /// Set once the host declined a background timer: then none is kept, and the end of each commit evicts what expired.
     var timersUnavailable = false
 }
 

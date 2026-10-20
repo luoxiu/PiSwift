@@ -17,6 +17,8 @@ internal final class TaskInvocation: Sendable {
         var ended = false
         var work: Task<Void, Never>?
         var watches: [UUID: @Sendable () -> Void] = [:]
+        /// Timers armed through the runtime; disarmed at invocation end.
+        var timers: [UUID: @Sendable () -> Void] = [:]
     }
     let state = Mutex(State())
     init(_ record: TaskRecord, abort: Bool, context: ChordContext) {
@@ -58,8 +60,11 @@ internal final class TaskScheduler: Sendable {
     /// The host's current model access (`HarnessOptions.models`); read at each access.
     let currentModels: @Sendable () -> any DurableModels
     var models: any DurableModels { currentModels() }
-    let clock: any DurableClock
     let now: @Sendable () -> Int64
+    /// `HarnessOptions.onWake`: replaces the timer for sleeping tasks.
+    let onWake: (@Sendable (Wake) throws -> Void)?
+    /// The host's timers (`HarnessOptions.setTimer`).
+    let timers: Timers
     let settings: @Sendable () -> Settings
     let resolveAgent: @Sendable (ConversationID, RegistrySnapshot, ChordContext) async throws -> Agent
     let env: @Sendable (ConversationID, ChordContext) async throws -> (any ExecutionEnv)?
@@ -69,6 +74,8 @@ internal final class TaskScheduler: Sendable {
     let settleOutcome: @Sendable (Transaction, TaskRecord, TaskOutcome) async throws -> Void
     let withdrawInputs: @Sendable (Transaction, ConversationID) async throws -> Void
     struct KeptContext: Sendable { let range: ContextRange; var idleSince: Int64? }
+    /// A timer the scheduler keeps, by ID: a callback that arrives after it was disarmed or replaced does nothing.
+    struct ArmedTimer: Sendable { let at: Int64; let id: Int; let disarm: @Sendable () -> Void }
     struct State: Sendable {
         var live: [TaskID: TaskRecord] = [:]
         /// When each live task became live; listings and reservation passes follow this order.
@@ -91,6 +98,8 @@ internal final class TaskScheduler: Sendable {
         var intent: Set<TaskID> = []
         /// Live tasks that are not `completing`, the candidates of a reservation pass; ones found waiting leave it.
         var runnable: Set<TaskID> = []
+        /// Sleeping live tasks, due or not: the candidates of `wakeDue(now:)`.
+        var sleeping: Set<TaskID> = []
         /// `completing` tasks the next finalize pass checks: those that started holding, and holders of ended work.
         var finalizeChecks: Set<TaskID> = []
         /// Live waiting tasks by each task in their `on`.
@@ -118,15 +127,22 @@ internal final class TaskScheduler: Sendable {
         var subscriptions: [SessionSubscription] = []
         var unsubscribe: (@Sendable () -> Void)?
         var contexts: [ConversationID: KeptContext] = [:]
-        var expiry: Task<Void, Never>?
-        var expiryAt: Int64?
-        var expiryID = UUID()
+        /// Background timer for the earliest expiry of an idle context, unless the host declined it (see `scheduleExpiry`).
+        var expiry: ArmedTimer?
+        /// Timer for the earliest sleep, without `onWake` while scheduling runs.
+        var timer: ArmedTimer?
+        var nextTimer = 0
+        /// Last value given to `onWake`, so an unchanged one is not repeated.
+        var lastWake: Wake?
+        /// A wake delivery is running; `wakeDirty` asks it for one more round.
+        var wakeScheduled = false
+        var wakeDirty = false
     }
     let state = Mutex(State())
     let taskWaiters = Waiters<TaskID, SettledTask>()
     let idleWaiters = Waiters<ConversationID?, Void>()
     init(session: Session, registry: any RegistryReader, models: @escaping @Sendable () -> any DurableModels,
-         clock: any DurableClock, now: @escaping @Sendable () -> Int64,
+         now: @escaping @Sendable () -> Int64, onWake: (@Sendable (Wake) throws -> Void)?, timers: Timers,
          settings: @escaping @Sendable () -> Settings,
          agent: @escaping @Sendable (ConversationID, RegistrySnapshot, ChordContext) async throws -> Agent,
          env: @escaping @Sendable (ConversationID, ChordContext) async throws -> (any ExecutionEnv)?,
@@ -135,7 +151,7 @@ internal final class TaskScheduler: Sendable {
          settleOutcome: @escaping @Sendable (Transaction, TaskRecord, TaskOutcome) async throws -> Void = { _, _, _ in },
          withdrawInputs: @escaping @Sendable (Transaction, ConversationID) async throws -> Void = { _, _ in }) {
         self.session = session; storage = session.storage; self.registry = registry; currentModels = models
-        self.clock = clock; self.now = now; self.settings = settings; resolveAgent = agent; self.env = env
+        self.now = now; self.onWake = onWake; self.timers = timers; self.settings = settings; resolveAgent = agent; self.env = env
         self.conversation = conversation; self.report = report; self.context = context.withoutAbortSignal()
         self.settleOutcome = settleOutcome; self.withdrawInputs = withdrawInputs
     }
@@ -149,7 +165,7 @@ internal final class TaskScheduler: Sendable {
         state.withLock { $0.subscriptions = [commits, close]; $0.unsubscribe = unsubscribe }
         try await session.commit({ tx in
             var found: [TaskRecord] = []
-            for status in [TaskStatus.pending, .running, .waiting, .completing] {
+            for status in [TaskStatus.pending, .running, .waiting, .sleeping, .completing] {
                 found += try await scanAll { cursor in try await tx.scanTasks(.init(status: status), limit: 256, cursor: cursor) }
             }
             // No chain is loaded yet: every task starts in `unloaded`, and the first pass loads them.
@@ -166,8 +182,15 @@ internal final class TaskScheduler: Sendable {
         }, context: context)
         state.withLock { $0.cascadePending = true }
         scheduleReconcile()
+        scheduleWake()
     }
-    func resume() { state.withLock { $0.enabled = true }; kick() }
+    /// Enable scheduling, and make sleeping tasks that are due runnable: a host wakeup, such as an alarm, calls this.
+    /// Idempotent; the kick does nothing once closing.
+    func resume() {
+        let now = now()
+        state.withLock { state in state.enabled = true; state.wakeDue(now: now) }
+        kick()
+    }
     /// Signal every invocation and wait for them; writes nothing. Close calls this after every close listener has run,
     /// so waits, watches, and streams a task holds end with the Session's reason, not as cancelled by its signal.
     func join() async {
@@ -179,13 +202,13 @@ internal final class TaskScheduler: Sendable {
     }
     /// Close listener: runs synchronously once admission is sealed, before `join()`, or when the Session fails.
     private func seal() {
-        let (expiry, unsubscribe) = state.withLock { state in
+        let (timers, unsubscribe) = state.withLock { state in
             state.closing = true; state.contexts = [:]
-            let expiry = state.expiry; state.expiry = nil; state.expiryAt = nil
+            let timers = [state.expiry, state.timer].compactMap { $0 }; state.expiry = nil; state.timer = nil
             let unsubscribe = state.unsubscribe; state.unsubscribe = nil
-            return (expiry, unsubscribe)
+            return (timers, unsubscribe)
         }
-        unsubscribe?(); expiry?.cancel()
+        unsubscribe?(); for timer in timers { timer.disarm() }
         taskWaiters.rejectAll(closedError(session)); idleWaiters.rejectAll(closedError(session))
     }
     /// Fail the Session, which reports it, for a throw in one of the scheduler's own commits; ignored once closing.
@@ -259,6 +282,7 @@ internal final class TaskScheduler: Sendable {
     }
     /// A Task is created under the lock. It cannot enter the pump until the lock is released.
     func kick() {
+        scheduleWake()
         state.withLock { state in
             guard !state.closing else { return }
             state.dirty = true
@@ -485,10 +509,13 @@ internal final class TaskScheduler: Sendable {
                 try await loadScopes()
                 let snapshot = registry.snapshot()
                 for taskId in state.withLock({ $0.ordered($0.runnable) }) {
+                    let now = now()
                     let candidate = state.withLock { state -> TaskRecord? in
                         guard let record = state.live[taskId], record.state.status != "completing", state.invocations[taskId] == nil,
                               // It returns once what it waits for ends, its record changes, or the work below it ends.
-                              state.waitingOn(record, first: true).isEmpty else { state.runnable.remove(taskId); return nil }
+                              state.waitingOn(record, first: true).isEmpty,
+                              // It returns when its time comes: `wakeDue(now:)` from the timer or `resume()`.
+                              !record.notDue(now) else { state.runnable.remove(taskId); return nil }
                         return record
                     }
                     guard let original = candidate else { continue }
@@ -555,17 +582,20 @@ internal final class TaskScheduler: Sendable {
         _ = state.withLock { $0.joining.removeValue(forKey: reservation.joinID) }
     }
     func end(_ invocation: TaskInvocation) {
-        let watches = invocation.state.withLock { state -> [@Sendable () -> Void]? in
+        let stops = invocation.state.withLock { state -> (watches: [@Sendable () -> Void], timers: [@Sendable () -> Void])? in
             guard !state.ended else { return nil }; state.ended = true
-            let watches = Array(state.watches.values); state.watches = [:]; return watches
+            let watches = Array(state.watches.values); state.watches = [:]
+            let timers = Array(state.timers.values); state.timers = [:]
+            return (watches, timers)
         }
-        guard let watches else { return }
+        guard let stops else { return }
         state.withLock { state in
             guard state.invocations[invocation.taskId] === invocation else { return }
             state.invocations.removeValue(forKey: invocation.taskId)
             if state.live[invocation.taskId] != nil { state.runnable.insert(invocation.taskId) }
         }
-        for stop in watches { stop() }
+        for stop in stops.watches { stop() }
+        for disarm in stops.timers { disarm() }
         invocation.controller.abort(SessionError.message("Task \(invocation.taskId.rawValue) invocation has ended"))
     }
     enum Decision { case proceed, end, fault(any Error) }
@@ -640,11 +670,21 @@ internal final class TaskScheduler: Sendable {
 }
 
 internal extension TaskState {
-    var checkpoint: JSONValue? { switch self { case .pending(let value, _), .running(let value, _), .waiting(let value, _, _, _): value; default: nil } }
+    var checkpoint: JSONValue? {
+        switch self {
+        case .pending(let value, _), .running(let value, _), .waiting(let value, _, _, _), .sleeping(let value, _, _): value
+        default: nil
+        }
+    }
     var outcome: TaskOutcome? { switch self { case .completing(let value, _), .terminal(let value, _): value; default: nil } }
 }
 internal extension TaskRecord {
     var parent: OwnershipUp { owner.map(OwnershipUp.task) ?? .conversation(conversationId) }
+    /// A sleep whose `until` the clock has not reached; an abort mark ends a sleep.
+    func notDue(_ now: Int64) -> Bool {
+        guard case .sleeping(_, let until, _) = state else { return false }
+        return !abortRequested && until > now
+    }
     var failedOutcome: Bool { state.outcome.map { $0.status != "completed" } ?? false }
     func replacing(input: JSONValue? = nil, version: Double? = nil, state: TaskState? = nil,
                    abortRequested: Bool? = nil, memos: JSONObject? = nil) -> TaskRecord {

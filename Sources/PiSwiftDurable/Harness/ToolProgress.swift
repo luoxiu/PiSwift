@@ -1,3 +1,4 @@
+import Foundation
 import PiSwiftChord
 import Synchronization
 
@@ -64,6 +65,15 @@ private actor ToolProgressWriter {
         return bytes
     }
 }
+/// The Harness clock and timers for progress pacing.
+private struct RuntimeProgressClock: ProgressClock {
+    let runtime: TaskRuntime
+    // After the invocation ends nothing more commits; the clock only has to answer.
+    func now() -> Int64 { (try? runtime.now()) ?? Int64(Date().timeIntervalSince1970 * 1000) }
+    func setTimer(_ callback: @escaping @Sendable () -> Void, delayMs: Int64) -> @Sendable () -> Void {
+        runtime.setTimer(callback, delayMs: delayMs)
+    }
+}
 /// Orders synchronous reports and waiter registration before the stop barrier.
 internal final class ToolReporter: Sendable {
     private enum Event: Sendable { case mark, waiter(ProgressWaiter) }
@@ -79,7 +89,7 @@ internal final class ToolReporter: Sendable {
         let writer = ToolProgressWriter(runtime: runtime, reported: reported, publishes: publishes, context: context)
         let progress = Progress(write: { try await writer.write() }, onError: { error in
             if !runtime.signal.aborted { runtime.scheduler.report(error) }
-        }, minIntervalMs: runtime.settings.progress.outputIntervalMs, clock: runtime.scheduler.clock)
+        }, minIntervalMs: runtime.settings.progress.outputIntervalMs, clock: RuntimeProgressClock(runtime: runtime))
         let stream = AsyncStream<Event>.makeStream()
         events = stream.continuation
         drain = Task {

@@ -1,52 +1,54 @@
 import Synchronization
 import PiSwiftDurable
 
-/// A manually advanced clock for deterministic sleep and retry tests.
-public final class TestClock: DurableClock, Sendable {
-    private struct Sleeper: Sendable {
+/// A manually advanced clock with host timers, for deterministic sleep and retry tests: pass `now` as
+/// `HarnessOptions.now` and `setTimer` as `HarnessOptions.setTimer`, in place of upstream's mutable clock and fake timers.
+/// Timers fire synchronously, in deadline order, when `advance(by:)` reaches their deadline.
+public final class TestClock: Sendable {
+    private struct Timer: Sendable {
         let deadline: Int64
-        let continuation: CheckedContinuation<Void, any Error>
+        let background: Bool
+        let callback: @Sendable () -> Void
     }
     private struct State: Sendable {
         var now: Int64
         var nextID = 0
-        var sleepers: [Int: Sleeper] = [:]
+        var timers: [Int: Timer] = [:]
     }
     private let state: Mutex<State>
     /// Creates a manual clock at the supplied millisecond time.
     public init(now: Int64 = 0) { state = Mutex(State(now: now)) }
     /// The current manually controlled time in milliseconds.
     public func now() -> Int64 { state.withLock { $0.now } }
-    /// The number of test sleeps that have not reached their deadline.
-    public var pendingSleeperCount: Int { state.withLock { $0.sleepers.count } }
-    /// Moves the test clock forward and wakes sleeps whose deadlines have passed.
+    /// `now()` as a function, for `HarnessOptions.now`.
+    public var nowFunction: @Sendable () -> Int64 { { [self] in now() } }
+    /// Armed timers that pace or resume work, such as a sleeping task's or a progress throttle's, not yet fired or
+    /// disarmed.
+    public var pendingTimerCount: Int { state.withLock { $0.timers.values.filter { !$0.background }.count } }
+    /// Armed background timers, which only free memory, not yet fired or disarmed.
+    public var pendingBackgroundTimerCount: Int { state.withLock { $0.timers.values.filter(\.background).count } }
+    /// Moves the clock forward and fires the timers whose deadline it reached, also those they arm meanwhile.
     public func advance(by milliseconds: Int64) {
         precondition(milliseconds >= 0)
-        let ready = state.withLock { state in
-            state.now += milliseconds
-            let ready = state.sleepers.filter { $0.value.deadline <= state.now }
-            for id in ready.keys { state.sleepers.removeValue(forKey: id) }
-            return Array(ready.values)
-        }
-        for sleeper in ready { sleeper.continuation.resume() }
+        state.withLock { $0.now += milliseconds }
+        while let timer = state.withLock({ state -> Timer? in
+            guard let next = state.timers.filter({ $0.value.deadline <= state.now })
+                .min(by: { ($0.value.deadline, $0.key) < ($1.value.deadline, $1.key) }) else { return nil }
+            state.timers.removeValue(forKey: next.key)
+            return next.value
+        }) { timer.callback() }
     }
-    /// Waits until the millisecond deadline or Swift task cancellation.
-    public func sleep(until deadline: Int64) async throws {
-        let id = state.withLock { state in state.nextID += 1; return state.nextID }
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-                let result = state.withLock { state -> Int in
-                    if Task.isCancelled { return 1 }
-                    if deadline <= state.now { return 2 }
-                    state.sleepers[id] = Sleeper(deadline: deadline, continuation: continuation)
-                    return 0
-                }
-                if result == 1 { continuation.resume(throwing: CancellationError()) }
-                else if result == 2 { continuation.resume() }
+    /// A host `setTimer` on this clock: a timer fires when `advance(by:)` reaches `now() + delayMs`.
+    public var setTimer: SetTimer {
+        { [self] callback, delayMs, options in
+            let id = state.withLock { state in
+                state.nextID += 1
+                let (deadline, overflow) = state.now.addingReportingOverflow(max(0, delayMs))
+                state.timers[state.nextID] = Timer(deadline: overflow ? .max : deadline, background: options.background,
+                                                   callback: callback)
+                return state.nextID
             }
-        } onCancel: {
-            let sleeper = self.state.withLock { $0.sleepers.removeValue(forKey: id) }
-            sleeper?.continuation.resume(throwing: CancellationError())
+            return { [self] in _ = state.withLock { $0.timers.removeValue(forKey: id) } }
         }
     }
 }

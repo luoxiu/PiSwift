@@ -85,7 +85,7 @@ import PiSwiftDurableTesting
         let subscription = try opened.harness.subscribeCommits { publication, _ in log.append(publication) }
         let input = try await generationSubmit(opened); try await eventually { models.seen.withLock { !$0.isEmpty } }
         for text in ["word", "word word", "word word word", "word word word word"] {
-            generationPartial(models, text: text); try await eventually { clock.pendingSleeperCount > 0 }; clock.advance(by: 100)
+            generationPartial(models, text: text); try await eventually { clock.pendingTimerCount > 0 }; clock.advance(by: 100)
             try await eventually { try await generationLive(opened)?.generation?.message?["content"]?[0]?["text"] == .string(text) }
         }
         generationFinal(models); _ = try await input.wait(context: .background)

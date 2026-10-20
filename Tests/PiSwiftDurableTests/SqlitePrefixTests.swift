@@ -94,7 +94,7 @@ struct SqlitePrefixTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         let path = directory.appendingPathComponent("storage.sqlite").path
         try await SqliteStorage.open(path: path).close(context: .background)
-        #expect(try sqliteSchemaVersion(path, table: "durable_schema") == 1)
+        #expect(try sqliteSchemaVersion(path, table: "durable_schema") == 2)
         #expect(!(try prefixNames(path)).contains("pi_durable_schema"))
     }
 

@@ -276,7 +276,7 @@ extension TaskScheduler.State {
         if record.state.status == "terminal" {
             let node = TaskNode(record)
             live.removeValue(forKey: id); order.removeValue(forKey: id)
-            intent.remove(id); runnable.remove(id); finalizeChecks.remove(id)
+            sleeping.remove(id); intent.remove(id); runnable.remove(id); finalizeChecks.remove(id)
             settled[id] = node
             // Before anything is forgotten: the walk up to the task it held passes the ended tasks between them. Its chain
             // is loaded, as every commit that ends a task loads the chains of `unloaded` first.
@@ -296,6 +296,13 @@ extension TaskScheduler.State {
         if record.state.status == "completing" { runnable.remove(id); finalizeChecks.insert(id) }
         else { runnable.insert(id) }
         if case .waiting(_, let on, _, _) = record.state { for task in on { waiters[task, default: []].insert(id) } }
+        if record.state.status == "sleeping" { sleeping.insert(id) } else { sleeping.remove(id) }
+    }
+    /// Make every sleeping task whose time has come a reservation candidate.
+    mutating func wakeDue(now: Int64) {
+        for id in sleeping {
+            if let record = live[id], !record.notDue(now) { runnable.insert(id) }
+        }
     }
     /// The nearest live task above ended ordinary work may be free now: one holding its outcome, or an aborting one.
     mutating func release(_ node: TaskNode) {

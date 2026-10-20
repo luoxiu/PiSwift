@@ -29,7 +29,7 @@ private func structuredLabels(_ log: HarnessEventLog) -> [String] {
         let clock = TestClock(now: 0), setup = HarnessChatSetup(clock: clock)
         let reference = Mutex<Harness?>(nil), childIDs = SessionTestLog<TaskID>()
         let child = harnessOneStep("test.event-hooked") { _, runtime, context in
-            try await runtime.sleep(until: 100, context: context)
+            try await harnessClockHold(until: 100, clock: clock, signal: runtime.signal)
             try await runtime.commit({ _, _ in .terminal(outcome: .completed(result: .null)) }, context: context)
         }
         try setup.registry.install(Extension(name: "event-children", tasks: [AnyTaskDefinition(child)]))
@@ -100,7 +100,7 @@ private func structuredLabels(_ log: HarnessEventLog) -> [String] {
         let abortEntered = HarnessChatSignal(), releaseAbort = SessionTestGate(), childIDs = SessionTestLog<TaskID>()
         defer { releaseAbort.release() }
         let child = harnessOneStep("test.event-owned", run: { _, runtime, context in
-            try await runtime.sleep(until: 100, context: context)
+            try await harnessClockHold(until: 100, clock: clock, signal: runtime.signal)
             try await runtime.commit({ _, _ in .terminal(outcome: .completed(result: .null)) }, context: context)
         }, abort: { _, runtime, context in
             abortEntered.signal(); await releaseAbort.wait()
@@ -120,7 +120,7 @@ private func structuredLabels(_ log: HarnessEventLog) -> [String] {
             }
             childIDs.append(id)
             // Reserve and launch child work before a fault can request its abort.
-            try await eventually { clock.pendingSleeperCount == 1 }
+            try await eventually { clock.pendingTimerCount == 1 }
             if fault {
                 var usage = Usage(input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0)
                 usage.cost.total = .nan

@@ -13,11 +13,11 @@ struct HarnessGenerationStreamTests {
         let submission = try await generationSubmit(opened)
         try await eventually { models.seen.withLock { !$0.isEmpty } }
         generationPartial(models, text: "a")
-        try await eventually { clock.pendingSleeperCount > 0 }
+        try await eventually { clock.pendingTimerCount > 0 }
         clock.advance(by: 100)
         try await eventually { try await generationLive(opened)?.generation?.message?["content"]?[0]?["text"] == .string("a") }
         generationPartial(models, text: "ab")
-        try await eventually { clock.pendingSleeperCount > 0 }
+        try await eventually { clock.pendingTimerCount > 0 }
         clock.advance(by: 100)
         try await eventually { try await generationLive(opened)?.generation?.message?["content"]?[0]?["text"] == .string("ab") }
         generationFinal(models)
@@ -40,7 +40,7 @@ struct HarnessGenerationStreamTests {
         let submission = try await generationSubmit(opened)
         try await eventually { models.seen.withLock { !$0.isEmpty } }
         generationPartial(models)
-        try await eventually { clock.pendingSleeperCount > 0 }
+        try await eventually { clock.pendingTimerCount > 0 }
         clock.advance(by: 300)
         #expect(try await generationLive(opened)?.generation?.message == nil)
         generationFinal(models)
@@ -55,7 +55,7 @@ struct HarnessGenerationStreamTests {
         let submission = try await generationSubmit(opened)
         try await eventually { models.seen.withLock { !$0.isEmpty } }
         generationPartial(models)
-        try await eventually { clock.pendingSleeperCount > 0 }
+        try await eventually { clock.pendingTimerCount > 0 }
         let gate = await storage.holdCommits()
         clock.advance(by: 100)
         await gate.waitUntilEntered()
@@ -73,7 +73,7 @@ struct HarnessGenerationStreamTests {
         let opened = try await openChat(setup: setup, models: models), submission = try await generationSubmit(opened)
         try await eventually { models.seen.withLock { !$0.isEmpty } }
         generationPartial(models)
-        try await eventually { clock.pendingSleeperCount > 0 }
+        try await eventually { clock.pendingTimerCount > 0 }
         clock.advance(by: 100)
         try await eventually { try await generationLive(opened)?.generation?.message != nil }
         try await opened.root.abort(context: .background)
@@ -109,7 +109,7 @@ struct HarnessGenerationStreamTests {
         let opened = try await openChat(setup: setup, models: models), submission = try await generationSubmit(opened)
         try await eventually { models.seen.withLock { !$0.isEmpty } }
         generationPartial(models)
-        try await eventually { clock.pendingSleeperCount > 0 }
+        try await eventually { clock.pendingTimerCount > 0 }
         clock.advance(by: 100)
         try await eventually { try await generationLive(opened)?.generation?.message != nil }
         var invalid = chatAssistant("final"); invalid.usage.cost.total = .nan

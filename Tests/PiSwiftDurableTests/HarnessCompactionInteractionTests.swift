@@ -229,7 +229,7 @@ func interactionBlockingRun(_ chat: CompactionChat) async throws -> (Submission,
     }
     // Upstream :1769.
     @Test func overflowCompactionPreservesFullRetryBudget() async throws {
-        let chat = try await compactionOpen(clock: SystemDurableClock()); try await compactionHistory(chat)
+        let chat = try await compactionOpen(clock: nil); try await compactionHistory(chat)
         chat.setup.updateSettings { $0.compaction = .init(enabled: true, reserveTokens: 1000, keepRecentTokens: 150, backgroundTokens: 0) }
         chat.script.appendSummary([.message(chatAssistant("SUMMARY"))])
         chat.script.appendAgent([.message(compactionFailure("prompt is too long")), .message(compactionFailure("overloaded")), .message(compactionFailure("overloaded")), .message(chatAssistant("finally"))])

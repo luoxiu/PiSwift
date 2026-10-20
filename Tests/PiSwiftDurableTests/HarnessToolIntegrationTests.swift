@@ -414,7 +414,7 @@ extension HarnessToolIntegrationTests {
         let path = directory.appendingPathComponent("tool-child.sqlite").path
         let setup = HarnessChatSetup(), running = HarnessChatSignal(), children = SessionTestLog<TaskID>()
         let child = harnessOneStep("test.integration-cascade", run: { _, runtime, context in
-            try await runtime.sleep(until: Int64.max / 2, context: context)
+            try await aborted(runtime.signal)
         })
         try setup.registry.install(Extension(name: "cascade", tasks: [AnyTaskDefinition(child)]))
         try installHarnessTool(harnessTestTool(execute: { _, api, context in

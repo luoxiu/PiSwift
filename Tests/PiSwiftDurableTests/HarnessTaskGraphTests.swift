@@ -15,7 +15,7 @@ private typealias GraphTask = TaskDefinition<Int, GraphCheckpoint, Int, NoTaskHo
 private func graphFamily(_ clock: TestClock) -> (parent: GraphTask, child: GraphTask) {
     let child = GraphTask(name: "test.graph-child", version: 1, initial: { _ in GraphCheckpoint(phase: .work) },
         phase: { task, runtime, context in
-            try await runtime.sleep(until: task.input == 0 ? 100 : 200, context: context)
+            try await harnessClockHold(until: task.input == 0 ? 100 : 200, clock: clock, signal: runtime.signal)
             try await runtime.commit({ _, _ in .terminal(outcome: .completed(result: .null)) }, context: context)
         }, abort: { _, runtime, context in
             try await runtime.commit({ _, _ in .terminal(outcome: .aborted(reason: "test")) }, context: context)
@@ -117,7 +117,7 @@ private func graphRebuild(_ harness: Harness, _ graph: AttachedReplicatedState<T
         defer { try? FileManager.default.removeItem(at: directory) }
         let clock = TestClock(now: 0)
         let work = harnessOneStep("test.graph-work") { _, runtime, context in
-            try await runtime.sleep(until: 100, context: context)
+            try await harnessClockHold(until: 100, clock: clock, signal: runtime.signal)
             try await runtime.commit({ _, _ in .terminal(outcome: .completed(result: .null)) }, context: context)
         }
         var harness = try await harnessOpen([AnyTaskDefinition(work)], storage: SqliteStorage.open(path: path.path), clock: clock)
@@ -180,7 +180,7 @@ private func graphRebuild(_ harness: Harness, _ graph: AttachedReplicatedState<T
                 for record in records { created.append(record.id) }
                 return nil
             }, context: context)
-            try await runtime.sleep(until: 100, context: context)
+            try await harnessClockHold(until: 100, clock: clock, signal: runtime.signal)
             try await runtime.commit({ _, _ in .terminal(outcome: .completed(result: .null)) }, context: context)
         }
         let harness = try await harnessOpen([AnyTaskDefinition(spawner)], clock: clock)
@@ -238,7 +238,7 @@ private func graphRebuild(_ harness: Harness, _ graph: AttachedReplicatedState<T
         let memo = harnessOneStep("test.graph-memo") { _, runtime, context in
             _ = try await runtime.memo("seen", value: true, context: context)
             reached.release()
-            try await runtime.sleep(until: 100, context: context)
+            try await harnessClockHold(until: 100, clock: clock, signal: runtime.signal)
             try await runtime.commit({ _, _ in .terminal(outcome: .completed(result: .null)) }, context: context)
         }
         let harness = try await harnessOpen([AnyTaskDefinition(memo)], clock: clock)

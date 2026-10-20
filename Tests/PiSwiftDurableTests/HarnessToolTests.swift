@@ -105,7 +105,7 @@ struct HarnessToolTests {
     }
     // :320,352,414,939,959,1000,1014.
     @Test(arguments: ["retained", "tail", "throw", "default", "sanitize", "null", "coalesce", "coalesceInvocation"]) func outputAndDetails(mode: String) async throws {
-        let setup = HarnessChatSetup(settings: .init(progress: .init(outputIntervalMs: 250)), clock: mode.hasPrefix("coalesce") ? TestClock() : SystemDurableClock())
+        let setup = HarnessChatSetup(settings: .init(progress: .init(outputIntervalMs: 250)), clock: mode.hasPrefix("coalesce") ? TestClock() : nil)
         let limits: OutputLimitOverrides? = mode == "retained" ? .init(maxLines: 2) : mode == "tail" ? .init(maxLines: 1, retain: .tail) : nil
         let settled = Mutex<[Int]>([]), pending = Mutex<[Task<Void, any Error>]>([])
         try installHarnessTool(harnessTestTool(limits: limits, execute: { _, api, context in

@@ -199,7 +199,7 @@ import PiSwiftDurableTesting
             log.append("abort")
             if blockAbort.withLock({ $0 }) {
                 abortEntered.release()
-                try await runtime.sleep(until: 1_000_000, context: context)
+                try await aborted(runtime.signal)
             }
             try await runtime.commit({ _, _ in .terminal(outcome: .aborted(reason: "stop")) }, context: context)
         })

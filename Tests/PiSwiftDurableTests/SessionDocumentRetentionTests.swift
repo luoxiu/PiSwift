@@ -53,9 +53,9 @@ private struct RetentionSession {
 }
 
 /// A Session with a controllable clock and retention.
-private func open(_ retention: DocumentRetention?, timer: @escaping SessionTimer = sessionTaskTimer) -> RetentionSession {
+private func open(_ retention: DocumentRetention?, setTimer: SetTimer? = nil) -> RetentionSession {
     let clock = RetentionClock(), storage = ControlledStorage()
-    let session = Session(storage: storage, now: { clock.now }, documentRetention: { retention }, timer: timer)
+    let session = Session(storage: storage, now: { clock.now }, documentRetention: { retention }, setTimer: setTimer)
     return RetentionSession(storage: storage, session: session, clock: clock)
 }
 
@@ -406,10 +406,11 @@ private func untilEvicted(_ session: Session) async throws {
         try await forever.session.close(context: .background)
     }
 
-    // :446. Upstream replaces `setTimeout` with one whose timers have no `unref`; here the Session's timer declines.
+    // :446. Upstream replaces `setTimeout` with one whose timers have no `unref`, which the default `setTimer` declines;
+    // here a host `setTimer` declines background timers.
     @Test("keeps no timer where the host declines timers, and evicts on commits") func declinedTimers() async throws {
         let timers = SessionTestLog<Int64>()
-        let opened = open(1_000, timer: { delay, _ in timers.append(delay); return nil })
+        let opened = open(1_000, setTimer: { _, delay, options in if options.background { timers.append(delay) }; return nil })
         let session = opened.session
         let conversationId = try await createConversation(session)
         try await bump(session, conversationId)

@@ -439,6 +439,9 @@ public enum TaskState: Sendable, Equatable, Codable {
     case running(checkpoint: JSONValue, extensions: JSONObject = [:])
     /// Work waits for the selected tasks under its join policy.
     case waiting(checkpoint: JSONValue, on: [TaskID], policy: JoinPolicy, extensions: JSONObject = [:])
+    /// Parked without an invocation until the Harness clock reaches `until`, in milliseconds on the `HarnessOptions.now`
+    /// clock; then resumes at `checkpoint`. An abort mark does not wait for it.
+    case sleeping(checkpoint: JSONValue, until: Int64, extensions: JSONObject = [:])
     /// An outcome is saved while ordinary owned work finishes.
     case completing(outcome: TaskOutcome, extensions: JSONObject = [:])
     /// The task has a final outcome and cannot execute again.
@@ -449,6 +452,7 @@ public enum TaskState: Sendable, Equatable, Codable {
         case .pending: "pending"
         case .running: "running"
         case .waiting: "waiting"
+        case .sleeping: "sleeping"
         case .completing: "completing"
         case .terminal: "terminal"
         }
@@ -461,6 +465,7 @@ public enum TaskState: Sendable, Equatable, Codable {
         case "pending": try recordForbid(object, ["on", "outcome", "policy"]); self = .pending(checkpoint: try recordRequired(object, "checkpoint"), extensions: recordExtensions(object, excluding: ["status", "checkpoint"]))
         case "running": try recordForbid(object, ["on", "outcome", "policy"]); self = .running(checkpoint: try recordRequired(object, "checkpoint"), extensions: recordExtensions(object, excluding: ["status", "checkpoint"]))
         case "waiting": try recordForbid(object, ["outcome"]); self = .waiting(checkpoint: try recordRequired(object, "checkpoint"), on: try recordRequired(object, "on"), policy: try recordRequired(object, "policy"), extensions: recordExtensions(object, excluding: ["status", "checkpoint", "on", "policy"]))
+        case "sleeping": try recordForbid(object, ["on", "outcome", "policy"]); self = .sleeping(checkpoint: try recordRequired(object, "checkpoint"), until: try recordRequired(object, "until"), extensions: recordExtensions(object, excluding: ["status", "checkpoint", "until"]))
         case "completing": try recordForbid(object, ["checkpoint", "on", "policy"]); self = .completing(outcome: try recordRequired(object, "outcome"), extensions: recordExtensions(object, excluding: ["status", "outcome"]))
         case "terminal": try recordForbid(object, ["checkpoint", "on", "policy"]); self = .terminal(outcome: try recordRequired(object, "outcome"), extensions: recordExtensions(object, excluding: ["status", "outcome"]))
         default: throw recordUnknown("status", tag)
@@ -487,6 +492,12 @@ public enum TaskState: Sendable, Equatable, Codable {
             try recordSet(&object, "checkpoint", checkpoint)
             try recordSet(&object, "on", on)
             try recordSet(&object, "policy", policy)
+        case let .sleeping(checkpoint, until, extensions):
+            object = extensions
+            object["status"] = .string("sleeping")
+            try recordForbid(object, ["on", "outcome", "policy"])
+            try recordSet(&object, "checkpoint", checkpoint)
+            try recordSet(&object, "until", until)
         case let .completing(outcome, extensions):
             object = extensions
             object["status"] = .string("completing")

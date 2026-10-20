@@ -23,33 +23,46 @@ public struct OpenHarnessResult: Sendable {
     /// Errors captured from concurrent test handlers.
     public let reports: HarnessReports
 }
-/// Opens a test harness with fake models and captured error reports.
+/// Opens a test harness with fake models and captured error reports. `clock` supplies `now` and `setTimer` together.
 public func openHarness(storage: any DurableStorage = MemoryStorage(), registry: Registry = Registry(),
-                        settings: HarnessSettingsProvider? = nil,
-                        clock: any DurableClock = SystemDurableClock(),
+                        settings: HarnessSettingsProvider? = nil, clock: TestClock? = nil,
                         context: ChordContext = .background) async throws -> OpenHarnessResult {
     let reports = HarnessReports()
     let harness = try await Harness.open(storage: storage,
         options: HarnessOptions(models: FakeDurableModels(), registry: registry, settings: settings,
-                                clock: clock, onReport: { reports.append($0) }), context: context)
+                                now: clock?.nowFunction, setTimer: clock?.setTimer,
+                                onReport: { reports.append($0) }), context: context)
     return OpenHarnessResult(harness: harness, registry: registry, reports: reports)
 }
-/// Installs application tasks and opens a test harness with fake models.
+/// Installs application tasks and opens a test harness with fake models. `clock` supplies `now` and `setTimer` together;
+/// `now` and `setTimer` given on their own take precedence.
 public func openTasks(storage: any DurableStorage = MemoryStorage(), tasks: [AnyTaskDefinition],
                       registry: Registry = Registry(), now: (@Sendable () -> Int64)? = nil,
                       settings: HarnessSettingsProvider? = nil,
-                      clock: any DurableClock = SystemDurableClock(),
+                      onWake: (@Sendable (Wake) throws -> Void)? = nil, setTimer: SetTimer? = nil,
+                      clock: TestClock? = nil,
                       context: ChordContext = .background) async throws -> OpenHarnessResult {
     if !tasks.isEmpty { try registry.install(Extension(name: "tasks", tasks: tasks)) }
     let reports = HarnessReports()
     let harness = try await Harness.open(storage: storage,
         options: HarnessOptions(models: FakeDurableModels(), registry: registry, settings: settings,
-                                clock: clock, now: now, onReport: { reports.append($0) }), context: context)
+                                now: now ?? clock?.nowFunction, setTimer: setTimer ?? clock?.setTimer,
+                                onWake: onWake, onReport: { reports.append($0) }), context: context)
     return OpenHarnessResult(harness: harness, registry: registry, reports: reports)
 }
 /// Creates a completed terminal task state with a JSON-encoded result.
 public func completed<Result: Codable & Sendable>(_ result: Result) throws -> TaskState {
     .terminal(outcome: .completed(result: try JSONValue(encoding: result)))
+}
+/// Waits until `signal` aborts, then throws its reason: a phase that holds until its invocation is signalled (upstream
+/// task-support `aborted(signal)`).
+public func aborted(_ signal: AbortSignal) async throws -> Never {
+    let stopped = HarnessChatSignal()
+    let registration = signal.addAbortListener { _ in stopped.signal() }
+    if signal.aborted { stopped.signal() }
+    await stopped.wait()
+    signal.removeAbortListener(registration)
+    throw signal.reason ?? CancellationError()
 }
 /// Creates an aborted terminal task state with the supplied reason.
 public func abortedWith(_ reason: String) -> TaskState { .terminal(outcome: .aborted(reason: reason)) }

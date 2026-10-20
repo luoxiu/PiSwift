@@ -93,6 +93,7 @@ extension TaskScheduler {
             else {
                 let on = state.withLock { $0.waitingOn(record) }
                 if !on.isEmpty { derived = .waiting(on: on) }
+                else if record.notDue(now()), case .sleeping(_, let until, _) = record.state { derived = .sleeping(until: until) }
                 else {
                     let definition = snapshot.task(name: record.kind), fit = fit(record, definition: definition)
                     if let reason = fit.reason { derived = .blocked(reason: TaskBlockedReason(rawValue: reason)!, error: fit.error) }
@@ -131,15 +132,21 @@ extension TaskScheduler {
         if case .waiting(_, let on, let policy, _) = next {
             try await validateWait(tx, invocation: invocation, current: current, on: on, policy: policy)
         }
+        if case .sleeping(_, let until, _) = next { try validateSleep(invocation, task: current.id, until: until) }
         switch next {
         case .terminal(let outcome, _):
             guard outcome.status != "faulted", outcome.status != "orphaned" else {
                 throw SessionError.message("Only the scheduler can commit \(outcome.status) outcomes")
             }
             try await terminate(tx, record: current, outcome: outcome)
-        case .running, .waiting: try tx.setTask(current.replacing(state: next))
-        default: throw SessionError.message("A task handler can commit only running, waiting, or terminal state")
+        case .running, .waiting, .sleeping: try tx.setTask(current.replacing(state: next))
+        default: throw SessionError.message("A task handler can commit only running, waiting, sleeping, or terminal state")
         }
+    }
+    /// A sleep's `until` is a time on the Harness clock; an abort handler cannot sleep.
+    private func validateSleep(_ invocation: TaskInvocation, task: TaskID, until: Int64) throws {
+        if invocation.abort { throw SessionError.message("Abort handler of task \(task.rawValue) cannot sleep") }
+        if until < 0 { throw SessionError.message("Task \(task.rawValue) cannot sleep until \(until): not a time in milliseconds") }
     }
     /// A wait names existing tasks, and `failFast` only tasks the waiter owns. It may not close a cycle in the wait-for
     /// graph, whose edges run from each task to what it waits on and to its live ordinary owned work (spec §5.5); waiting
@@ -184,27 +191,6 @@ extension TaskScheduler {
             }
         }
         scheduleExpiry()
-    }
-    private func scheduleExpiry() {
-        let retention = settings().contextRetentionMs, now = now()
-        state.withLock { state in
-            let deadline = state.contexts.values.compactMap { $0.idleSince.map { $0 + retention } }.min()
-            if state.expiryAt == deadline { return }
-            state.expiry?.cancel(); state.expiry = nil; state.expiryAt = nil
-            guard let deadline, !state.closing else { return }
-            state.expiryAt = deadline
-            let id = UUID(); state.expiryID = id
-            state.expiry = Task { [weak self, clock] in
-                do { try await clock.sleep(until: now + min(max(0, deadline - now), 2_147_483_647)) }
-                catch { return }
-                guard let self else { return }
-                let valid = self.state.withLock { state -> Bool in
-                    guard state.expiryID == id, !state.closing else { return false }
-                    state.expiry = nil; state.expiryAt = nil; return true
-                }
-                if valid { self.settleIdle() }
-            }
-        }
     }
     func readContext(_ invocation: TaskInvocation, id: ConversationID, at: EntryID?, context: ChordContext) async throws -> ContextView {
         try invocation.check()

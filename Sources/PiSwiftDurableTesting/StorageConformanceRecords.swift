@@ -228,6 +228,17 @@ extension StorageChecks {
         try StorageAssertions.strictEqual(try await h.scan("task", ["status": "completing"]).items, [])
         try StorageAssertions.strictEqual(try await h.scan("task", ["status": "terminal"]).items, [terminal])
     }
+    static func caseSleeping(_ h: Self) async throws {
+        let root = try await h.root(), sleepingId = try await h.mint()
+        let sleeping = task(sleepingId, root, ["state": ["status": "sleeping", "checkpoint": ["phase": "next"], "until": 61_000], "memos": ["kept": true]])
+        try await h.commit([write("task", sleeping)])
+        try StorageAssertions.deepEqual(try await h.task(sleepingId), sleeping)
+        try StorageAssertions.strictEqual(try await h.scan("task", ["status": "sleeping"]).items, [sleeping])
+        let running = replacing(sleeping, ["state": ["status": "running", "checkpoint": ["phase": "next"]]])
+        try await h.commit([write("task", running)])
+        try StorageAssertions.strictEqual(try await h.scan("task", ["status": "sleeping"]).items, [])
+        try StorageAssertions.strictEqual(try await h.scan("task", ["status": "running"]).items, [running])
+    }
     static func case13(_ h: Self) async throws {
         let root = try await h.root(), other = try await h.mint()
         try await h.commit([write("conversation", ["id": number(other)])])

@@ -11,14 +11,20 @@ public final class HarnessChatSetup: Sendable {
     public let registry: Registry
     /// Errors captured from concurrent test handlers.
     public let reports = HarnessReports()
-    /// The time source used for task sleeps and retry deadlines.
-    public let clock: any DurableClock
+    /// The Harness clock (`HarnessOptions.now`); nil for the system time.
+    public let now: (@Sendable () -> Int64)?
+    /// The host timers (`HarnessOptions.setTimer`); nil for the default, a task that sleeps.
+    public let setTimer: SetTimer?
     private let settingsState: Mutex<HarnessSettings>
-    /// Creates fake model scripts and settings that can survive a harness reopen.
+    /// Creates fake model scripts and settings that can survive a harness reopen. `clock` supplies `now` and `setTimer`
+    /// together; `now` and `setTimer` given on their own take precedence.
     public init(options: FauxRegistrationOptions = .init(), registry: Registry = createRegistry(),
-                settings: HarnessSettings = .init(), clock: any DurableClock = SystemDurableClock()) {
+                settings: HarnessSettings = .init(), clock: TestClock? = nil,
+                now: (@Sendable () -> Int64)? = nil, setTimer: SetTimer? = nil) {
         models = FakeDurableModels(options: options)
-        self.registry = registry; self.clock = clock; settingsState = Mutex(settings)
+        self.registry = registry; settingsState = Mutex(settings)
+        self.now = now ?? clock?.nowFunction
+        self.setTimer = setTimer ?? clock?.setTimer
     }
     /// The current host settings or resolved task settings.
     public var settings: HarnessSettings { settingsState.withLock { $0 } }
@@ -44,7 +50,8 @@ public func openChat(storage: any DurableStorage = MemoryStorage(), setup: Harne
                      context: ChordContext = .background) async throws -> OpenChatResult {
     let harness = try await Harness.open(storage: storage,
         options: HarnessOptions(models: models ?? setup.models, registry: setup.registry,
-            settings: setup.settingsProvider, clock: setup.clock, onReport: { setup.reports.append($0) }), context: context)
+            settings: setup.settingsProvider, now: setup.now, setTimer: setup.setTimer,
+            onReport: { setup.reports.append($0) }), context: context)
     let root = try await harness.root(options: .init(agent: AgentChange(model: .set(ModelRef(provider: "faux", modelId: "faux-1")))), context: context)
     return OpenChatResult(harness: harness, root: root)
 }

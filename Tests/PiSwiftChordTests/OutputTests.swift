@@ -2,38 +2,29 @@ import Testing
 import Synchronization
 @testable import PiSwiftChord
 
-/// A manually advanced clock, as PiSwiftDurableTesting's `TestClock`, which these tests used in PiSwiftDurable.
+/// A manually advanced clock with timers that fire as it passes their deadline, in place of upstream's fake timers.
 private final class OutputTestClock: ProgressClock, Sendable {
-    private struct Sleeper: Sendable { let deadline: Int64; let continuation: CheckedContinuation<Void, any Error> }
-    private struct State: Sendable { var now: Int64 = 0; var nextID = 0; var sleepers: [Int: Sleeper] = [:] }
+    private struct Timer: Sendable { let deadline: Int64; let callback: @Sendable () -> Void }
+    private struct State: Sendable { var now: Int64 = 0; var nextID = 0; var timers: [Int: Timer] = [:] }
     private let state = Mutex(State())
     func now() -> Int64 { state.withLock { $0.now } }
-    var pendingSleeperCount: Int { state.withLock { $0.sleepers.count } }
+    var pendingTimerCount: Int { state.withLock { $0.timers.count } }
     func advance(by milliseconds: Int64) {
-        let ready = state.withLock { state in
+        let due = state.withLock { state in
             state.now += milliseconds
-            let ready = state.sleepers.filter { $0.value.deadline <= state.now }
-            for id in ready.keys { state.sleepers.removeValue(forKey: id) }
-            return Array(ready.values)
+            let due = state.timers.filter { $0.value.deadline <= state.now }.sorted { $0.key < $1.key }
+            for (id, _) in due { state.timers.removeValue(forKey: id) }
+            return due.map(\.value)
         }
-        for sleeper in ready { sleeper.continuation.resume() }
+        for timer in due { timer.callback() }
     }
-    func sleep(until deadline: Int64) async throws {
-        let id = state.withLock { state in state.nextID += 1; return state.nextID }
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-                let result = state.withLock { state -> Int in
-                    if Task.isCancelled { return 1 }
-                    if deadline <= state.now { return 2 }
-                    state.sleepers[id] = Sleeper(deadline: deadline, continuation: continuation)
-                    return 0
-                }
-                if result == 1 { continuation.resume(throwing: CancellationError()) } else if result == 2 { continuation.resume() }
-            }
-        } onCancel: {
-            let sleeper = self.state.withLock { $0.sleepers.removeValue(forKey: id) }
-            sleeper?.continuation.resume(throwing: CancellationError())
+    func setTimer(_ callback: @escaping @Sendable () -> Void, delayMs: Int64) -> @Sendable () -> Void {
+        let id = state.withLock { state in
+            state.nextID += 1
+            state.timers[state.nextID] = Timer(deadline: state.now + delayMs, callback: callback)
+            return state.nextID
         }
+        return { [weak self] in _ = self?.state.withLock { $0.timers.removeValue(forKey: id) } }
     }
 }
 
@@ -147,10 +138,10 @@ private final class OutputTestClock: ProgressClock, Sendable {
         let progress = Progress(write: { state.withLock { $0.commits.append(clock.now()); return $0.size } }, onError: { _ in }, minIntervalMs: 100, clock: clock)
         await progress.mark(); await eventually { state.withLock { $0.commits == [0] } }
         state.withLock { $0.size = 10 }
-        await progress.mark(); await progress.mark(); await eventually { clock.pendingSleeperCount == 1 }
+        await progress.mark(); await progress.mark(); await eventually { clock.pendingTimerCount == 1 }
         clock.advance(by: 499); #expect(state.withLock { $0.commits } == [0])
         clock.advance(by: 1); await eventually { state.withLock { $0.commits == [0, 500] } }
-        await progress.mark(); await eventually { clock.pendingSleeperCount == 1 }
+        await progress.mark(); await eventually { clock.pendingTimerCount == 1 }
         clock.advance(by: 99); #expect(state.withLock { $0.commits } == [0, 500])
         clock.advance(by: 1); await eventually { state.withLock { $0.commits == [0, 500, 600] } }
         _ = await progress.stop()
@@ -159,10 +150,33 @@ private final class OutputTestClock: ProgressClock, Sendable {
         let clock = OutputTestClock(); let commits = Mutex<[Int64]>([])
         let progress = Progress(write: { commits.withLock { $0.append(clock.now()) }; return 10 }, onError: { _ in }, minIntervalMs: 500, clock: clock)
         await progress.mark(); await eventually { commits.withLock { $0 == [0] } }
-        await progress.mark(); await eventually { clock.pendingSleeperCount == 1 }
+        await progress.mark(); await eventually { clock.pendingTimerCount == 1 }
         clock.advance(by: 499); #expect(commits.withLock { $0 } == [0])
         clock.advance(by: 1); await eventually { commits.withLock { $0 == [0, 500] } }
         _ = await progress.stop()
+    }
+    @Test("paces on the clock it is given") func progressClock() async throws {
+        let clock = PacingClock(now: 1_000)
+        let commits = Mutex<[Int64]>([])
+        let progress = Progress(write: { commits.withLock { $0.append(clock.now()) }; return 10 }, onError: { _ in },
+                                minIntervalMs: 100, clock: clock)
+        try await progress.markAndWait()
+        #expect(commits.withLock { $0 } == [1_000])
+        // Let the first commit finish settling.
+        try #require(await outputEventuallyAsync { await !progress.hasCommitInFlight })
+        clock.set(1_040)
+        let second = Task { try await progress.markAndWait() }
+        try #require(await outputEventuallyAsync { clock.timers.count == 1 })
+        #expect(clock.timers.map(\.delayMs) == [60])
+        clock.set(1_100)
+        clock.timers[0].callback()
+        try await second.value
+        #expect(commits.withLock { $0 } == [1_000, 1_100])
+        try #require(await outputEventuallyAsync { await !progress.hasCommitInFlight })
+        await progress.mark()
+        #expect(clock.timers.map(\.delayMs) == [60, 100])
+        _ = await progress.stop()
+        #expect(clock.timers[1].disarmed)
     }
     @Test("rejects the waiters of a failed commit and reports its error") func failedProgress() async {
         let errors = Mutex<[String]>([])
@@ -189,6 +203,27 @@ private final class OutputTestClock: ProgressClock, Sendable {
     }
 }
 private enum OutputTestFailure: Error { case commit }
+/// A clock the test sets, recording each timer it arms, as upstream's "paces on the clock it is given" does.
+private final class PacingClock: ProgressClock, Sendable {
+    final class Timer: Sendable {
+        let delayMs: Int64
+        let callback: @Sendable () -> Void
+        private let state = Mutex(false)
+        init(delayMs: Int64, callback: @escaping @Sendable () -> Void) { self.delayMs = delayMs; self.callback = callback }
+        var disarmed: Bool { state.withLock { $0 } }
+        func disarm() { state.withLock { $0 = true } }
+    }
+    private let state: Mutex<(now: Int64, timers: [Timer])>
+    init(now: Int64) { state = Mutex((now, [])) }
+    var timers: [Timer] { state.withLock { $0.timers } }
+    func set(_ now: Int64) { state.withLock { $0.now = now } }
+    func now() -> Int64 { state.withLock { $0.now } }
+    func setTimer(_ callback: @escaping @Sendable () -> Void, delayMs: Int64) -> @Sendable () -> Void {
+        let timer = Timer(delayMs: delayMs, callback: callback)
+        state.withLock { $0.timers.append(timer) }
+        return { timer.disarm() }
+    }
+}
 private actor OutputTestGate {
     var released = false
     var continuation: CheckedContinuation<Void, Never>?

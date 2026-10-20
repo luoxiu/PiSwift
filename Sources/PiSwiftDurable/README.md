@@ -131,6 +131,70 @@ then call `resume`. Submission or waiting also enables scheduling. Example 13 re
 through tick 5 without duplicate ticks. Examples 24 and 31 check task and tool recovery.
 Close the Harness to stop its work and close storage.
 
+## Sleeping and Waking Up
+
+A task waits for time by ending its phase asleep. The sleep is stored, so the task holds no invocation
+meanwhile, survives restarts, and resumes at the checkpoint once the Harness clock reaches `until`.
+`notify` stands for the host's own effect:
+
+```swift
+struct ReminderInput: Codable, Sendable { let text: String; let at: Int64 }
+struct ReminderState: TaskCheckpoint {
+    enum Phase: String, Codable, Sendable { case wait, deliver }
+    var phase: Phase = .wait
+}
+let reminder = TaskDefinition<ReminderInput, ReminderState, JSONValue, NoTaskHooks>(
+    name: "app.reminder", version: 1, initial: { _ in ReminderState() },
+    phase: { task, runtime, context in
+        switch task.checkpoint.phase {
+        // Returns once the sleep is stored; the phase ends there.
+        case .wait: try await runtime.sleepUntil(task.input.at, checkpoint: ReminderState(phase: .deliver), context: context)
+        case .deliver:
+            await notify(task.input.text)
+            try await runtime.commit({ _, _ in .terminal(outcome: .completed(result: .null)) }, context: context)
+        }
+    },
+    abort: { _, runtime, context in
+        try await runtime.commit({ _, _ in .terminal(outcome: .aborted()) }, context: context)
+    })
+```
+
+There is no sleep in the middle of a phase: a phase reruns from its top after a restart, so work
+after the wait goes in the next phase, and what it needs goes in the checkpoint.
+`.sleeping(checkpoint:until:)` returned from `runtime.commit()` is the same sleep, committed together
+with other writes. Retry backoffs and deferred-response polls of the built-in tasks sleep the same way.
+
+Every timer the Harness uses goes through `HarnessOptions.setTimer` (default: a task that
+sleeps), and every time through `now` (default the system time); pass both to run a Harness on a
+fake clock, as tests do with PiSwiftDurableTesting's `TestClock`. Sleep deadlines are stored on `now`,
+so every process that opens one storage must use the same clock. While scheduling runs, a timer resumes
+sleeping tasks when they are due. A Swift task keeps no process alive: the host keeps it running.
+
+A host whose process can be suspended or ended wakes it itself. With `onWake`, the Harness arms no timer
+for sleeps; it tells the host what `harness.wake()` says whenever that changes: `active` while some task
+can run now or is running, and `at`, the earliest sleep. The host keeps its wakeup armed and calls
+`resume()` when it fires. Here `alarm` stands for the host's own scheduler, such as a background task
+request, and arms a recovery heartbeat while work runs, never later than the earliest sleep:
+
+```swift
+@Sendable func alarmTime(_ wake: Wake, now: Int64) -> Int64? {
+    guard wake.active else { return wake.at }
+    return min(now + 60_000, wake.at ?? .max)
+}
+let options = HarnessOptions(models: models, registry: registry,
+    onWake: { wake in alarm.arm(at: alarmTime(wake, now: clock())) })
+let harness = try await Harness.open(storage: SqliteStorage.open(path: path),
+    options: options, context: context)
+try harness.resume()
+// When the alarm fires: resume due sleeps and work a lost process left, then arm again.
+try harness.resume()
+alarm.arm(at: alarmTime(try harness.wake(), now: clock()))
+// Before admitting work: an early alarm is harmless, a missing one strands the work.
+alarm.arm(at: alarmTime(Wake(active: true, at: try harness.wake().at), now: clock()))
+let root = try await harness.root(context: context)
+_ = try await root.submit(.input(content: .text("Hello")), context: context)
+```
+
 ## Extensions and Tools
 
 Create `registry` with `createRegistry()`. Install this extension before you open the Harness.
@@ -267,7 +331,9 @@ There is no cross-process lock. Keep commits serialized through Session.
 Preparation alone does not reserve a future commit. SQLite uses the Apple SDK library
 and requires SQLite 3.37 or later. The port reads the upstream SQLite schema, and a file either
 side wrote opens on the other, prefixed or not. The driver and the migration runner, which
-records each schema's version in its own table, live in PiSwiftChord.
+records each schema's version in its own table, live in PiSwiftChord. Opening applies pending
+schema migrations in one transaction; schema version 2 rebuilds the task table to admit the
+`sleeping` status. A database migrated by a newer version is refused by an older one.
 JSONL shares the valid format-1 files with TypeScript. JSON text bytes can differ.
 It holds full state in memory and replays `main.jsonl` on open, so its memory grows with the
 history. Use SQLite for long-running agents. Open can repair file tails.
@@ -513,9 +579,15 @@ until a compaction produces a summary. The event snapshot carries it as
   so re-encoded bytes differ. Foundation encodes base64.
 - `DocumentRetention` replaces the retention number. `.forever` is upstream `Infinity`, and a
   negative count, the only value that is not milliseconds, means the default. The eviction timer
-  is a sleeping task that keeps nothing alive. Upstream evicts only on commits where timers cannot
-  be unreferenced; here that applies when the Session's internal timer declines, which only tests
-  do. `PI_DURABLE_DOCUMENT_RETENTION_MS` replaces the default for the test suite's second run.
+  is a background timer (`setTimer`); where the host declines it, only commits evict.
+  `PI_DURABLE_DOCUMENT_RETENTION_MS` replaces the default for the test suite's second run.
+- `SetTimer` gets `TimerOptions` and may throw; `onWake` may throw. The default timer is a task that
+  sleeps: a Swift task keeps no process alive, so it never declines a background timer, where
+  upstream's `setTimeout` default unreferences one, or declines it where it cannot. The Session and the
+  scheduler may call `setTimer` while they hold an internal lock, so a host's must return without calling
+  back into the Harness or firing first. `HarnessOptions` has `now` and `setTimer` in place of the earlier
+  Swift `clock`. A sleep's `until` is an `Int64` of milliseconds, so the only time `sleepUntil` can reject
+  is a negative one; its checkpoint is any `TaskCheckpoint`.
 - `InputEntry` holds only `kind` and `data`, so taking those two members of an input's entry is
   its decoding. A queued input's entry is `InboxItem.inputEntry`, stored as upstream's `entry`.
 - `ModelToolSelection` and `ModelToolChange` replace the `modelTools` union: `.exact`, or
@@ -531,7 +603,8 @@ until a compaction produces a summary. The event snapshot carries it as
   with `SqliteStorage.open(path:options:)`, which opens its own file. The driver is synchronous, so a call on
   the database inside its own transaction throws instead of queueing. There is no Durable Object driver.
 - `ShellOutputSkip` is a type alias of PiSwiftChord's `OutputSkip`, where upstream declares the same shape
-  twice. `Progress` takes a `ProgressClock`, which `DurableClock` refines, so a Harness clock paces it.
+  twice. `Progress` takes a `ProgressClock` (`now()` and `setTimer(_:delayMs:)`); a tool's progress paces on
+  the Harness clock and `TaskRuntime.setTimer()`.
   A file that also imports Foundation names it `PiSwiftChord.Progress`.
 - `CompactionSettings` repeats `CompactionPolicyOverrides`' four fields and adds `modelOverrides`, where upstream
   intersects the types. The resolved `CompactionPolicy` in `Settings` carries `modelOverrides` too, and the policy

@@ -9,6 +9,8 @@ public enum TaskGraphState: Sendable, Equatable, Codable {
     case running(phase: String)
     /// Work waits for the selected tasks under its join policy.
     case waiting(phase: String, on: [TaskID], policy: JoinPolicy)
+    /// Asleep until the Harness clock reaches `until`.
+    case sleeping(phase: String, until: Int64)
     /// An outcome is saved while ordinary owned work finishes.
     case completing(outcome: String)
 
@@ -18,6 +20,7 @@ public enum TaskGraphState: Sendable, Equatable, Codable {
         case .pending: "pending"
         case .running: "running"
         case .waiting: "waiting"
+        case .sleeping: "sleeping"
         case .completing: "completing"
         }
     }
@@ -30,6 +33,7 @@ public enum TaskGraphState: Sendable, Equatable, Codable {
         case "running": self = .running(phase: try recordRequired(object, "phase"))
         case "waiting": self = .waiting(phase: try recordRequired(object, "phase"),
             on: try recordRequired(object, "on"), policy: try recordRequired(object, "policy"))
+        case "sleeping": self = .sleeping(phase: try recordRequired(object, "phase"), until: try recordRequired(object, "until"))
         case "completing": self = .completing(outcome: try recordRequired(object, "outcome"))
         default: throw recordUnknown("status", status)
         }
@@ -44,6 +48,9 @@ public enum TaskGraphState: Sendable, Equatable, Codable {
             object["phase"] = .string(phase)
             object["on"] = .array(on.map { .number(Double($0.rawValue)) })
             object["policy"] = .string(policy.rawValue)
+        case let .sleeping(phase, until):
+            object["phase"] = .string(phase)
+            object["until"] = .number(Double(until))
         case .completing(let outcome): object["outcome"] = .string(outcome)
         }
         return .object(object)
@@ -78,6 +85,7 @@ public struct TaskGraphNode: Sendable, Equatable, Codable {
         case .pending(let checkpoint, _): state = .pending(phase: phase(checkpoint))
         case .running(let checkpoint, _): state = .running(phase: phase(checkpoint))
         case let .waiting(checkpoint, on, policy, _): state = .waiting(phase: phase(checkpoint), on: on, policy: policy)
+        case let .sleeping(checkpoint, until, _): state = .sleeping(phase: phase(checkpoint), until: until)
         case .completing(let outcome, _), .terminal(let outcome, _): state = .completing(outcome: outcome.status)
         }
     }
@@ -225,7 +233,7 @@ internal final class TaskGraphView: Sendable {
     }
     private func build(_ context: ChordContext) async throws -> TaskGraph {
         var records: [TaskRecord] = []
-        for status in [TaskStatus.pending, .running, .waiting, .completing] {
+        for status in [TaskStatus.pending, .running, .waiting, .sleeping, .completing] {
             records += try await scanAll { try await storage.scanTasks(.init(status: status), limit: 256, cursor: $0, context: context) }
         }
         var tasks: [String: TaskGraphNode] = [:]

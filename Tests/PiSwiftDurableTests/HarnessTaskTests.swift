@@ -27,6 +27,19 @@ func harnessStart(_ conversation: Conversation, _ definition: HarnessTestTask,
         try await tx.createTask(definition, input: input, options: .init(ownership: .conversation(), background: background))
     }, context: .background)
 }
+/// Holds the phase until `clock` reaches `until`, or throws once `signal` aborts: the in-phase wait `runtime.sleep` was
+/// before upstream `f75b3240a` replaced it with durable sleeps, kept for tests that need a running invocation the test
+/// clock releases. Its timer is one of `clock.pendingTimerCount`.
+func harnessClockHold(until: Int64, clock: TestClock, signal: AbortSignal) async throws {
+    if until <= clock.now() { return }
+    let wake = HarnessChatSignal()
+    let disarm = try clock.setTimer({ wake.signal() }, until - clock.now(), TimerOptions(background: false))
+    let registration = signal.addAbortListener { _ in wake.signal() }
+    if signal.aborted { wake.signal() }
+    await wake.wait()
+    disarm?(); signal.removeAbortListener(registration)
+    try signal.throwIfAborted()
+}
 func harnessEventually(_ condition: @escaping @Sendable () async throws -> Bool) async throws {
     let deadline = ContinuousClock.now.advanced(by: .seconds(5))
     while try await !condition() {
@@ -35,9 +48,10 @@ func harnessEventually(_ condition: @escaping @Sendable () async throws -> Bool)
     }
 }
 func harnessOpen(_ tasks: [AnyTaskDefinition], storage: any DurableStorage = MemoryStorage(),
-                 registry: Registry = Registry(), clock: any DurableClock = SystemDurableClock()) async throws -> Harness {
+                 registry: Registry = Registry(), clock: TestClock? = nil) async throws -> Harness {
     if !tasks.isEmpty { try registry.install(Extension(name: "tasks", tasks: tasks)) }
-    return try await Harness.open(storage: storage, options: .init(models: FakeDurableModels(), registry: registry, clock: clock), context: .background)
+    return try await Harness.open(storage: storage, options: .init(models: FakeDurableModels(), registry: registry,
+        now: clock?.nowFunction, setTimer: clock?.setTimer), context: .background)
 }
 
 @Suite struct HarnessTaskTests {
@@ -166,31 +180,6 @@ func harnessOpen(_ tasks: [AnyTaskDefinition], storage: any DurableStorage = Mem
         await #expect(throws: (any Error).self) {
             _ = try await runtime.memo("late", value: .number(3), context: .background)
         }
-        try await harness.close(context: .background)
-    }
-
-    // upstream harness-tasks.test.ts:692,712
-    @Test func absoluteSleepUsesTestClockAndAbortCancelsSleep() async throws {
-        let clock = TestClock(now: 100)
-        let entered = SessionTestGate()
-        let definition = harnessOneStep("test.sleep") { _, runtime, context in
-            entered.release()
-            try await runtime.sleep(until: 200, context: context)
-            try await runtime.commit({ _, _ in .terminal(outcome: .completed(result: .number(1))) }, context: context)
-        }
-        let harness = try await harnessOpen([AnyTaskDefinition(definition)], clock: clock)
-        let root = try await harness.root(context: .background)
-        let id = try await harnessStart(root, definition)
-        let wait = Task { try await harness.waitForTask(id: id, context: .background) }
-        await entered.wait()
-        try await harnessEventually { clock.pendingSleeperCount > 0 }
-        clock.advance(by: 99)
-        #expect(try await harness.getTask(id: id, context: .background)?.state.status == "running")
-        clock.advance(by: 1)
-        #expect(try await wait.value.outcome == .completed(result: .number(1)))
-        let aborted = try await harnessStart(root, definition)
-        _ = try await harness.abortTask(id: aborted, context: .background)
-        #expect(try await harness.waitForTask(id: aborted, context: .background).outcome.status == "aborted")
         try await harness.close(context: .background)
     }
 

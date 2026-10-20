@@ -8,7 +8,7 @@ import PiSwiftDurableTesting
     @Test func separateConversationIdleScopesIgnoreBackgroundAndCallerCancellation() async throws {
         let clock = TestClock()
         let definition = harnessOneStep("test.idle-scopes") { task, runtime, context in
-            try await runtime.sleep(until: Int64(task.input), context: context)
+            try await harnessClockHold(until: Int64(task.input), clock: clock, signal: runtime.signal)
             try await runtime.commit({ _, _ in .terminal(outcome: .completed(result: .number(1))) }, context: context)
         }
         let harness = try await harnessOpen([AnyTaskDefinition(definition)], clock: clock)
@@ -19,7 +19,7 @@ import PiSwiftDurableTesting
         _ = try await harnessStart(other, definition, input: 200)
         let caller = ChordContext.background.withCancel()
         let cancelled = Task { try await harness.waitForIdle(context: caller.context) }
-        try await harnessEventually { clock.pendingSleeperCount == 3 }
+        try await harnessEventually { clock.pendingTimerCount == 3 }
         caller.cancel()
         await #expect(throws: (any Error).self) { try await cancelled.value }
         let already = ChordContext.background.withCancel()

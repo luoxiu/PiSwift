@@ -1,3 +1,4 @@
+import Foundation
 import PiSwiftChord
 import Synchronization
 
@@ -96,20 +97,39 @@ public final class TaskRuntime: Sendable {
     public func env(context: ChordContext) async throws -> (any ExecutionEnv)? {
         try await withTaskCancellationContext(context) { context in try invocation.check(); try context.abortSignal?.throwIfAborted(); return try await scheduler.env(conversationId, context) }
     }
-    /// Waits until the clock deadline or context cancellation.
-    public func sleep(until deadline: Int64, context: ChordContext) async throws {
-        try await withTaskCancellationContext(context) { context in
-            try invocation.check()
-            let bound = context.withAbortSignal(signal)
-            while true {
-                try bound.abortSignal?.throwIfAborted()
-                let now = scheduler.now()
-                if deadline <= now { return }
-                let step = now + min(deadline - now, 2_147_483_647)
-                let work = Task { try await scheduler.clock.sleep(until: step) }
-                defer { work.cancel() }
-                try await awaitWithContext(work, bound)
-            }
+    /// Commit a sleep: the task holds no invocation until the Harness clock reaches `until`, then resumes at `checkpoint`.
+    /// Returns once the sleep is stored, not when the time comes; the phase returns right after. Returning
+    /// `.sleeping(checkpoint:until:)` from `commit()` is the same sleep, for one that must commit together with other
+    /// writes.
+    public func sleepUntil<Checkpoint: TaskCheckpoint>(_ until: Int64, checkpoint: Checkpoint, context: ChordContext) async throws {
+        let encoded = try encodeTaskCheckpoint(checkpoint)
+        try await commit({ _, _ in .sleeping(checkpoint: encoded, until: until) }, context: context)
+    }
+    /// Call `callback` once after about `delayMs` on the Harness's timer (`HarnessOptions.setTimer`), for pacing work
+    /// inside a phase, such as throttled progress commits. Not durable: the invocation's end disarms it, and after its end
+    /// nothing is armed. Returns a function that disarms it. Wait for time between phases with `sleepUntil()`.
+    public func setTimer(_ callback: @escaping @Sendable () -> Void, delayMs: Int64) -> @Sendable () -> Void {
+        let id = UUID(), invocation = self.invocation
+        // An ended invocation's timers never fire. Listed before arming, so a timer that fires at once finds itself.
+        guard invocation.state.withLock({ state -> Bool in
+            if state.ended { return false }
+            state.timers[id] = {}
+            return true
+        }) else { return {} }
+        let disarm = scheduler.timers.foreground({
+            let live = invocation.state.withLock { state in state.timers.removeValue(forKey: id) != nil && !state.ended }
+            if live { callback() }
+        }, delayMs)
+        let listed = invocation.state.withLock { state -> Bool in
+            guard state.timers[id] != nil else { return false }
+            state.timers[id] = disarm
+            return true
+        }
+        // Fired, or the invocation ended meanwhile, which disarmed only the placeholder.
+        if !listed { disarm() }
+        return {
+            _ = invocation.state.withLock { $0.timers.removeValue(forKey: id) }
+            disarm()
         }
     }
     /// Returns the current durable task record, or nil when it is absent.

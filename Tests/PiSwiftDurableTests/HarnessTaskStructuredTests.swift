@@ -114,7 +114,7 @@ import PiSwiftDurableTesting
     @Test func conversationAbortKeepsBackgroundAndDirectAbortCrossesIt() async throws {
         let clock = TestClock()
         let definition = harnessOneStep("test.background") { _, runtime, context in
-            try await runtime.sleep(until: 100_000, context: context)
+            try await harnessClockHold(until: 100_000, clock: clock, signal: runtime.signal)
             try await runtime.commit({ _, _ in .terminal(outcome: .completed(result: .number(1))) }, context: context)
         }
         let harness = try await harnessOpen([AnyTaskDefinition(definition)], clock: clock)
@@ -135,7 +135,7 @@ import PiSwiftDurableTesting
         let clock = TestClock()
         let log = SessionTestLog<String>()
         let grandchild = harnessOneStep("test.abort-grandchild", run: { _, runtime, context in
-            try await runtime.sleep(until: 100_000, context: context)
+            try await harnessClockHold(until: 100_000, clock: clock, signal: runtime.signal)
         }, abort: { _, runtime, context in
             log.append("grandchild")
             try await runtime.commit({ _, _ in .terminal(outcome: .aborted(reason: "test")) }, context: context)
@@ -170,7 +170,7 @@ import PiSwiftDurableTesting
         let root = try await harness.root(context: .background)
         let id = try await harnessStart(root, parent)
         try harness.resume()
-        try await harnessEventually { clock.pendingSleeperCount == 1 }
+        try await harnessEventually { clock.pendingTimerCount == 1 }
         _ = try await harness.abortTask(id: id, context: .background)
         #expect(try await harness.waitForTask(id: id, context: .background).outcome.status == "aborted")
         #expect(log.values == ["grandchild", "child", "parent"])

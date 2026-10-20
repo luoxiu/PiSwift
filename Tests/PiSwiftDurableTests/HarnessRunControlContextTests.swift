@@ -31,10 +31,11 @@ private func h6Describe(_ message: Message) -> String {
     case .toolResult(let result): return "result:\(result.toolCallId)"
     }
 }
-private func h6ContextSetup(settings: HarnessSettings = .init(), clock: any DurableClock = SystemDurableClock()) async throws -> (Harness, Registry, Conversation, H6CountingStorage, EntryRecord) {
+private func h6ContextSetup(settings: HarnessSettings = .init(), clock: TestClock? = nil) async throws -> (Harness, Registry, Conversation, H6CountingStorage, EntryRecord) {
     let storage = H6CountingStorage(), registry = Registry()
     let harness = try await Harness.open(storage: storage,
-        options: .init(models: FakeDurableModels(), registry: registry, settings: HarnessSettingsProvider { settings }, clock: clock), context: .background)
+        options: .init(models: FakeDurableModels(), registry: registry, settings: HarnessSettingsProvider { settings },
+                       now: clock?.nowFunction, setTimer: clock?.setTimer), context: .background)
     let root = try await harness.root(context: .background)
     let first = try await root.commit({ tx in try await tx.appendEntry(root.id, value: h6User("first")) }, context: .background)
     for index in 0..<20 { _ = try await root.commit({ tx in try await tx.appendEntry(root.id, value: h6Assistant("old \(index)")) }, context: .background) }
@@ -179,12 +180,12 @@ private func h6ContextSetup(settings: HarnessSettings = .init(), clock: any Dura
         _ = try await harness.waitForTask(id: harnessStart(root, definition), context: .background)
         try await root.waitForIdle(context: .background)
         if retention > 0 {
-            try await eventually { clock.pendingSleeperCount == 1 }
+            try await eventually { harness.tasks.state.withLock { $0.expiry != nil } }
             _ = try await harness.waitForTask(id: harnessStart(root, definition), context: .background)
             try await root.waitForIdle(context: .background)
             #expect(rows.values == [22, 1])
             clock.advance(by: retention)
-            try await eventually { clock.pendingSleeperCount == 0 }
+            try await eventually { harness.tasks.state.withLock { $0.expiry == nil } }
         }
         _ = try await harness.waitForTask(id: harnessStart(root, definition), context: .background)
         #expect(rows.values.last == 22)
