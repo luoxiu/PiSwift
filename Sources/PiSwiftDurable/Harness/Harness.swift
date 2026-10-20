@@ -60,7 +60,7 @@ public final class Harness: Sendable {
             let storage = session.storage
             let settings: @Sendable () -> Settings = { options.settings?.resolve() ?? resolveSettings() }
             let reference = Mutex(WeakHarness())
-            let scheduler = TaskScheduler(session: session, registry: options.registry, models: options.models,
+            let scheduler = TaskScheduler(session: session, registry: options.registry, models: options.currentModels,
                 clock: options.clock, now: now, settings: settings,
                 agent: { id, snapshot, callContext in
                     let state = try await session.snapshot(AgentDoc, conversationId: id, context: callContext)

@@ -7,8 +7,12 @@ public struct HookApi: Sendable {
     public var taskId: TaskID
     /// The conversation that owns or is addressed by this value.
     public var conversationId: ConversationID
-    /// The model service used by this harness or task.
-    public var models: any DurableModels
+    /// The current `HarnessOptions.models`, read at each access.
+    public var models: any DurableModels {
+        get { currentModels() }
+        set { currentModels = { newValue } }
+    }
+    private var currentModels: @Sendable () -> any DurableModels
     /// Document snapshot services available to this hook or renderer.
     public var read: HarnessDocumentReader
     /// Reads a saved task memo or installs a candidate when absent.
@@ -17,7 +21,13 @@ public struct HookApi: Sendable {
     public init(taskId: TaskID, conversationId: ConversationID, models: any DurableModels,
                 read: HarnessDocumentReader = .init(),
                 memo: @escaping @Sendable (String, JSONValue?, ChordContext) async throws -> JSONValue? = { _, _, _ in nil }) {
-        self.taskId = taskId; self.conversationId = conversationId; self.models = models; self.read = read; self.memo = memo
+        self.init(taskId: taskId, conversationId: conversationId, models: { models }, read: read, memo: memo)
+    }
+    /// Binds a function returning the current model service, called at each access of `models`.
+    internal init(taskId: TaskID, conversationId: ConversationID, models: @escaping @Sendable () -> any DurableModels,
+                  read: HarnessDocumentReader,
+                  memo: @escaping @Sendable (String, JSONValue?, ChordContext) async throws -> JSONValue?) {
+        self.taskId = taskId; self.conversationId = conversationId; currentModels = models; self.read = read; self.memo = memo
     }
 }
 

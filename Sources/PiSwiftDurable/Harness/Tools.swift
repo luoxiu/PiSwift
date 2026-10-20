@@ -176,8 +176,12 @@ public struct ToolExecutionApi: Sendable {
     public var registry: RegistrySnapshot
     /// The agent configuration used for this conversation.
     public var agent: @Sendable (ChordContext) async throws -> Agent
-    /// The model service used by this harness or task.
-    public var models: any DurableModels
+    /// The current `HarnessOptions.models`, read at each access: the catalog, credentials, and request transforms.
+    public var models: any DurableModels {
+        get { currentModels() }
+        set { currentModels = { newValue } }
+    }
+    private var currentModels: @Sendable () -> any DurableModels
     /// The optional execution environment for the conversation.
     public var env: (any ExecutionEnv)?
     /// Document snapshot services available to this hook or renderer.
@@ -213,12 +217,12 @@ public struct ToolExecutionApi: Sendable {
                 retainedOutput: @escaping @Sendable () throws -> RetainedToolOutput = { RetainedToolOutput(text: "", truncated: false) }) {
         self.runtime = runtime
         self.taskId = taskId; self.conversationId = conversationId; self.callId = callId; self.registry = registry
-        self.models = models; self.env = env; self.read = read; self.outputWindow = outputWindow; self.agent = agent
+        currentModels = { models }; self.env = env; self.read = read; self.outputWindow = outputWindow; self.agent = agent
         self.output = output; self.diagnostic = diagnostic; self.details = details; self.memo = memo
         self.retainedOutput = retainedOutput
     }
     internal init(taskId: TaskID, conversationId: ConversationID, callId: String, registry: RegistrySnapshot,
-                  models: any DurableModels, env: (any ExecutionEnv)? = nil, read: HarnessDocumentReader = .init(),
+                  models: @escaping @Sendable () -> any DurableModels, env: (any ExecutionEnv)? = nil, read: HarnessDocumentReader = .init(),
                   outputWindow: ShellOutputWindow? = nil, runtime: TaskRuntime,
                   lifetime: ToolInvocationLifetime,
                   agent: @escaping @Sendable (ChordContext) async throws -> Agent,
@@ -233,7 +237,7 @@ public struct ToolExecutionApi: Sendable {
             try runtime.invocation.check()
         }
         self.init(taskId: taskId, conversationId: conversationId, callId: callId, registry: registry,
-                  models: models, env: env, read: toolBoundReader(read, check: check),
+                  models: models(), env: env, read: toolBoundReader(read, check: check),
                   outputWindow: outputWindow, runtime: runtime,
                   agent: { context in try check(); return try await agent(context) },
                   output: { chunk, skipped in try lifetime.check(); try check(); try output(chunk, skipped) },
@@ -245,6 +249,7 @@ public struct ToolExecutionApi: Sendable {
             try lifetime.check(); try check(); return try await nestedCall(name, arguments, options, context)
         }
         self.resumes = resumes
+        currentModels = models
     }
 
 }

@@ -120,11 +120,15 @@ public struct EnvTarget: Sendable {
 public typealias HarnessEnvFactory = @Sendable (EnvTarget, ChordContext) async throws -> (any ExecutionEnv)?
 /// Host services and live settings required to open a harness.
 public struct HarnessOptions: Sendable {
-    /// The model service used by this harness or task.
-    public let models: any DurableModels
+    /// Model access used by generation, compaction, hooks, and tools: the supplied service, or the current return value
+    /// of the supplied function, called at each use, so a host can replace its model configuration without reopening
+    /// the Harness.
+    public var models: any DurableModels { currentModels() }
+    /// `models` as a function: a plain service is returned at every call.
+    internal let currentModels: @Sendable () -> any DurableModels
     /// The installed extension and task definitions used by this harness.
     public let registry: any RegistryReader
-    /// An optional callback that supplies live host settings.
+    /// An optional callback that supplies live host settings; read at each use.
     public var settings: HarnessSettingsProvider?
     /// The optional execution environment for the conversation.
     public var env: HarnessEnvFactory?
@@ -143,7 +147,16 @@ public struct HarnessOptions: Sendable {
                 clock: any DurableClock = SystemDurableClock(), now: (@Sendable () -> Int64)? = nil,
                 conversationCreated: (@Sendable (Transaction, ConversationRecord) async throws -> Void)? = nil,
                 onReport: (@Sendable (any Error) -> Void)? = nil) {
-        self.models = models; self.registry = registry; self.settings = settings; self.env = env
+        self.init(models: { models }, registry: registry, settings: settings, env: env, clock: clock, now: now,
+                  conversationCreated: conversationCreated, onReport: onReport)
+    }
+    /// Supplies a function returning the current model service, called at each use, with the other host services.
+    public init(models: @escaping @Sendable () -> any DurableModels, registry: any RegistryReader,
+                settings: HarnessSettingsProvider? = nil, env: HarnessEnvFactory? = nil,
+                clock: any DurableClock = SystemDurableClock(), now: (@Sendable () -> Int64)? = nil,
+                conversationCreated: (@Sendable (Transaction, ConversationRecord) async throws -> Void)? = nil,
+                onReport: (@Sendable (any Error) -> Void)? = nil) {
+        self.currentModels = models; self.registry = registry; self.settings = settings; self.env = env
         self.clock = clock; self.now = now; self.conversationCreated = conversationCreated; self.onReport = onReport
     }
 }

@@ -55,7 +55,9 @@ internal final class TaskScheduler: Sendable {
     let session: Session
     let storage: any DurableStorage
     let registry: any RegistryReader
-    let models: any DurableModels
+    /// The host's current model access (`HarnessOptions.models`); read at each access.
+    let currentModels: @Sendable () -> any DurableModels
+    var models: any DurableModels { currentModels() }
     let clock: any DurableClock
     let now: @Sendable () -> Int64
     let settings: @Sendable () -> Settings
@@ -123,7 +125,7 @@ internal final class TaskScheduler: Sendable {
     let state = Mutex(State())
     let taskWaiters = Waiters<TaskID, SettledTask>()
     let idleWaiters = Waiters<ConversationID?, Void>()
-    init(session: Session, registry: any RegistryReader, models: any DurableModels,
+    init(session: Session, registry: any RegistryReader, models: @escaping @Sendable () -> any DurableModels,
          clock: any DurableClock, now: @escaping @Sendable () -> Int64,
          settings: @escaping @Sendable () -> Settings,
          agent: @escaping @Sendable (ConversationID, RegistrySnapshot, ChordContext) async throws -> Agent,
@@ -132,7 +134,7 @@ internal final class TaskScheduler: Sendable {
          report: @escaping @Sendable (any Error) -> Void, context: ChordContext,
          settleOutcome: @escaping @Sendable (Transaction, TaskRecord, TaskOutcome) async throws -> Void = { _, _, _ in },
          withdrawInputs: @escaping @Sendable (Transaction, ConversationID) async throws -> Void = { _, _ in }) {
-        self.session = session; storage = session.storage; self.registry = registry; self.models = models
+        self.session = session; storage = session.storage; self.registry = registry; currentModels = models
         self.clock = clock; self.now = now; self.settings = settings; resolveAgent = agent; self.env = env
         self.conversation = conversation; self.report = report; self.context = context.withoutAbortSignal()
         self.settleOutcome = settleOutcome; self.withdrawInputs = withdrawInputs

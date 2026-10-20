@@ -36,7 +36,7 @@ public final class TaskRuntime: Sendable {
     public var signal: AbortSignal { invocation.controller.signal }
     /// The context and cancellation signal bound to this invocation.
     public var context: ChordContext { invocation.context }
-    /// The model service used by this harness or task.
+    /// `HarnessOptions.models`, resolved at each access.
     public var models: any DurableModels { scheduler.models }
     /// The current host settings or resolved task settings.
     public var settings: Settings { scheduler.settings() }

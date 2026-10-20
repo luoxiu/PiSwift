@@ -61,7 +61,7 @@ internal func runTool(_ runtime: TaskRuntime, _ input: ToolTaskInput, _ call: To
     do {
         let env = try await runtime.env(context: context)
         var api = ToolExecutionApi(taskId: runtime.taskId, conversationId: runtime.conversationId, callId: call.id,
-            registry: runtime.registry, models: runtime.models, env: env, read: runtime.hookApi.read,
+            registry: runtime.registry, models: { runtime.models }, env: env, read: runtime.hookApi.read,
             outputWindow: limits.retain == .tail ? ShellOutputWindow(maxBytes: limits.maxBytes, maxLines: limits.maxLines,
                 minIntervalMs: runtime.settings.progress.outputIntervalMs, bytesPerSecond: progressBytesPerSecond) : nil,
             runtime: runtime, lifetime: lifetime, agent: { try await runtime.agent(context: $0) },

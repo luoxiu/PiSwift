@@ -61,6 +61,10 @@ Cancellation of a submission wait cancels that wait. It does not withdraw the su
 
 Use `FakeDurableModels` from PiSwiftDurableTesting for deterministic tests.
 A host supplies `DurableModels` for real requests. The core has no global provider registry.
+`HarnessOptions` also takes a function returning the current `DurableModels`. Generation and
+compaction requests, `runtime.models`, and the `api.models` of hooks and tools call it at each
+use, so a host can replace its model configuration without reopening the Harness. Settings come
+from a `HarnessSettingsProvider`, which the Harness reads at each use the same way.
 Import Foundation, PiSwiftAI, PiSwiftChord, PiSwiftDurable, and PiSwiftDurableTesting.
 Run each body below in an async throwing function. `ReadmeLocalExamplesTests` runs all
 code blocks with public imports. The marker names in that file identify each block.
@@ -475,7 +479,9 @@ until a compaction produces a summary. The event snapshot carries it as
 - Tool schemas are explicit JSON. Typed `defineTool` decodes arguments.
   Metadata is separate from tools. Hooks follow the declared upstream API.
   Bash preparation returns a value instead of changing a shared object.
-- Models and live settings are injected services. Fakes are per instance.
+- Models and live settings are injected services. Fakes are per instance. `HarnessOptions` has one initializer
+  for a model service and one for a function returning it, for upstream's `Models | (() => Models)`. Settings
+  are always a `HarnessSettingsProvider` function; wrap a plain `HarnessSettings` value in one.
   File and command failures use Result values. POSIX error text can differ from Node.
   File timestamps drop sub-millisecond precision. Pre-abort rejects zero-line reads.
   AI estimation and validation retain the port's JSON formatting and error text.
