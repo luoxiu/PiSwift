@@ -64,7 +64,7 @@ public protocol ImageProcessor: Sendable {
 /// Formats every provider takes inline; others, such as BMP, need converting.
 internal let inlineImageTypes: Set<String> = ["image/png", "image/jpeg", "image/gif", "image/webp"]
 
-/// Standard base64 of `bytes`. Upstream encodes by hand to avoid platform APIs; Foundation's encoder is the same.
+/// Standard base64 of `bytes`, from Foundation's encoder. Upstream uses `btoa` over 8 KiB binary-string chunks.
 internal func toBase64(_ bytes: [UInt8]) -> String { Data(bytes).base64EncodedString() }
 
 /// The length of the base64 of `byteLength` bytes.

@@ -54,7 +54,7 @@
 | `06a466935` | 2026-10-13 | Release v1.2.0 | 不跟：npm 发版号；Swift 侧版本随移植里程碑在 README 记 | 不跟 |
 | `d54794918` | 2026-10-13 | Add [Unreleased] section for next cycle | 不跟：只加 CHANGELOG 段落 | 不跟 |
 | `f13c00fb3` | 2026-10-13 | fix: pin internal dependencies to exact versions | 不跟：npm 内部依赖钉版本 | 不跟 |
-| `b04299717` | 2026-10-14 | fix(durable): encode base64 with btoa, without retaining concatenation trees | 跟 | 待移植 |
+| `b04299717` | 2026-10-14 | fix(durable): encode base64 with btoa, without retaining concatenation trees | 不跟：Swift 用 Foundation base64（`ImageProcessor.swift` 的 `toBase64` 是 `Data(bytes).base64EncodedString()`），没有 V8 拼接树占堆的问题。上游手写 `toBase64` 的测试在 `42a3497d0` 就没移植，这次加的 8191/8192/8193/16385 长度和 128 MB 堆的 Node 子进程用例也没有对应；`toBase64` 注释里「上游手写」改成上游现在用 `btoa` | 不跟 |
 | `5713c9507` | 2026-10-14 | fix(durable): lead with the system baseline after a compaction that keeps assistant messages | 跟 | 待移植 |
 | `4a5d37291` | 2026-10-15 | feat(chord,durable): move OutputBuffer and Progress to @earendil-works/chord/output | 跟 | 待移植 |
 | `f7e3cb543` | 2026-10-15 | feat(durable): support namespaced SQLite storage (#10937) | 跟 | 待移植 |
