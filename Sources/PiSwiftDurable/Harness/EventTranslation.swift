@@ -82,13 +82,14 @@ internal func translateDurableEvents(conversationId: ConversationID, before: Con
     var entries: [EntryRecord] = []; var tasks: [TaskID: TaskRecord] = [:]; var taskOrder: [TaskID] = []
     var submissions: [SubmissionRecord] = []
     // Nested results this commit stored, by nested task ID; read now, since the caller's documents may retire next.
-    var nestedResults: [String: NestedToolExecutionResult] = [:]
+    var nestedResults: [TaskID: NestedToolExecutionResult] = [:]
     for change in publication.changes {
         switch change {
-        case .document(let document) where document.record.kind == NestedResultDoc.definition.kind
+        case .document(let document) where document.record.kind == NestedCallDoc.definition.kind
             && document.conversationId == conversationId:
-            if let key = document.record.key, let value = document.value?["result"] {
-                nestedResults[key] = try value.decode(NestedToolExecutionResult.self)
+            if let value = document.value {
+                let state = try JSONValue.object(value).decode(NestedCallState.self)
+                if let taskId = state.taskId, let result = state.result { nestedResults[taskId] = result }
             }
         case .entry(let record) where record.conversationId == conversationId: entries.append(record)
         case .task(let record) where record.conversationId == conversationId:
@@ -171,7 +172,7 @@ internal func translateDurableEvents(conversationId: ConversationID, before: Con
     // Nested calls that end in this commit, the same way, children before the calls that made them: the lists hold
     // parents first, so walk them backwards.
     func endNested(_ slot: NestedToolSlot) {
-        events.append(.toolExecutionEnd(call: toolEventCall(slot), result: nestedResults[String(slot.taskId.rawValue)]))
+        events.append(.toolExecutionEnd(call: toolEventCall(slot), result: nestedResults[slot.taskId]))
     }
     let nestedNow = Dictionary(nested.map { ($0.taskId, $0) }, uniquingKeysWith: { $1 })
     for previous in (was.live.nestedTools ?? []).reversed() where previous.status != .done {

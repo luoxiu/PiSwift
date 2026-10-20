@@ -117,7 +117,7 @@ public struct NestedToolSlot: Sendable, Equatable, Codable {
     public var details: JSONValue?
     /// The diagnostics reported by this tool call.
     public var diagnostics: [ToolDiagnostic]?
-    /// Once done: how the call ended, for a status line. The result itself is in the caller's `NestedResultDoc`.
+    /// Once done: how the call ended, for a status line. The result itself is in the caller's `NestedCallDoc`.
     public var summary: NestedToolSummary?
     /// Records a nested call and its initial execution status.
     public init(callId: String, parentCallId: String, parentTaskId: TaskID, name: String, taskId: TaskID,

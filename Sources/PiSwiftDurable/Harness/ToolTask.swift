@@ -113,7 +113,7 @@ public struct ToolTaskCheckpoint: TaskCheckpoint {
         self.phase = phase; self.arguments = arguments; self.replay = replay
     }
 }
-/// A model-issued call's result is its transcript entry; a nested call's result is in its caller's `NestedResultDoc`,
+/// A model-issued call's result is its transcript entry; a nested call's result is in its caller's `NestedCallDoc`,
 /// so the receipt stays small and the result retires with the caller. A version 1 task that was already holding its
 /// outcome as `completing` when the Harness upgraded finishes with a version 1 result, `{ entryId, control? }` without
 /// `kind`; a result without `kind` decodes as a model-issued call's.
@@ -148,29 +148,30 @@ public enum ToolTaskResult: Sendable, Equatable, Codable {
     public var control: ToolControl? { if case .model(_, let control) = self { control } else { nil } }
 }
 
-/// Index of a call's nested calls by key, so a rerun of the call finds the nested calls it already made.
-internal struct NestedCallsState: Sendable, Codable {
-    var calls: [String: TaskID] = [:]
-}
-internal let NestedCallsDoc = try! TaskDocToken<NestedCallsState>(kind: "pi.tool.nested", version: 1, initial: { NestedCallsState() })
+/// Memo of a tool task that made a nested call, in any attempt, committed before the first admission of each attempt:
+/// only then can `pi.live` hold slots below it, which settling removes. A crash between the two only costs a scan.
+internal let madeNestedCallsMemo = "pi.tool.madeNestedCalls"
 
-/// One stored nested call result.
-public struct NestedResultState: Sendable, Equatable, Codable {
-    /// The result exactly as `executeTool()` returns it.
-    public var result: NestedToolExecutionResult
-    /// Stores one result.
-    public init(result: NestedToolExecutionResult) { self.result = result }
+/// One nested call of a running tool: its task, and once it ended, its result.
+public struct NestedCallState: Sendable, Equatable, Codable {
+    /// Absent only inside the commit that creates the call; a creation that fails leaves no member.
+    public var taskId: TaskID?
+    /// Exactly what `executeTool()` returns; absent while running, and for a call the scheduler faulted or orphaned.
+    public var result: NestedToolExecutionResult?
+    /// Stores a nested call's task and result.
+    public init(taskId: TaskID? = nil, result: NestedToolExecutionResult? = nil) { self.taskId = taskId; self.result = result }
 }
-/// The result of one nested call, exactly as `executeTool()` returns it, a member of its caller's family keyed by the
-/// nested task ID. Written in the nested call's terminal commit; one document per result, so no write rewrites other
-/// results. Retires with the caller.
-public let NestedResultDoc = try! TaskDocFamilyToken<NestedResultState, NestedResultState>(
-    kind: "pi.tool.nested-result", version: 1, initial: { $0 })
+/// The nested calls of a tool call, a task-scoped family of the calling task keyed by the nested call's key: so a rerun
+/// finds the calls it already made, and the caller reads each result. Created with the nested task; the nested call's
+/// terminal commit adds its result. One document per call, so no commit rewrites the others. Retires with the caller.
+/// Upstream's seed is `null`; acquire a member with `seed: .null`.
+public let NestedCallDoc = try! TaskDocFamilyToken<NestedCallState, JSONValue>(
+    kind: "pi.tool.nested-call", version: 1, initial: { _ in NestedCallState() })
 
 /// Built-in tool task: resolves the called tool among its phase agent's tools, validates, runs `beforeTool`, records
 /// intent, executes, runs `afterTool`, and settles the result, all in one `call` handler so nothing separates resolution
 /// from settlement. `execute` is reached only by recovery and applies the replay rule. A model-issued call settles by
-/// appending its result entry; a nested call by writing its result to its caller's `NestedResultDoc`.
+/// appending its result entry; a nested call by writing its result to its caller's `NestedCallDoc`.
 public let toolTask = TaskDefinition<ToolTaskInput, ToolTaskCheckpoint, ToolTaskResult, ToolHooks>(
     name: "pi.tool", version: 2, initial: { _ in ToolTaskCheckpoint(phase: .call) },
     phase: { task, runtime, context in try await runToolTask(task, runtime, context) },
@@ -335,7 +336,7 @@ internal func toolResultFromSlot(_ slot: ToolSlotProgress?, code: String, messag
                                isError: true, details: slot?.details, diagnostics: diagnostics)
 }
 /// Commit the tool's terminal state and mark its slot done. A model-issued call appends its result entry and ends with
-/// the entry ID; a nested call writes its result to the caller's `NestedResultDoc`, records its usage, and ends with a
+/// the entry ID; a nested call writes its result to the caller's `NestedCallDoc`, records its usage, and ends with a
 /// small receipt. Nested calls this call left running are aborted first, so they report into their slots before the
 /// slots below the call leave `pi.live`. `build` receives the slot so interruption and abort can report the durable
 /// partial output.
@@ -343,8 +344,13 @@ internal func settleTool(_ runtime: TaskRuntime, _ input: ToolTaskInput, _ call:
                          durationMs: Int? = nil, context: ChordContext,
                          build: (ToolSlotProgress?) throws -> ToolExecutionResult) async throws {
     // A crash in between leaves the call in `execute`: a safe rerun reattaches to the calls, an interruption ends here.
-    let index = try await runtime.snapshot(NestedCallsDoc, taskId: runtime.taskId, context: context)
-    let nestedIds = (index?.calls.values).map { Array($0) }?.sorted() ?? []
+    // Every live nested call the task owns, also those an earlier attempt made and this one never called again.
+    let nestedIds = try await runtime.ownedTasks(context: context).filter { record in
+        guard record.kind == toolTask.name, case .nested? = try? record.input.decode(ToolTaskInput.self) else { return false }
+        return true
+    }.map(\.id)
+    // Read before the settling commit: no admission starts after the lifetime ends, and those underway were awaited.
+    let madeNested = try await runtime.memo(madeNestedCallsMemo, context: context) == .bool(true)
     // Mark them all before waiting for any: one may run until a sibling is cancelled.
     try await withThrowingTaskGroup(of: Void.self) { group in
         for id in nestedIds { group.addTask { try await runtime.abortOwned(id, context: context) } }
@@ -362,13 +368,13 @@ internal func settleTool(_ runtime: TaskRuntime, _ input: ToolTaskInput, _ call:
             if let usage = value.usage {
                 try await recordUsage(tx: tx, conversationId: conversationId, bucket: .tools, key: call.name, usage: usage)
             }
-            // The caller is never terminal before its owned nested calls; a missing entry is a bug, not a race.
-            let index = try await tx.doc(NestedCallsDoc, taskId: nested.parent)
-            guard try index.child("calls")?.get(nested.key)?.decode(TaskID.self) == runtime.taskId else {
+            // The caller is never terminal before its owned nested calls, so its document is open; another task in it is a
+            // bug, not a race.
+            let state = try await tx.doc(NestedCallDoc, taskId: nested.parent, key: nested.key, seed: .null)
+            guard try state.get("taskId")?.decode(TaskID.self) == runtime.taskId else {
                 throw TaskDefinitionError("Nested call \(call.id) is not in its caller's index")
             }
-            _ = try await tx.doc(NestedResultDoc, taskId: nested.parent, key: String(runtime.taskId.rawValue),
-                                 seed: NestedResultState(result: value))
+            try state.set("result", JSONValue(encoding: value))
             if let slot, try isNestedSlot(slot) {
                 try finishSlot(slot: slot)
                 try slot.set("summary", JSONValue(encoding: nestedToolSummary(value, output: result.output ?? [])))
@@ -384,8 +390,9 @@ internal func settleTool(_ runtime: TaskRuntime, _ input: ToolTaskInput, _ call:
             let control: ToolControl? = if case .completed = ending { result.control } else { nil }
             settled = .model(entryId: entry.id, control: control)
         }
-        // A call that made no nested calls has no slots below it; skipping the scan keeps many leaves linear.
-        if !nestedIds.isEmpty { try removeNestedSlots(live: live, taskId: runtime.taskId) }
+        // A call that made no nested calls, in any attempt, has no slots below it; skipping the scan keeps many leaves
+        // linear. Committed before the read: no nested call is admitted after the lifetime ends.
+        if madeNested { try removeNestedSlots(live: live, taskId: runtime.taskId) }
         let value = try JSONValue(encoding: settled)
         switch ending {
         case .completed: return .terminal(outcome: .completed(result: value))
@@ -402,16 +409,16 @@ private func nestedToolResult(taskId: TaskID, result: ToolExecutionResult, durat
                               durationMs: durationMs)
 }
 /// Create nested call `key` of the call `parentCallId` in one commit: its tool task, owned by the calling task, its slot,
-/// and its index entry. A key already in the index returns that call's task when it names the same tool and arguments.
+/// and its `NestedCallDoc`. A key already made returns that call's task when it names the same tool and arguments.
 internal func startNestedCall(_ runtime: TaskRuntime, parentCallId: String, name: String, arguments: JSONObject,
                               key: String, progress: Bool?, abandonOnRestart: Bool,
                               context: ChordContext) async throws -> TaskID {
     let call = NestedToolCall(id: "\(parentCallId)/\(key)", name: name, arguments: arguments)
     return try await withTaskCancellationContext(context) { context in
         try await runtime.scheduler.gated(runtime.invocation, context: context) { tx, _ in
-            let index = try await tx.doc(NestedCallsDoc, taskId: runtime.taskId)
-            guard let calls = try index.child("calls") else { throw TaskDefinitionError("Nested call index is missing") }
-            if let existing = try calls.get(key)?.decode(TaskID.self) {
+            // Opened, or created empty for a key not made yet.
+            let state = try await tx.doc(NestedCallDoc, taskId: runtime.taskId, key: key, seed: .null)
+            if let existing = try state.get("taskId")?.decode(TaskID.self) {
                 let input = try await tx.task(existing).map { try $0.input.decode(ToolTaskInput.self) }
                 guard case .nested(let found)? = input, found.parent == runtime.taskId,
                       harnessNamesEqual(found.call.name, name),
@@ -424,7 +431,7 @@ internal func startNestedCall(_ runtime: TaskRuntime, parentCallId: String, name
                                                                  key: key, call: call, progress: progress == false ? false : nil))
             let created = try await tx.createTask(toolTask, input: input, options: TaskOptions(
                 ownership: .task(taskId: runtime.taskId), abandonOnRestart: abandonOnRestart))
-            try calls.set(key, JSONValue(encoding: created))
+            try state.set("taskId", JSONValue(encoding: created))
             let live = try await tx.doc(LiveDoc, conversationId: runtime.conversationId)
             if try live.child("nestedTools") == nil { try live.set("nestedTools", .array([])) }
             try live.child("nestedTools")!.append(JSONValue(encoding: NestedToolSlot(
@@ -454,7 +461,8 @@ internal func fallbackNestedResult(_ taskId: TaskID, name: String, outcome: Task
     return NestedToolExecutionResult(taskId: taskId, isError: true, diagnostics: error.diagnostics ?? [])
 }
 /// Explicit nested call keys are path segments of the call ID, so IDs of different nested calls never collide, and are
-/// never plain positive integers, which default keys use. `__proto__` is rejected as upstream rejects it.
+/// never plain positive integers, which default keys use. `__proto__` stays reserved, as it was when keys indexed a JSON
+/// object.
 internal func checkNestedKey(_ key: String) throws {
     let digits = key.utf8
     let positiveInteger = !digits.isEmpty && digits.first! >= 0x31 && digits.first! <= 0x39 && digits.allSatisfy { $0 >= 0x30 && $0 <= 0x39 }

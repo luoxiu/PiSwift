@@ -134,6 +134,26 @@ public final class TaskRuntime: Sendable {
             _ = try await scheduler.waitForTask(id: id, context: bound)
         }
     }
+    /// Live tasks this task owns directly, in ID order: also those an earlier invocation created, before a restart. Tasks
+    /// in conversations it owns are not included. Copies of the committed records.
+    public func ownedTasks(context: ChordContext) async throws -> [TaskRecord] {
+        try await withTaskCancellationContext(context) { context in
+            try invocation.check()
+            return try await scheduler.session.readOnLine {
+                // The step that ends the invocation may have run on the line before this.
+                try invocation.check()
+                try context.abortSignal?.throwIfAborted()
+                // Every live task is listed under its parent node, its owner task when it has one.
+                let owned = scheduler.state.withLock { state in
+                    (state.below[.task(taskId)] ?? []).compactMap { node -> TaskRecord? in
+                        guard case .task(let id) = node, let record = state.live[id], record.owner == taskId else { return nil }
+                        return record
+                    }
+                }
+                return owned.sorted { $0.id < $1.id }
+            }
+        }
+    }
     /// Returns the terminal outcomes of the supplied tasks in ID-list order.
     public func outcomes(_ ids: [TaskID], context: ChordContext) async throws -> [TaskOutcome] {
         try await withTaskCancellationContext(context) { context in

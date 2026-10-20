@@ -133,13 +133,15 @@ error result. A model-issued call only loses it, and `onReport` gets the break.
 A tool calls another tool with `api.executeTool(_:arguments:options:context:)`. The nested
 call is its own `pi.tool` task, owned by the caller. It is validated, runs the tool hooks,
 whose `ToolHookCall` carries `parent`, and keeps its own output limits and replay policy.
-Its `NestedToolExecutionResult` returns to the caller, not the transcript. The result lives
-in the caller's `NestedResultDoc` until the caller settles. Nested calls show in
+Its `NestedToolExecutionResult` returns to the caller, not the transcript. Each nested call
+is a member of the caller's `NestedCallDoc`, keyed by its key. The member holds its `taskId`
+and, once it ends, its `result`, until the caller settles. Nested calls show in
 `pi.live.nestedTools` and as tool events with `parentToolCallId` and `parentTaskId`.
 A key names each nested call: its position by default, or `options.key`. A replay-safe
 caller that reruns after a crash gets its nested calls back by key. A caller that is not
 replay-safe never reruns, so its unfinished nested calls are abandoned after a restart.
-Before a caller settles, it aborts the nested calls it left running.
+Before a caller settles, it aborts the nested calls it left running, also those an earlier
+attempt made.
 
 `callers` on a tool says who may call it: `.model`, `.tools`, or both by default.
 A conversation's `modelTools` narrows the tools the model is offered. Tools can still
@@ -147,6 +149,7 @@ call the others. `Agent.callable` lists the tools nested calls resolve among.
 A task created with `abandonOnRestart` is aborted with reason `restart`, with its owned
 work, when a later Harness starts scheduling. Such a task waits for a missing definition
 instead of becoming orphaned. `runtime.abortOwned` aborts an owned task and waits for it.
+`runtime.ownedTasks` lists the live tasks a task owns directly, whichever invocation made them.
 
 Busy input defaults to a follow-up. `.steer` joins after the tool round.
 `.reject` rejects busy admission. Writes append without a model call. Example 20 checks

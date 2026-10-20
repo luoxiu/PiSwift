@@ -72,16 +72,20 @@ private func codes(_ diagnostics: [ToolDiagnostic]?) -> [String?] { (diagnostics
             return .init()
         }, setup: setup)
         setup.models.setResponses([.message(try nestedCall("probe")), .message(nestedDone)])
-        let storage = ControlledStorage()
-        let opened = try await openChat(storage: storage, setup: setup)
+        let opened = try await openChat(setup: setup)
+        // The result each nested call's document got, as committed.
+        let stored = SessionTestLog<NestedToolExecutionResult>()
+        let subscription = try opened.harness.subscribeCommits { publication, _ in
+            for case .document(let change) in publication.changes where change.record.kind == NestedCallDoc.definition.kind {
+                let result = try change.value.map { try JSONValue.object($0).decode(NestedCallState.self) }?.result
+                if let result, !change.ops.isEmpty { stored.append(result) }
+            }
+        }
         let (watch, events) = try await nestedEvents(opened.harness, opened.root.id)
         _ = try await opened.root.submit(.input(content: .text("go")), context: .background).wait(context: .background)
         try await opened.harness.waitForIdle(context: .background)
         await watch.waitUntilIdle(); _ = await watch.stop()
-        let stored = await storage.commits.flatMap { $0 }.compactMap { write -> NestedToolExecutionResult? in
-            guard case .documentCreate(let record, let content, _) = write, record.kind == NestedResultDoc.definition.kind else { return nil }
-            return try? content.value["result"]?.decode(NestedToolExecutionResult.self)
-        }
+        subscription.cancel()
         let ends = events.values.compactMap { event -> NestedToolExecutionResult? in
             if case .toolExecutionEnd(let call, _, let result) = event, call.parentToolCallId != nil { return result }
             return nil
@@ -89,7 +93,7 @@ private func codes(_ diagnostics: [ToolDiagnostic]?) -> [String?] { (diagnostics
         try await opened.harness.close(context: .background)
         #expect(received.values[0].structuredOutput == "a" && received.values[0].isError == false)
         #expect(received.values[1].structuredOutput == .null && received.values[1].isError == false)
-        #expect(stored == received.values)
+        #expect(stored.values == received.values)
         #expect(ends == received.values)
     }
 

@@ -27,6 +27,61 @@ private func sameUsage(_ lhs: Usage?, _ rhs: Usage?) -> Bool { lhs.map(usageValu
 
 /// Port of upstream `test/harness-nested-tools.test.ts`.
 @Suite struct HarnessNestedToolsTests {
+    @Test func storesOneDocumentPerNestedCallKeyedByItsKeyWrittenOnlyByThatCall() async throws {
+        let setup = HarnessChatSetup(), echo = try echoTool()
+        try installHarnessTool(echo.registration, setup: setup)
+        try installHarnessTool(try nestedTool("batch") { _, api, context in
+            async let a = api.executeTool("echo", arguments: ["text": "a"], context: context)
+            async let b = api.executeTool("echo", arguments: ["text": "b"], options: .init(key: "named"), context: context)
+            _ = try await (a, b)
+            return .init()
+        }, setup: setup)
+        setup.models.setResponses([.message(try nestedCall("batch")), .message(nestedDone)])
+        let storage = ControlledStorage()
+        let opened = try await openChat(storage: storage, setup: setup)
+        _ = try await opened.root.submit(.input(content: .text("go")), context: .background).wait(context: .background)
+        // Per document written, the keys of the nested calls it holds.
+        let written = await storage.commits.flatMap { $0 }.compactMap { write -> [String?]? in
+            guard case .documentCreate(let record, _, _) = write else { return nil }
+            return [record.kind, record.key]
+        }
+        // Concurrent calls commit in no fixed order in Swift; upstream's `Promise.all` admits them in call order.
+        let nested = written.filter { $0[0]?.hasPrefix("pi.tool.") == true }.sorted { ($0[1] ?? "") < ($1[1] ?? "") }
+        #expect(nested == [[NestedCallDoc.definition.kind, "1"], [NestedCallDoc.definition.kind, "named"]])
+        try await opened.harness.close(context: .background)
+    }
+
+    @Test func rejectsANestedCallOfAnAbortedCallerAndLeavesNoDocumentForIt() async throws {
+        let setup = HarnessChatSetup(), echo = try echoTool()
+        try installHarnessTool(echo.registration, setup: setup)
+        let started = HarnessChatSignal(), marked = HarnessChatSignal()
+        let rejected = Mutex<(any Error)?>(nil), caller = Mutex<TaskID?>(nil)
+        try installHarnessTool(try nestedTool("late") { _, api, _ in
+            caller.withLock { $0 = api.taskId }
+            started.signal()
+            await marked.wait()
+            // Its context is aborted too, so pass one that is not: the admission itself must refuse.
+            do { _ = try await api.executeTool("echo", arguments: ["text": "a"], context: .background) }
+            catch { rejected.withLock { $0 = error } }
+            return .init()
+        }, setup: setup)
+        setup.models.setResponses([.message(try nestedCall("late")), .message(nestedDone)])
+        let opened = try await openChat(setup: setup)
+        let submission = try await opened.root.submit(.input(content: .text("go")), context: .background)
+        await started.wait()
+        let id = try #require(caller.withLock { $0 })
+        try await opened.harness.commit({ tx in
+            let record = try #require(try await tx.task(id))
+            try tx.setTask(record.withAbortMark())
+        }, context: .background)
+        marked.signal()
+        _ = try await submission.wait(context: .background)
+        let error = String(describing: try #require(rejected.withLock { $0 }))
+        #expect(["abort mark", "aborted", "has settled"].contains { error.contains($0) }, "\(error)")
+        #expect(try await opened.harness.snapshot(NestedCallDoc, taskId: id, key: "1", context: .background) == nil)
+        try await opened.harness.close(context: .background)
+    }
+
     @Test func runsANestedCallAsItsOwnToolTaskAndReturnsItsResultToTheCallerNotTheTranscript() async throws {
         let setup = HarnessChatSetup(), echo = try echoTool()
         try installHarnessTool(echo.registration, setup: setup)
@@ -52,7 +107,7 @@ private func sameUsage(_ lhs: Usage?, _ rhs: Usage?) -> Bool { lhs.map(usageValu
             call: .init(id: "c1/1", name: "echo", arguments: ["text": "a"]))))
         // The receipt stays small: the result lived in the caller's documents, which retired with it.
         #expect(child.state == .terminal(outcome: .completed(result: ["kind": "nested"])))
-        #expect(try await run.harness.snapshot(NestedResultDoc, taskId: parent.id, key: String(child.id.rawValue), context: .background) == nil)
+        #expect(try await run.harness.snapshot(NestedCallDoc, taskId: parent.id, key: "1", context: .background) == nil)
         #expect(try await run.harness.snapshot(LiveDoc, conversationId: run.root.id, context: .background) == LiveState())
         try await run.harness.close(context: .background)
     }

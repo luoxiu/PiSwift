@@ -179,3 +179,84 @@ private final class ObservedStorage: DurableStorage, Sendable {
         try await harness.close(context: .background)
     }
 }
+
+/// What `ownedTasks()` returned to each run of a probe, by its name, and the runtime of its last run.
+private final class OwnedTasksLog: Sendable {
+    let owned = Mutex<[String: [TaskID]]>([:])
+    let runtimes = Mutex<[String: TaskRuntime]>([:])
+}
+/// Records its owned tasks once its `look.<name>` gate opens, then holds until its own gate opens.
+private func ownedTasksProbe(_ gates: HarnessHoldGates, _ log: OwnedTasksLog) -> HarnessHoldTask {
+    HarnessHoldTask(name: "test.index.probe", version: 1, initial: { _ in HarnessTaskCheckpoint() }, phase: { task, runtime, context in
+        log.runtimes.withLock { $0[task.input.name] = runtime }
+        guard await gates.wait("look.\(task.input.name)", signal: runtime.signal) != nil else { return }
+        let owned = try await runtime.ownedTasks(context: context).map(\.id)
+        log.owned.withLock { $0[task.input.name] = owned }
+        guard let outcome = await gates.wait(task.input.name, signal: runtime.signal) else { return }
+        try await runtime.commit({ _, _ in .terminal(outcome: outcome) }, context: context)
+    }, abort: { _, runtime, context in
+        try await runtime.commit({ _, _ in .terminal(outcome: .aborted()) }, context: context)
+    })
+}
+
+/// Port of the `TaskRuntime.ownedTasks` cases of upstream `test/harness-scheduler-indexes.test.ts`.
+@Suite struct TaskRuntimeOwnedTasksTests {
+    @Test func listsTheLiveTasksATaskOwnsDirectlyInIDOrderAlsoAfterAReopen() async throws {
+        let directory = try sqliteTestDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("session.sqlite").path
+        var gates = HarnessHoldGates(), log = OwnedTasksLog()
+        var hold = harnessHold(gates), probe = ownedTasksProbe(gates, log)
+        var opened = try await openTasks(storage: SqliteStorage.open(path: path), tasks: [AnyTaskDefinition(hold), AnyTaskDefinition(probe)])
+        let root = try await opened.harness.root(context: .background)
+        try opened.harness.resume()
+        // The probe owns: two held tasks, one that ends, a grandchild below one of them, and a conversation with a task.
+        let ids = try await root.commit({ [hold, probe] tx in
+            let owner = try await tx.createTask(probe, input: .init(name: "probe"), options: .init(ownership: .conversation()))
+            let first = try await tx.createTask(hold, input: .init(name: "first"), options: .init(ownership: .task(taskId: owner)))
+            let ends = try await tx.createTask(hold, input: .init(name: "ends"), options: .init(ownership: .task(taskId: owner)))
+            let second = try await tx.createTask(hold, input: .init(name: "second"), options: .init(ownership: .task(taskId: owner)))
+            _ = try await tx.createTask(hold, input: .init(name: "grandchild"), options: .init(ownership: .task(taskId: first)))
+            let child = try await tx.createConversation(ownership: .task(taskId: owner)).id
+            _ = try await tx.createTask(hold, input: .init(name: "inside"), options: .init(ownership: .conversation(), conversationId: child))
+            return (probe: owner, first: first, ends: ends, second: second)
+        }, context: .background)
+        gates.open("ends")
+        _ = try await opened.harness.waitForTask(id: ids.ends, context: .background)
+        gates.open("look.probe")
+        try await eventually { [log] in log.owned.withLock { $0["probe"] } != nil }
+        #expect(log.owned.withLock { $0["probe"] } == [ids.first, ids.second])
+        try await opened.harness.close(context: .background)
+
+        // After a reopen the rerun sees the same tasks, which an earlier invocation created.
+        gates = HarnessHoldGates(); log = OwnedTasksLog()
+        hold = harnessHold(gates); probe = ownedTasksProbe(gates, log)
+        opened = try await openTasks(storage: SqliteStorage.open(path: path), tasks: [AnyTaskDefinition(hold), AnyTaskDefinition(probe)])
+        try opened.harness.resume()
+        gates.open("look.probe")
+        try await eventually { [log] in log.owned.withLock { $0["probe"] } != nil }
+        #expect(log.owned.withLock { $0["probe"] } == [ids.first, ids.second])
+        try await opened.harness.close(context: .background)
+    }
+
+    @Test func rejectsOnceItsInvocationHasEnded() async throws {
+        let directory = try sqliteTestDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let gates = HarnessHoldGates(), log = OwnedTasksLog(), probe = ownedTasksProbe(gates, log)
+        let opened = try await openTasks(storage: SqliteStorage.open(path: directory.appendingPathComponent("session.sqlite").path),
+                                         tasks: [AnyTaskDefinition(harnessHold(gates)), AnyTaskDefinition(probe)])
+        let root = try await opened.harness.root(context: .background)
+        try opened.harness.resume()
+        let id = try await root.commit({ tx in
+            try await tx.createTask(probe, input: .init(name: "probe"), options: .init(ownership: .conversation()))
+        }, context: .background)
+        try await eventually { log.runtimes.withLock { $0["probe"] } != nil }
+        let runtime = try #require(log.runtimes.withLock { $0["probe"] })
+        // Aborting joins the run invocation, which has ended by then.
+        _ = try await opened.harness.abortTask(id: id, context: .background)
+        await #expect { _ = try await runtime.ownedTasks(context: .background) } throws: { error in
+            String(describing: error).contains("invocation has ended")
+        }
+        try await opened.harness.close(context: .background)
+    }
+}

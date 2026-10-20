@@ -6,10 +6,33 @@ import Synchronization
 /// Nested call admissions one invocation started, and its default key sequence. Cleanup waits for the admissions, so it
 /// sees every nested call.
 private final class NestedAdmissions: Sendable {
-    private struct State: Sendable { var sequence = 0; var pending: [HarnessPromise<Void>] = [] }
+    private struct State: Sendable {
+        var sequence = 0
+        var pending: [HarnessPromise<Void>] = []
+        var madeNestedMemo: HarnessPromise<Void>?
+    }
     private let state = Mutex(State())
     /// Default keys: the order of this invocation's calls, so a rerun that calls in the same order reattaches.
     func nextKey() -> String { state.withLock { state in state.sequence += 1; return String(state.sequence) } }
+    /// This attempt's commit of the `madeNestedCallsMemo` memo: once, by the first call; a failed one is tried again by
+    /// the next call.
+    func madeNestedMemo(_ commit: () async throws -> Void) async throws {
+        let (memo, first) = state.withLock { state -> (HarnessPromise<Void>, Bool) in
+            if let memo = state.madeNestedMemo { return (memo, false) }
+            let memo = HarnessPromise<Void>()
+            state.madeNestedMemo = memo
+            return (memo, true)
+        }
+        guard first else { return try await memo.value() }
+        do {
+            try await commit()
+            memo.finish(.success(()))
+        } catch {
+            state.withLock { $0.madeNestedMemo = nil }
+            memo.finish(.failure(error))
+            throw error
+        }
+    }
     func admit<T: Sendable>(_ work: () async throws -> T) async throws -> T {
         let done = HarnessPromise<Void>()
         state.withLock { $0.pending.append(done) }
@@ -52,13 +75,18 @@ internal func runTool(_ runtime: TaskRuntime, _ input: ToolTaskInput, _ call: To
             nestedCall: { name, arguments, options, callContext in
                 let key = options.key ?? admissions.nextKey()
                 if let explicit = options.key { try checkNestedKey(explicit) }
+                // Registered now, so cleanup waits for it.
                 let id = try await admissions.admit {
-                    try await startNestedCall(runtime, parentCallId: call.id, name: name, arguments: arguments, key: key,
-                                              progress: options.progress, abandonOnRestart: !resumes, context: callContext)
+                    // The memo first, once per attempt.
+                    try await admissions.madeNestedMemo {
+                        _ = try await runtime.memo(madeNestedCallsMemo, value: .bool(true), context: callContext)
+                    }
+                    return try await startNestedCall(runtime, parentCallId: call.id, name: name, arguments: arguments,
+                                                     key: key, progress: options.progress, abandonOnRestart: !resumes,
+                                                     context: callContext)
                 }
                 let settled = try await runtime.waitForTask(id, context: callContext)
-                let stored = try await runtime.snapshot(NestedResultDoc, taskId: runtime.taskId, key: String(id.rawValue),
-                                                        context: callContext)
+                let stored = try await runtime.snapshot(NestedCallDoc, taskId: runtime.taskId, key: key, context: callContext)
                 // A nested call the scheduler faulted or orphaned stored none.
                 return stored?.result ?? fallbackNestedResult(id, name: name, outcome: settled.outcome)
             },

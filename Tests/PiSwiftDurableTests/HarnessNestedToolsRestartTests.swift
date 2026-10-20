@@ -259,6 +259,77 @@ private func submissionStatus(_ opened: OpenChatResult, _ id: SubmissionID) asyn
         try await opened.harness.close(context: .background)
     }
 
+    @Test func clearsTheSlotsOfNestedCallsAnEarlierAttemptFinishedWhenTheRerunMakesNone() async throws {
+        let (path, directory) = try nestedSqlitePath()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let setup = HarnessChatSetup(), finished = HarnessChatSignal(), attempts = RunCount()
+        try installHarnessTool(try nestedTool("quick") { _, _, _ in .init(output: [.text(TextContent(text: "ok"))]) }, setup: setup)
+        try installHarnessTool(try nestedTool("caller", replay: .safe) { _, api, context in
+            if attempts.increment() == 1 {
+                _ = try await api.executeTool("quick", context: context)
+                finished.signal()
+                return try await nestedAborted(context)
+            }
+            return .init(output: [.text(TextContent(text: "done"))])
+        }, setup: setup)
+        setup.models.setResponses([.message(try nestedCall("caller")), .message(nestedDone)])
+        var opened = try await nestedOpenSqlite(path, setup)
+        let id = try await opened.root.submit(.input(content: .text("go")), context: .background).id
+        await finished.wait()
+        // The finished nested call's slot is still listed, below its running caller.
+        #expect(try await opened.harness.snapshot(LiveDoc, conversationId: opened.root.id, context: .background)?.nestedTools?.count == 1)
+        try await opened.harness.close(context: .background)
+
+        opened = try await nestedOpenSqlite(path, setup)
+        let slotsAfterCaller = Mutex<Int?>(nil)
+        let subscription = try opened.harness.subscribeCommits { publication, _ in
+            for case .task(let record) in publication.changes where record.kind == toolTask.name {
+                guard case .model? = try? nestedInput(record), record.state.status == "terminal" else { continue }
+                let live = publication.changes.lazy.compactMap { change -> DocumentCommitChange? in
+                    if case .document(let document) = change, document.record.kind == "pi.live" { return document }
+                    return nil
+                }.first
+                slotsAfterCaller.withLock { $0 = live?.value?["nestedTools"]?.arrayValue?.count ?? 0 }
+            }
+        }
+        defer { subscription.cancel() }
+        try opened.harness.resume()
+        #expect(try await submissionStatus(opened, id) == "done")
+        #expect(attempts.value == 2)
+        // The caller's terminal commit removed the slot, though the rerun made no nested call.
+        #expect(slotsAfterCaller.withLock { $0 } == 0)
+        try await opened.harness.close(context: .background)
+    }
+
+    @Test func abortsANestedCallAnEarlierAttemptOfAReplaySafeCallerLeftRunningAndTheRerunNeverMadeAgain() async throws {
+        let (path, directory) = try nestedSqlitePath()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let setup = HarnessChatSetup(), running = HarnessChatSignal(), attempts = RunCount()
+        try installHarnessTool(try nestedTool("slow", replay: .safe) { _, _, context in
+            running.signal()
+            return try await nestedAborted(context)
+        }, setup: setup)
+        try installHarnessTool(try nestedTool("caller", replay: .safe) { _, api, context in
+            // Only the first attempt calls `slow`; the rerun after the restart returns at once.
+            if attempts.increment() == 1 { _ = try await api.executeTool("slow", options: .init(key: "slow"), context: context) }
+            return .init(output: [.text(TextContent(text: "done"))])
+        }, setup: setup)
+        setup.models.setResponses([.message(try nestedCall("caller")), .message(nestedDone)])
+        var opened = try await nestedOpenSqlite(path, setup)
+        let id = try await opened.root.submit(.input(content: .text("go")), context: .background).id
+        await running.wait()
+        try await opened.harness.close(context: .background)
+
+        opened = try await nestedOpenSqlite(path, setup)
+        try opened.harness.resume()
+        #expect(try await submissionStatus(opened, id) == "done")
+        #expect(attempts.value == 2)
+        // The rerun's settlement found the leftover call among the tasks it owns and aborted it.
+        let leftover = try await nestedOnlyTasks(opened.harness).first
+        #expect(leftover?.state.status == "terminal" && nestedOutcome(leftover)?.status == "aborted")
+        try await opened.harness.close(context: .background)
+    }
+
     @Test(arguments: ["same", "swapped"])
     func reattachesAReplaySafeCallerByDefaultAndExplicitKeysAndRejectsARerunThatCallsDifferently(order: String) async throws {
         let (path, directory) = try nestedSqlitePath()
