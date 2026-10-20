@@ -57,7 +57,8 @@ extension TaskScheduler {
     }
 
     /// Recompute the wake off the Session line: arm the built-in timer, or tell `onWake` of a change. Upstream runs it in a
-    /// microtask; here one task delivers at a time, and a request made meanwhile runs one more round.
+    /// microtask; here one task delivers at a time, and a request made meanwhile runs one more round. A round that finds a
+    /// sleep come due since the last pass starts one (`passForLateSleeps()`).
     func scheduleWake() {
         let start = state.withLock { state -> Bool in
             guard !state.closing else { return false }
@@ -74,6 +75,7 @@ extension TaskScheduler {
             state.wakeDirty = false
             return true
         }) {
+            passForLateSleeps()
             let wake = wake()
             guard let onWake else {
                 armTimer(state.withLock { $0.enabled } ? wake.at : nil)
@@ -86,6 +88,27 @@ extension TaskScheduler {
                 state.withLock { $0.lastWake = wake }
             } catch { report(error, .hostError(callback: .onWake, task: nil)) }
         }
+    }
+
+    /// Start a pass for sleeps that came due after the last pass found them not yet due. Upstream computes the wake in a
+    /// microtask queued before the pass the same change starts, so a sleep due when the wake is computed is due at that
+    /// pass, which runs it. Here the wake runs in a task of its own, which can run after that pass, once the sleep has come
+    /// due: the wake then keeps no timer for it, and nothing would run it until some later change. Such a sleep is out of
+    /// the candidates, has no invocation, and is not parked; it becomes a candidate again and the pass runs it, so a sleep
+    /// that cannot run starts no second pass.
+    private func passForLateSleeps() {
+        let now = now(), limit = restartLimit()
+        let late = state.withLock { state -> Bool in
+            guard state.enabled, !state.closing else { return false }
+            let late = state.sleeping.contains { id in
+                guard !state.runnable.contains(id), state.invocations[id] == nil, let record = state.live[id],
+                      !record.abortRequested, !record.parked(limit), case .sleeping(_, let until, _) = record.state else { return false }
+                return until <= now
+            }
+            if late { state.wakeDue(now: now) }
+            return late
+        }
+        if late { kick() }
     }
 
     /// Keep the timer for the earliest sleep. Unlike the context expiry timer, it is a foreground timer: a process with a

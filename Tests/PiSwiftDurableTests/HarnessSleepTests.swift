@@ -205,6 +205,37 @@ private final class Flag: Sendable {
         try await harness.close(context: .background)
     }
 
+    // Fork (not upstream): the wake runs in a task of its own, which under load can run after the pass the last change
+    // started and after a sleep that pass found not yet due has come due. That wake keeps no timer for the due sleep, so the
+    // round must start a pass itself; upstream computes the wake before that pass. With and without `onWake`.
+    @Test(arguments: [false, true])
+    func runsASleepThatCameDueBeforeALateWakeWithoutAnotherChange(onWake: Bool) async throws {
+        let clock = TestClock(now: 1_000), timers = FakeTimers(), wakes = SessionTestLog<Wake>()
+        let nap = napTask(500)
+        let record: (@Sendable (Wake) throws -> Void)? = onWake ? { @Sendable in wakes.append($0) } : nil
+        let harness = try await openTasks(tasks: [AnyTaskDefinition(nap)], now: clock.nowFunction, onWake: record,
+                                          setTimer: timers.setTimer).harness
+        let id = try await startNap(harness, nap)
+        try harness.resume()
+        // The pass after the invocation ended found the sleep not yet due, and the wake after it kept the timer or told
+        // the host; nothing is underway.
+        try await eventually {
+            harness.tasks.state.withLock { !$0.runnable.contains(id) && $0.invocations[id] == nil && !$0.pumping && !$0.wakeScheduled }
+        }
+        if onWake {
+            try await eventually { wakes.values.last == Wake(active: false, at: 1_500) }
+        } else {
+            #expect(timers.live().map(\.delayMs) == [500])
+        }
+        // The deadline passes before a wake round runs, as when the task computing it runs late; the timer does not fire.
+        clock.advance(by: 500)
+        harness.tasks.scheduleWake()
+        // Polled: `waitForTask()` would call `resume()`, which wakes due sleeps itself.
+        try await eventually { try await stateOf(harness, id)?.status == "terminal" }
+        #expect(try await stateOf(harness, id)?.outcome == .completed(result: 1_500))
+        try await harness.close(context: .background)
+    }
+
     @Test func disarmsTheSleepTimerWhenTheSleepIsAbortedAndWhenTheHarnessCloses() async throws {
         let clock = TestClock(now: 1_000), timers = FakeTimers()
         let short = napTask(500)

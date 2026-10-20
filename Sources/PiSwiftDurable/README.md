@@ -657,7 +657,8 @@ until a compaction produces a summary. The event snapshot carries it as
   scheduler may call `setTimer` while they hold an internal lock, so a host's must return without calling
   back into the Harness or firing first. `HarnessOptions` has `now` and `setTimer` in place of the earlier
   Swift `clock`. A sleep's `until` is an `Int64` of milliseconds, so the only time `sleepUntil` can reject
-  is a negative one; its checkpoint is any `TaskCheckpoint`.
+  is a negative one; its checkpoint is any `TaskCheckpoint`. The wake is computed in a task rather than a
+  microtask, so it can run after a sleep came due that no pass has run; that round starts a pass, which runs it.
 - `InputEntry` holds only `kind` and `data`, so taking those two members of an input's entry is
   its decoding. A queued input's entry is `InboxItem.inputEntry`, stored as upstream's `entry`.
 - `ModelToolSelection` and `ModelToolChange` replace the `modelTools` union: `.exact`, or
