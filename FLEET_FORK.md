@@ -101,3 +101,6 @@
   其中一个报 `database is locked`（单独跑约 1/4 的概率，`f7e3cb543` 的并发前缀用例因此先建好文件）。已是 WAL 的文件并发打开、
   并发迁移都没问题（`BEGIN IMMEDIATE` 加 5 秒 busy timeout）。Bear Days 一个文件只开一个 storage，不受影响；先确认上游 Node adapter 是否一样。
 - `SessionSetterSettlementTests` 在线程池里用信号量堵线程，并行跑会把 10 核机器的线程池占满卡死；串行全过。可回提给原作者。
+- Session 在自己的状态锁里调宿主 `setTimer` 武装文档清理计时器（`f44707e7f` 起就在锁里排清理），宿主 `setTimer` 对后台计时器抛错时，
+  `onReport` 也在这把锁里被调；宿主若在 `onReport` 里同步调 `Harness.resume()` 之类要读 Session 状态的方法，会死锁。上游单线程没有这个问题。
+  改法是把武装挪到锁外（调度器的两个计时器已经是先占位、锁外武装、再认领）。默认计时器和 `TestClock` 都不抛错，Bear Days 不受影响。
