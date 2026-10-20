@@ -10,10 +10,10 @@
   每个上游提交对应这里的一个提交，说明以 `durable: port upstream <短 sha> <原标题>` 开头。
 - 范围沿用原作者的口径（`Sources/PiSwiftDurable/README.md`「Swift Differences and Scope」）：库、执行环境、内置工具；
   不含 CLI / TUI / Windows。只对 Node 或 Cloudflare 有意义的提交不跟，原因写在下表。
-- 每步之后跑 `swift test --filter 'PiSwiftDurableTests|PiSwiftChordTests|PiSwiftAgentTests' --skip SessionSetterSettlementTests`。
+- 每步之后跑 `swift test --filter 'PiSwiftDurableTests|PiSwiftChordTests|PiSwiftAgentTests|PiSwiftTelemetryTests' --skip SessionSetterSettlementTests`。
   `SessionSetterSettlementTests` 并行跑会把线程池堵满（测试在线程池里用信号量阻塞线程），串行单独跑；修好后去掉这个 skip。
 - 同一条命令再以 `PI_DURABLE_DOCUMENT_RETENTION_MS=0` 跑一遍，两遍都要过（对应上游 `npm test` 的第二遍，`f44707e7f` 起）：
-  `PI_DURABLE_DOCUMENT_RETENTION_MS=0 swift test --filter 'PiSwiftDurableTests|PiSwiftChordTests|PiSwiftAgentTests' --skip SessionSetterSettlementTests`。
+  `PI_DURABLE_DOCUMENT_RETENTION_MS=0 swift test --filter 'PiSwiftDurableTests|PiSwiftChordTests|PiSwiftAgentTests|PiSwiftTelemetryTests' --skip SessionSetterSettlementTests`。
   这个变量替换所有没有自己设 retention 的 Session 的默认值，每个没被观察的文档用完就从缓存里清掉。
 
 ## 上游 durable 提交台账（`v1.1.0..73f8de80b`）
@@ -84,7 +84,16 @@
 
 ## fork 自己的改动
 
-（还没有。不属于上游移植的改动记在这里，并说明能否回提给原作者。）
+不属于上游移植的改动记在这里，并说明能否回提给原作者（`xibbon/PiSwift`）。
+
+- `bcac0c6` durable: wake due sleeps that the wake pass found late。宿主没有 `onWake` 时，sleep 之后的 wake 由一个 Task 算
+  （上游是紧跟 commit 的 microtask，排在同一次变化启动的 pass 之前）；负载下这个 Task 可能晚于那次 pass、也晚于 sleep 到期才跑，
+  到期的睡眠不进 `at`，于是不 arm 计时器，要等以后某次变化的 pass 才跑；有 `onWake` 时同理，宿主收到 `active: true` 却没有 pass。
+  现在 wake 的每一轮先查「不在候选里、没有 invocation、没停放、已到期」的睡眠，有就 `wakeDue` 再 kick 一次 pass
+  （`TaskSchedulerWake.swift` 的 `passForLateSleeps()`）；跑不了的睡眠（比如缺定义）留在候选里，不会反复 kick。
+  测试 `HarnessSleepTests.runsASleepThatCameDueBeforeALateWakeWithoutAnotherChange(onWake:)`：等 pass 把睡眠移出候选、wake 送达，
+  推进测试时钟（宿主计时器不触发），直接 `scheduleWake()` 模拟晚到的那一轮；去掉 `passForLateSleeps()` 两个参数都失败（5 秒超时）。
+  README Swift Differences 的计时器那条加一句。不能回提：`xibbon/PiSwift` 停在 `v1.1.0`，没有 `f75b3240a` 的睡眠调度。
 
 待办（追平上游之后再看，先确认上游 TS 有没有同样的问题）：
 
@@ -111,10 +120,9 @@
   不是已知的「idle grace period」那条偶发，没有排查。这一批（`a30c2a81d`..`91b33cab3`）里它在一次第二遍全量跑中挂住整个测试进程：
   `sample` 看到只剩 `PiSwiftDurable.shell.exec` 队列的线程停在 `LocalShellEvents.wait` 的 `kevent` 里，其余测试都在等它。
   当时机器负载很高（load average 68，另有 xcodebuild 在跑），同一批里 `LocalExecutionConformanceTests` 的 polling watch 用例也偶发失败，单独跑都过。
-- 宿主没有 `onWake` 时，sleep 提交后的 wake 由一个 Task 算；负载下这个 Task 可能晚于 sleep 到期才跑，到期的睡眠不进 `at`，
-  于是不 arm 计时器，要等下一次 kick 的 pass 才跑（上游 microtask 紧跟 commit，没有这个窗口）。测试里只有「宿主谢绝前台计时器」那条
-  会因此失败，`5654374` 把它改到测试时钟上（fork 自己的测试改动，不涉及库代码）。对齐要么在 wake 发现到期的睡眠时 kick，要么让
-  计时器也覆盖已到期的睡眠；先确认生产里 sleep 提交之后总有一次晚于到期的 pass（invocation 结束时的 kick 通常就是）。
+- 上游可能有同类但更窄的窗口（读 `73f8de80b` 的 `scheduler.ts` 得到的印象，没在 Node 里跑过）：`#reconcile()` 结束时只调
+  `#scheduleWake()`，不跑 pass；reconcile 的 commit 期间睡眠到期的话，那次 wake 不把它算进 `at`，`#armTimer(undefined)` 撤掉计时器，
+  睡眠要等以后某次变化。Swift 的 `bcac0c6` 也覆盖这条路径（任何一轮 wake 都查）。可以给上游提 issue，先写一个 Node 复现。
 
 ## 上游 telemetry 移植（`packages/telemetry`）
 
@@ -134,7 +142,7 @@ PiSwift 原来没有 `@earendil-works/pi-telemetry` 的移植：原作者跳过�
 
 验证：`swift test --filter PiSwiftTelemetryTests`（13 个测试，4 个 suite，加一个全局参数化测试）通过；整包 `swift build` 通过；
 `xcodebuild -scheme PiSwiftTelemetry` 和 `-scheme PiSwiftTelemetryTesting`（`generic/platform=iOS Simulator`）都 BUILD SUCCEEDED。
-「约定」里的两条测试命令合并后要加上 `PiSwiftTelemetryTests`：这一节追加在文件末尾，是为了不和同时改上表的提交冲突，约定那段留给合并之后改。
+「约定」里的两条测试命令在合并之后加上了 `PiSwiftTelemetryTests`（这一节追加在文件末尾，是为了不和同时改上表的提交冲突）。
 
 后续（随 `48909d987` / `2ec55d808` 做，不在基线里）：
 
