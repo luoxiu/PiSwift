@@ -87,4 +87,6 @@
 
 - `MemoryStorage` 的状态索引删除是线性的；事务对每个 terminal 任务都重算一次 `createdTaskIDs()`。
   2 万个任务的深链要跑几分钟，会掩盖 `cb4375493` 的调度器优化（见那一行的偏差）。Bear Days 用 `SqliteStorage`，影响小。
+- `LocalExecutionShellTests`「ends after the idle grace period and does not call back after return」偶发失败（原作者的代码里就有，
+  移植前的基线跑里出现过）：全量并行跑时偶尔断言 `descendant-done` 文件不存在失败，单独跑稳定通过。和时间有关，Bear Days 不用 shell。
 - `SessionSetterSettlementTests` 在线程池里用信号量堵线程，并行跑会把 10 核机器的线程池占满卡死；串行全过。可回提给原作者。
