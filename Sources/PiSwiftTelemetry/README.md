@@ -7,7 +7,8 @@ PiSwiftTelemetry ports `@earendil-works/pi-telemetry`
 at upstream `482c1381a`, the parent of `48909d987`. Upstream's sources, tests, and README there are
 unchanged since `35f5c265d` (v0.84.0). Later upstream commits that `FLEET_FORK.md` lists as ported
 come on top: propagation, links, and metrics (`48909d987`), capabilities on every context
-(`2ec55d808`), and the telemetry store and trace renderer (`d9025a5f5`). It has no dependencies.
+(`2ec55d808`), and the telemetry store and trace renderer (`d9025a5f5`); upstream's `packages/telemetry`
+has no later change through `fdce48eb4` (2026-10-20). It has no dependencies.
 PiSwiftChord's SQLite recorder (upstream's `@earendil-works/chord/telemetry-sqlite`) builds on it. The
 package requires macOS 15 or iOS 18.
 
