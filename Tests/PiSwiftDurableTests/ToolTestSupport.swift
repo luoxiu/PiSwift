@@ -49,3 +49,20 @@ func toolTestDirectory() throws -> URL {
 func toolResultText(_ result: ToolExecutionResult) -> String {
     (result.output ?? []).compactMap { if case .text(let text) = $0 { text.text } else { nil } }.joined()
 }
+
+/// A tool result content block in a form tests can compare.
+enum ToolTestBlock: Equatable {
+    case text(String)
+    case image(data: String, mimeType: String)
+    case other
+}
+
+func toolResultBlocks(_ result: ToolExecutionResult) -> [ToolTestBlock] {
+    (result.output ?? []).map { block in
+        switch block {
+        case .text(let text): .text(text.text)
+        case .image(let image): .image(data: image.data, mimeType: image.mimeType)
+        default: .other
+        }
+    }
+}

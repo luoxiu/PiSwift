@@ -142,6 +142,17 @@ import PiSwiftDurableTesting
         #expect(try String(contentsOf: directory.appendingPathComponent("notes.txt"), encoding: .utf8) == "hello durable\n")
     }
 
+    #if canImport(ImageIO)
+    @Test func codingToolsWithImages() throws {
+        let registry = createRegistry()
+        // README: coding-tools-images
+        try registry.install(try createCodingTools(options: .init(images: createImageIOImages())))
+        // README: end
+        let read = try #require(registry.snapshot().tools().first { $0.tool.declaration.name == "read" })
+        #expect(read.tool.declaration.description.contains("(jpg, png, gif, webp, bmp)"))
+    }
+    #endif
+
     @Test func fileToolsOnly() async throws {
         let directory = try readmeLocalDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }

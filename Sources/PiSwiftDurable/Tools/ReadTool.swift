@@ -2,7 +2,7 @@ import Foundation
 import PiSwiftAI
 import PiSwiftChord
 
-/// Arguments for the text read tool. Line numbers start at one.
+/// Arguments for the read tool. Line numbers, which apply to text files, start at one.
 public struct ReadToolInput: Sendable, Codable {
     /// The file path, relative to the environment directory or absolute.
     public var path: String
@@ -34,34 +34,59 @@ public struct ReadToolError: Error, Sendable, CustomStringConvertible {
     public init(_ message: String) { self.message = message }
 }
 
-/// Creates a tool that reads text with bounded memory and reports continuation in diagnostics.
-public func createReadTool() throws -> ToolRegistration {
-    try defineTool(name: "read", description: "Read the contents of a text file. Output is truncated to \(defaultMaxLines) lines or \(defaultMaxBytes / 1024)KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.", parameters: [
+/// Options for the read tool.
+public struct ReadToolOptions: Sendable {
+    /// Resizes and converts images; without one, images within `defaultImageLimits.maxBytes` pass through as they are.
+    public var images: (any ImageProcessor)?
+    /// Creates read options with an optional image processor.
+    public init(images: (any ImageProcessor)? = nil) { self.images = images }
+}
+
+/// Reads text files and images. Remarks about truncation, continuation, and image processing are diagnostics; the
+/// content is only file text, or one image, which programs get as its `ImageContent`.
+public func createReadTool(options: ReadToolOptions = .init()) throws -> ToolRegistration {
+    let formats = options.images == nil ? "jpg, png, gif, webp" : "jpg, png, gif, webp, bmp"
+    return try defineTool(name: "read", description: "Read the contents of a file. Supports text files and images (\(formats)). Images are sent as attachments. For text files, output is truncated to \(defaultMaxLines) lines or \(defaultMaxBytes / 1024)KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.", parameters: [
         "type": "object", "properties": .object([
             "path": .object(["type": "string", "description": "Path to the file to read (relative or absolute)"]),
             "offset": .object(["type": "number", "description": "Line number to start reading from (1-indexed)"]),
             "limit": .object(["type": "number", "description": "Maximum number of lines to read"])
         ]), "required": .array(["path"])
-    ], args: ReadToolInput.self, execute: executeReadTool)
+    ], args: ReadToolInput.self) { args, api, context in
+        try await executeReadTool(args, api, context, options: options)
+    }
 }
 
-internal func executeReadTool(_ args: ReadToolInput, _ api: ToolExecutionApi,
-                              _ context: ChordContext) async throws -> ToolExecutionResult {
+internal func executeReadTool(_ args: ReadToolInput, _ api: ToolExecutionApi, _ context: ChordContext,
+                              options: ReadToolOptions = .init()) async throws -> ToolExecutionResult {
     let env = try requireEnv(api)
     let path = try await resolveReadToolPath(env: env, path: args.path, context: context)
     let reader = try await env.openBinaryReader(path, options: nil, context: context).get()
-    return try await executeReadReader(reader, args: args, context: context)
+    return try await executeReadReader(reader, args: args, api: api, options: options, context: context)
 }
 
-internal func executeReadReader(_ reader: any BinaryReader, args: ReadToolInput,
-                                context: ChordContext) async throws -> ToolExecutionResult {
+internal func executeReadReader(_ reader: any BinaryReader, args: ReadToolInput, api: ToolExecutionApi,
+                                options: ReadToolOptions = .init(), context: ChordContext) async throws -> ToolExecutionResult {
     do {
+        // A concurrent writer can change the file between the scan and the reads. Appending (a growing log) leaves
+        // the scanned text as it was; an image must be whole. Otherwise the file is read again once.
         var attempt = 0
         while true {
             let before = try await reader.info(context: context).get()
-            let result = try await readText(reader, info: before, args: args, context: context)
+            let mimeType = try await detectSupportedImageMimeTypeOf(.init(size: before.size, read: { position, length in
+                try await reader.read(offset: position, length: length, context: context).get()
+            }))
+            let result: ToolExecutionResult
+            if let mimeType {
+                result = try await readImage(reader, info: before, path: args.path, mimeType: mimeType,
+                                             processor: options.images, model: imageModel(api, context: context),
+                                             context: context)
+            } else {
+                result = try await readText(reader, args: args, context: context)
+            }
             let after = try await reader.info(context: context).get()
-            if after.size > before.size || (after.size == before.size && after.mtimeMs == before.mtimeMs) {
+            let unchanged = after.size == before.size && after.mtimeMs == before.mtimeMs
+            if unchanged || (mimeType == nil && after.size > before.size) {
                 await reader.close(context: context)
                 return result
             }
@@ -72,6 +97,85 @@ internal func executeReadReader(_ reader: any BinaryReader, args: ReadToolInput,
         await reader.close(context: context)
         throw error
     }
+}
+
+/// One image block, prepared by `processor` or, without one, as it is when its format is inline and it fits the limits
+/// (its size is checked before reading it, its dimensions from its header); otherwise an error result saying why. What
+/// happened to the image is an `info` diagnostic, so programs get the bare `ImageContent`. A model without image input
+/// sees PiSwiftAI's placeholder instead; a diagnostic says so.
+private func readImage(_ reader: any BinaryReader, info: FileInfo, path: String, mimeType: String,
+                       processor: (any ImageProcessor)?, model: ImageModel,
+                       context: ChordContext) async throws -> ToolExecutionResult {
+    let limits = model.limits
+    let image: (data: String, mimeType: String)
+    var notes: [String] = []
+    if let processor {
+        let bytes = try await reader.read(offset: 0, length: Int(info.size), context: context).get()
+        guard let prepared = await processor.prepare(bytes, mimeType: mimeType, limits: limits) else {
+            return imageError("\(path) is an image (\(mimeType)) that cannot be prepared for the model")
+        }
+        image = (prepared.data, prepared.mimeType)
+        if let convertedFrom = prepared.convertedFrom {
+            notes.append("Converted from \(convertedFrom) to \(prepared.mimeType).")
+        }
+        if let resized = prepared.resized {
+            let (from, to) = (resized.from, resized.to)
+            let scale = fixed2(Double(from.width) / Double(to.width))
+            notes.append("Resized from \(from.width)x\(from.height) to \(to.width)x\(to.height). Multiply coordinates by \(scale) to map them to the original.")
+        }
+    } else {
+        if !inlineImageTypes.contains(mimeType) {
+            return imageError("\(path) is an image (\(mimeType)) that needs converting, and no image processor is configured")
+        }
+        let unshrinkable = "and no image processor is configured to shrink it"
+        if base64Length(info.size) > Int64(limits.maxBytes) {
+            return imageError("\(path) is an image (\(mimeType)) of \(formatSize(Int(info.size))), too large to send, \(unshrinkable)")
+        }
+        let bytes = try await reader.read(offset: 0, length: Int(info.size), context: context).get()
+        guard let size = imageDimensions(bytes, mimeType: mimeType) else {
+            return imageError("\(path) is an image (\(mimeType)) whose size cannot be read")
+        }
+        if size.width > limits.maxWidth || size.height > limits.maxHeight {
+            return imageError("\(path) is an image (\(mimeType)) of \(size.width)x\(size.height), larger than \(limits.maxWidth)x\(limits.maxHeight), \(unshrinkable)")
+        }
+        image = (toBase64(bytes), mimeType)
+    }
+    if !model.vision { notes.append("The current model does not support images; it sees a placeholder instead.") }
+    let diagnostics = [ToolDiagnostic(severity: .info, message: (["Read image file [\(image.mimeType)]."] + notes).joined(separator: " "), code: "image")]
+    return .init(output: [.image(ImageContent(data: image.data, mimeType: image.mimeType))], diagnostics: diagnostics)
+}
+
+/// What the conversation's model takes: whether images, and within which limits.
+private struct ImageModel {
+    var vision: Bool
+    var limits: ImageLimits
+}
+
+/// The conversation model's image input: `defaultImageLimits` overridden by its `inputLimits.images.resize`. Without a
+/// resolvable model, it counts as one that takes images within the defaults.
+private func imageModel(_ api: ToolExecutionApi, context: ChordContext) async throws -> ImageModel {
+    let ref = try await api.agent(context).model
+    let model = ref.flatMap { api.models.getModel(provider: $0.provider, modelId: $0.modelId) }
+    let resize = model?.inputLimits?.images?.resize
+    return ImageModel(vision: model.map { $0.input.contains(.image) } ?? true, limits: ImageLimits(
+        maxWidth: resize?.maxWidth ?? defaultImageLimits.maxWidth,
+        maxHeight: resize?.maxHeight ?? defaultImageLimits.maxHeight,
+        maxBytes: resize?.maxBytes ?? defaultImageLimits.maxBytes))
+}
+
+private func imageError(_ message: String) -> ToolExecutionResult {
+    .init(output: [], isError: true, diagnostics: [.init(severity: .error, message: message, code: "unsupported_image")])
+}
+
+/// JavaScript's `value.toFixed(2)` for a positive ratio. `%.2f` rounds a value exactly halfway to even (2.125 gives
+/// 2.12); JavaScript rounds it up (2.13). Halfway at two decimals means the value is an odd number of eighths.
+private func fixed2(_ value: Double) -> String {
+    let eighths = value * 8
+    if eighths == eighths.rounded(), eighths < 1e15, Int64(eighths) % 2 == 1 {
+        let hundredths = (Int64(eighths) * 25 + 1) / 2
+        return "\(hundredths / 100)." + String(format: "%02lld", hundredths % 100)
+    }
+    return String(format: "%.2f", locale: Locale(identifier: "en_US_POSIX"), value)
 }
 
 private func sliceIndex(_ value: Double) -> Double { value.isNaN ? 0 : value.rounded(.towardZero) }
@@ -104,15 +208,10 @@ private func readHead(_ reader: any BinaryReader, start: Int64, end: Int64, skip
     return text + decoder.decode()
 }
 
-private func readText(_ reader: any BinaryReader, info: FileInfo, args: ReadToolInput,
+/// The read result for the opened file. It equals decoding the whole file, splitting it on newlines, and bounding the
+/// selected lines with `truncateHead`, while reading only one scan's worth of the file plus the head.
+private func readText(_ reader: any BinaryReader, args: ReadToolInput,
                       context: ChordContext) async throws -> ToolExecutionResult {
-    if let mime = try await detectSupportedImageMimeTypeOf(.init(size: info.size, read: { position, length in
-        try await reader.read(offset: position, length: length, context: context).get()
-    })) {
-        return .init(output: [], isError: true, diagnostics: [
-            .init(severity: .error, message: "\(args.path) is an image (\(mime)); reading images is not supported", code: "unsupported_image")
-        ])
-    }
     let offset = args.offset ?? 0
     let startLine = offset == 0 || offset.isNaN ? 0 : jsMax(0, offset - 1)
     let startDisplay = startLine + 1

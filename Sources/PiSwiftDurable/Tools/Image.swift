@@ -54,6 +54,47 @@ internal func detectSupportedImageMimeType(_ bytes: [UInt8]) -> String? {
     return nil
 }
 
+/// The width and height an image of `mimeType` declares in its header, without decoding it: PNG's IHDR, GIF's screen,
+/// WebP's VP8, VP8L, or VP8X chunk, JPEG's first SOF segment. Nil when the header cannot be read.
+internal func imageDimensions(_ bytes: [UInt8], mimeType: String) -> ImageSize? {
+    func size(_ width: Int64, _ height: Int64) -> ImageSize { ImageSize(width: Int(width), height: Int(height)) }
+    switch mimeType {
+    case "image/png":
+        return bytes.count < 24 ? nil : size(readUInt32BE(bytes, at: 16), readUInt32BE(bytes, at: 20))
+    case "image/gif":
+        return bytes.count < 10 ? nil : size(readUInt16LE(bytes, at: 6), readUInt16LE(bytes, at: 8))
+    case "image/webp":
+        if bytes.count < 30 { return nil }
+        if startsWithAscii(bytes, at: 12, "VP8 ") {
+            return size(readUInt16LE(bytes, at: 26) & 0x3fff, readUInt16LE(bytes, at: 28) & 0x3fff)
+        }
+        if startsWithAscii(bytes, at: 12, "VP8L") {
+            let bits = readUInt32LE(bytes, at: 21)
+            return size((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1)
+        }
+        if startsWithAscii(bytes, at: 12, "VP8X") {
+            func uint24(_ offset: Int) -> Int64 { readUInt16LE(bytes, at: offset) + (byte(bytes, offset + 2) << 16) }
+            return size(uint24(24) + 1, uint24(27) + 1)
+        }
+        return nil
+    case "image/jpeg":
+        var offset = 2
+        while offset + 9 <= bytes.count {
+            if bytes[offset] != 0xff { return nil }
+            let marker = bytes[offset + 1]
+            if marker == 0xff { offset += 1; continue }
+            // SOF0 to SOF15, except DHT (C4), JPG (C8), and DAC (CC), which share the range.
+            if marker >= 0xc0 && marker <= 0xcf && marker != 0xc4 && marker != 0xc8 && marker != 0xcc {
+                return size(readUInt16BE(bytes, at: offset + 7), readUInt16BE(bytes, at: offset + 5))
+            }
+            offset += 2 + Int(readUInt16BE(bytes, at: offset + 2))
+        }
+        return nil
+    default:
+        return nil
+    }
+}
+
 private func isPng(_ bytes: [UInt8]) -> Bool {
     bytes.count >= 16 && readUInt32BE(bytes, at: 8) == 13 && startsWithAscii(bytes, at: 12, "IHDR")
 }
@@ -75,6 +116,9 @@ private func isBmp(_ bytes: [UInt8]) -> Bool {
 private func byte(_ bytes: [UInt8], _ index: Int) -> Int64 { index < bytes.count ? Int64(bytes[index]) : 0 }
 private func readUInt16LE(_ bytes: [UInt8], at offset: Int) -> Int64 {
     byte(bytes, offset) + byte(bytes, offset + 1) * 256
+}
+private func readUInt16BE(_ bytes: [UInt8], at offset: Int) -> Int64 {
+    byte(bytes, offset) * 256 + byte(bytes, offset + 1)
 }
 private func readUInt32BE(_ bytes: [UInt8], at offset: Int) -> Int64 {
     byte(bytes, offset) * 0x1000000 + byte(bytes, offset + 1) * 0x10000 + byte(bytes, offset + 2) * 256 + byte(bytes, offset + 3)

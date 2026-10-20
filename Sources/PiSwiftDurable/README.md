@@ -238,7 +238,21 @@ try await harness.close(context: .background)
 ```
 
 `read` uses bounded memory and reports truncation and continuation diagnostics.
-Recognized images return `unsupported_image`. `write` keeps the supplied content.
+It returns an image file as one image block, which programs calling it get as an
+`ImageContent`. Limits are the model's `inputLimits.images.resize`, by default
+2000x2000 pixels and 4.5 MB of base64 (`defaultImageLimits`). Without an image
+processor it sends PNG, JPEG, GIF, and WebP files within them as they are, without
+decoding them, and refuses larger ones and other formats. With one, it decodes every
+image, turns it upright by its EXIF orientation, converts BMP to PNG, and shrinks it
+to fit. `createImageIOImages()` is that processor on ImageIO and Core Graphics:
+
+```swift
+try registry.install(try createCodingTools(options: .init(images: createImageIOImages())))
+```
+
+A model without image input sees a placeholder instead of the image, and `read` says
+so in a diagnostic. An image must be read whole: one that changes while it is read is
+read again. `write` keeps the supplied content.
 `edit` matches replacements against the original file. It rejects missing, duplicate,
 and overlapping targets. Details contain a display diff, a unified patch, and the first
 changed line. It preserves BOM and uniform CRLF. Upstream and Swift normalize mixed
@@ -257,7 +271,7 @@ try await root.configure(change: .init(tools: .set(.exact([
 ]))), context: .background)
 ```
 
-Factories and `CodingTools` throw because construction checks their schemas.
+Factories, `createCodingTools`, and `CodingTools` throw because construction checks their schemas.
 `BashToolOptions.prepare` returns a `BashExecution` value. It sets command, cwd,
 environment variables, and inheritance for that call. Mutations of one canonical path
 in one environment ID run in order. This queue does not lock out shell commands or other processes.
@@ -391,6 +405,11 @@ Harness's own bookkeeping, such as a scheduler commit, fails the Harness.
   code units and repair a cut surrogate pair. Default nested-call keys follow the order in
   which `executeTool` calls start running. Concurrent calls start in no fixed order, so a
   replay-safe caller that runs them concurrently passes explicit keys.
+- `createImageIOImages()` replaces upstream's Photon processor (`createPhotonImages`, with its
+  `/images/node` and `/images/cloudflare` loaders). It uses the system codecs, so it is part of
+  this library rather than a separate entry and exists where ImageIO does. JPEG qualities 80 to
+  40 map to ImageIO's 0.8 to 0.4, and Core Graphics' high-quality interpolation replaces Lanczos3,
+  so re-encoded bytes differ. Foundation encodes base64.
 - This library has no CLI or TUI code. PowerShell and Windows process support are outside scope.
 
 Upstream examples 00–31 have Swift integration tests with assertions for the library

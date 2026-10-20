@@ -63,45 +63,47 @@ import PiSwiftDurableTesting
     @Test("reads the selected lines from a growing log")
     func growingLog() async throws {
         let reader = ReadTestReader(bytes: Array("one\ntwo\n".utf8), mutation: .grow)
-        let result = try await executeReadReader(reader, args: .init(path: "app.log", limit: 2), context: context)
+        let result = try await executeReadReader(reader, args: .init(path: "app.log", limit: 2), api: toolTestApi(), context: context)
         #expect(toolResultText(result) == "one\ntwo")
         #expect(await reader.closed)
         #expect(await reader.scans == 1)
     }
-    @Test("reports a PNG image by its content")
+    @Test("returns images by content as one image block")
     func image() async throws {
-        let png = try #require(Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAX+XDSwAAAABJRU5ErkJggg=="))
+        let data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAX+XDSwAAAABJRU5ErkJggg=="
         let env = FakeExecutionEnv()
-        try await env.writeFile("image.txt", content: .bytes(Array(png)), context: context).get()
+        try await env.writeFile("image.txt", content: .bytes(Array(try #require(Data(base64Encoded: data)))), context: context).get()
+        // No model: `read` treats it as one that sees images.
         let result = try await createReadTool().execute(["path": "image.txt"], toolTestApi(env: env), context)
-        #expect(result.output?.isEmpty == true); #expect(result.isError == true)
-        #expect(result.diagnostics == [.init(severity: .error, message: "image.txt is an image (image/png); reading images is not supported", code: "unsupported_image")])
+        #expect(toolResultBlocks(result) == [.image(data: data, mimeType: "image/png")])
+        #expect(result.isError == nil)
+        #expect(result.diagnostics == [.init(severity: .info, message: "Read image file [image/png].", code: "image")])
     }
     @Test("reads a rewritten file again once and closes the reader")
     func rewrite() async throws {
         let reader = ReadTestReader(bytes: Array("old\ntext".utf8), mutation: .rewriteOnce)
-        let result = try await executeReadReader(reader, args: .init(path: "f.txt"), context: context)
+        let result = try await executeReadReader(reader, args: .init(path: "f.txt"), api: toolTestApi(), context: context)
         #expect(toolResultText(result) == "new\ntext")
         #expect(await reader.scans == 2); #expect(await reader.closed)
     }
     @Test("reads a file again after it becomes smaller")
     func shrink() async throws {
         let reader = ReadTestReader(bytes: Array("old\ntext".utf8), mutation: .shrinkOnce)
-        let result = try await executeReadReader(reader, args: .init(path: "f.txt"), context: context)
+        let result = try await executeReadReader(reader, args: .init(path: "f.txt"), api: toolTestApi(), context: context)
         #expect(toolResultText(result) == "new")
         #expect(await reader.scans == 2); #expect(await reader.closed)
     }
     @Test("fails after two changes and closes the reader")
     func repeatedRewrite() async throws {
         let reader = ReadTestReader(bytes: Array("old\ntext".utf8), mutation: .rewriteAlways)
-        do { _ = try await executeReadReader(reader, args: .init(path: "f.txt"), context: context); Issue.record("Expected changed-file error") }
+        do { _ = try await executeReadReader(reader, args: .init(path: "f.txt"), api: toolTestApi(), context: context); Issue.record("Expected changed-file error") }
         catch { #expect(String(describing: error) == "f.txt changed while it was read") }
         #expect(await reader.scans == 2); #expect(await reader.closed)
     }
     @Test("bounds each positional read and retained text for a large file")
     func boundedReads() async throws {
         let reader = ReadTestReader(bytes: Array(String(repeating: "x", count: 5 * 1024 * 1024).utf8))
-        let result = try await executeReadReader(reader, args: .init(path: "f.txt"), context: context)
+        let result = try await executeReadReader(reader, args: .init(path: "f.txt"), api: toolTestApi(), context: context)
         #expect(toolResultText(result).utf8.count == defaultMaxBytes)
         #expect(await reader.maximumRead <= 64 * 1024)
         #expect(await reader.positionalBytes <= 64 * 1024 + 35)

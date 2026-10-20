@@ -33,8 +33,12 @@ import PiSwiftChord
         do {
             let result = try await body()
             var object: JSONObject = ["content": .array((result.output ?? []).map { block in
-                if case .text(let text) = block { return .object(["type": "text", "text": .string(text.text)]) }
-                return .null
+                switch block {
+                case .text(let text): return .object(["type": "text", "text": .string(text.text)])
+                case .image(let image):
+                    return .object(["type": "image", "data": .string(image.data), "mimeType": .string(image.mimeType)])
+                default: return .null
+                }
             })]
             if let isError = result.isError { object["isError"] = .bool(isError) }
             if let details = result.details { object["details"] = details }
@@ -59,6 +63,9 @@ import PiSwiftChord
             let seed = try #require(file["seed"]?.numberValue)
             let base64 = try #require(file["base64"]?.stringValue)
             let bytes = try #require(Data(base64Encoded: base64))
+            // The fixture is from v1.1.0. Upstream's reference since returns an image block for an image, but no seed
+            // makes one, so its results are unchanged; the image tests cover images.
+            #expect(detectSupportedImageMimeType(Array(bytes)) == nil, "seed \(seed)")
             try bytes.write(to: directory.appendingPathComponent("f.txt"))
             let trials = try #require(file["trials"]?.arrayValue)
             #expect(trials.count == 4)
