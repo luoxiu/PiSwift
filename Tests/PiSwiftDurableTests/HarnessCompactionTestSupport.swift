@@ -60,13 +60,13 @@ struct CompactionChat: Sendable {
 func compactionOpen(policy: CompactionPolicy = compactionManualPolicy, contextWindow: Int = 100_000,
                     storage: any DurableStorage = MemoryStorage(), clock: any DurableClock = TestClock(now: 1000),
                     setup supplied: HarnessChatSetup? = nil, script suppliedScript: CompactionScript? = nil,
-                    resume: Bool = true) async throws -> CompactionChat {
+                    models: (any DurableModels)? = nil, resume: Bool = true) async throws -> CompactionChat {
     let setup = supplied ?? HarnessChatSetup(options: .init(models: [.init(id: "faux-1", contextWindow: contextWindow, maxTokens: 900)]), clock: clock)
     let script = suppliedScript ?? CompactionScript(setup: setup)
     if supplied == nil {
         try setup.registry.install(Extension(name: "compaction-preamble", sections: [section("preamble", tag: false) { _, _ in "You are helpful." }]))
     }
-    let opened = try await openChat(storage: storage, setup: setup)
+    let opened = try await openChat(storage: storage, setup: setup, models: models)
     setup.updateSettings { $0.stream = .init(cacheRetention: CacheRetention.none); $0.compaction = compactionOverrides(policy); $0.retry = .init(enabled: true, maxRetries: 2, baseDelayMs: 1) }
     if resume { try opened.harness.resume() }
     return CompactionChat(harness: opened.harness, root: opened.root, setup: setup, script: script)

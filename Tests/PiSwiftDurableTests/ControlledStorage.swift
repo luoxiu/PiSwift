@@ -41,6 +41,8 @@ actor ControlledStorage: DurableStorage {
     }
 
     private let storage = MemoryStorage()
+    /// Closed as the backend would be; `reopen()` opens it again over the same records.
+    private var closed = false
     private var nextGateID = 0
     private var commitGate: Held?
     private var findGate: Held?
@@ -66,6 +68,10 @@ actor ControlledStorage: DurableStorage {
 
     /// Clears the commit gate. Calls already held remain held until their gate is released.
     func crash() { commitGate = nil }
+    /// Reopen after `close()`, as a fresh process would reopen the same database, keeping every committed record.
+    /// Port of `test/session-support.ts` `reopen()`.
+    @discardableResult func reopen() -> ControlledStorage { closed = false; return self }
+    private func assertOpen() throws { if closed { throw DurableStorageError.closed(backend: "MemoryStorage") } }
     func failNextCommit(_ error: any Error) { commitFailure = error }
 
     private func releaseCommit(_ held: Held) async {
@@ -79,6 +85,7 @@ actor ControlledStorage: DurableStorage {
     }
 
     func commit(_ writes: [StorageWrite], context: ChordContext) async throws -> Seq {
+        try assertOpen()
         admittedCommits.append(writes)
         commits.append(writes)
         if let held = commitGate {
@@ -93,16 +100,19 @@ actor ControlledStorage: DurableStorage {
     }
 
     func mintId<Kind: DurableIDKind>() async throws -> DurableID<Kind> {
+        try assertOpen()
         mintCount += 1
         return try await storage.mintId()
     }
 
     func document(_ id: DocumentID, at: DocumentPoint, context: ChordContext) async throws -> StoredDocument? {
+        try assertOpen()
         documentReadCount += 1
         return try await storage.document(id, at: at, context: context)
     }
 
     func findDocument(_ address: DocumentAddress, at: DocumentPoint, context: ChordContext) async throws -> DocumentRecord? {
+        try assertOpen()
         if let held = findGate {
             await held.entered.resolve()
             await held.gate.wait()
@@ -111,40 +121,53 @@ actor ControlledStorage: DurableStorage {
     }
 
     func conversation(_ id: ConversationID, context: ChordContext) async throws -> ConversationRecord? {
-        try await storage.conversation(id, context: context)
+        try assertOpen()
+        return try await storage.conversation(id, context: context)
     }
     func scanConversations(_ query: ConversationQuery, limit: Int, cursor: Cursor?, context: ChordContext) async throws -> Page<ConversationRecord, Cursor> {
-        try await storage.scanConversations(query, limit: limit, cursor: cursor, context: context)
+        try assertOpen()
+        return try await storage.scanConversations(query, limit: limit, cursor: cursor, context: context)
     }
     func entry(_ id: EntryID, context: ChordContext) async throws -> EntryLookup? {
-        try await storage.entry(id, context: context)
+        try assertOpen()
+        return try await storage.entry(id, context: context)
     }
     func entry(_ conversationId: ConversationID, id: EntryID, context: ChordContext) async throws -> EntryLookup? {
-        try await storage.entry(conversationId, id: id, context: context)
+        try assertOpen()
+        return try await storage.entry(conversationId, id: id, context: context)
     }
     func findLatestHeadMarker(_ conversationId: ConversationID, atOrBeforeEntryId: EntryID?, context: ChordContext) async throws -> EntryRecord? {
-        try await storage.findLatestHeadMarker(conversationId, atOrBeforeEntryId: atOrBeforeEntryId, context: context)
+        try assertOpen()
+        return try await storage.findLatestHeadMarker(conversationId, atOrBeforeEntryId: atOrBeforeEntryId, context: context)
     }
     func scanEntries(_ query: EntryQuery, limit: Int, cursor: Cursor?, context: ChordContext) async throws -> Page<EntryRecord, Cursor> {
-        try await storage.scanEntries(query, limit: limit, cursor: cursor, context: context)
+        try assertOpen()
+        return try await storage.scanEntries(query, limit: limit, cursor: cursor, context: context)
     }
     func task(_ id: TaskID, context: ChordContext) async throws -> TaskRecord? {
-        try await storage.task(id, context: context)
+        try assertOpen()
+        return try await storage.task(id, context: context)
     }
     func scanTasks(_ query: TaskQuery, limit: Int, cursor: Cursor?, context: ChordContext) async throws -> Page<TaskRecord, Cursor> {
-        try await storage.scanTasks(query, limit: limit, cursor: cursor, context: context)
+        try assertOpen()
+        return try await storage.scanTasks(query, limit: limit, cursor: cursor, context: context)
     }
     func submission(_ id: SubmissionID, context: ChordContext) async throws -> SubmissionRecord? {
-        try await storage.submission(id, context: context)
+        try assertOpen()
+        return try await storage.submission(id, context: context)
     }
     func scanSubmissions(_ query: SubmissionQuery, limit: Int, cursor: Cursor?, context: ChordContext) async throws -> Page<SubmissionRecord, Cursor> {
-        try await storage.scanSubmissions(query, limit: limit, cursor: cursor, context: context)
+        try assertOpen()
+        return try await storage.scanSubmissions(query, limit: limit, cursor: cursor, context: context)
     }
     func submissionByRequest(_ conversationId: ConversationID, requestId: String, context: ChordContext) async throws -> SubmissionRecord? {
-        try await storage.submissionByRequest(conversationId, requestId: requestId, context: context)
+        try assertOpen()
+        return try await storage.submissionByRequest(conversationId, requestId: requestId, context: context)
     }
     func scanDocuments(_ query: DocumentQuery, limit: Int, cursor: Cursor?, context: ChordContext) async throws -> Page<DocumentRecord, Cursor> {
-        try await storage.scanDocuments(query, limit: limit, cursor: cursor, context: context)
+        try assertOpen()
+        return try await storage.scanDocuments(query, limit: limit, cursor: cursor, context: context)
     }
-    func close(context: ChordContext) async throws { try await storage.close(context: context) }
+    /// Closing twice is permitted, as by the memory backend.
+    func close(context: ChordContext) async throws { closed = true }
 }

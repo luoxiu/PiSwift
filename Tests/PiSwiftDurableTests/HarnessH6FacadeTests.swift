@@ -201,8 +201,9 @@ private func h6FacadeTree(_ harness: Harness, _ root: Conversation, _ owner: Har
         try await opened.harness.close(context: .background)
     }
 
-    // H5 deferred harness-structured.test.ts:1131. A nonfinite usage number replaces the non-JSON JS function.
-    @Test func faultedGenerationKeepsRunUntilOwnedWorkDrainsAndFinalCommitRetries() async throws {
+    // H5 deferred harness-structured.test.ts:1131 "keeps run control with a faulted generation until its owned work
+    // drains, and fails the Harness on a failed final commit". A nonfinite usage number replaces the non-JSON JS function.
+    @Test func faultedGenerationKeepsRunUntilOwnedWorkDrainsAndFailedFinalCommitFailsHarness() async throws {
         let abortGate = SessionTestGate(), abortReached = SessionTestGate(), clock = TestClock()
         let child = harnessOneStep("test.h6-hooked-child", run: { _, runtime, context in
             try await runtime.sleep(until: 1_000_000, context: context)
@@ -223,7 +224,7 @@ private func h6FacadeTree(_ harness: Harness, _ root: Conversation, _ owner: Har
             }
         ))], tasks: [AnyTaskDefinition(child)]))
         let manual = HarnessManualModels(base: setup.models)
-        let storage = HarnessSelectiveStorage()
+        let base = ControlledStorage(), storage = HarnessSelectiveStorage(base)
         let opened = try await openChat(storage: storage, setup: setup, models: manual)
         handle.withLock { $0 = opened.harness }
         let submission = try await opened.root.submit(.input(content: .text("hi")), context: .background)
@@ -243,15 +244,18 @@ private func h6FacadeTree(_ harness: Harness, _ root: Conversation, _ owner: Har
             }
         }
         abortGate.release()
-        try await eventually { setup.reports.values.contains { $0 is StorageRejected } }
-        #expect(try await opened.harness.snapshot(LiveDoc, conversationId: opened.root.id, context: .background)?.run?.taskId == generation)
-        #expect(try await allEntries(opened.root).map(\.kind) == ["pi.user"])
-        try await opened.root.commit({ tx in _ = try await tx.appendEntry(opened.root.id, value: EntryDraft(kind: "note")) }, context: .background)
-        let receipt = try await submission.wait(context: .background)
-        #expect(receipt.reason == "faulted")
-        #expect(try await opened.harness.snapshot(LiveDoc, conversationId: opened.root.id, context: .background) == LiveState())
-        #expect(try await allEntries(opened.root).map(\.kind) == ["pi.user", "note", "pi.assistant"])
+        // The final commit, with the run's cleanup, fails: nothing of the cleanup lands, and the Harness fails.
+        let failure = TestFailure("selected write rejected")
+        #expect(endedFailed(await opened.harness.closed, failure))
+        await expectSessionFailed(cause: failure) { _ = try await submission.wait(context: .background) }
         try await opened.harness.close(context: .background)
+        // Reopening finalizes the run; the partial becomes one aborted entry.
+        let reopened = try await openChat(storage: HarnessSelectiveStorage(await base.reopen()), setup: setup, models: manual)
+        let again = try #require(try await reopened.harness.submission(id: submission.id, context: .background))
+        #expect(try await again.wait(context: .background).reason == "faulted")
+        #expect(try await reopened.harness.snapshot(LiveDoc, conversationId: reopened.root.id, context: .background) == LiveState())
+        #expect(try await allEntries(reopened.root).map(\.kind) == ["pi.user", "pi.assistant"])
+        try await reopened.harness.close(context: .background)
     }
 
     // upstream harness-submissions.test.ts:149. The submission table read itself spans close.

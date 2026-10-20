@@ -5,10 +5,11 @@ import PiSwiftDurableTesting
 @testable import PiSwiftDurable
 
 @Suite struct HarnessTaskReconcileTests {
-    // upstream structured:1428; ownership:522,559
+    // upstream structured:1430 "fails the Harness on a failed finalization, which reopening applies"; ownership:559
+    // "fails the Harness on a failed cascade commit, and reopening applies the cascade"
     @Test(arguments: ["cascade", "finalization"])
-    func rejectedReconcileWriteRetriesOnNextCommit(mode: String) async throws {
-        let storage = HarnessSelectiveStorage()
+    func failedReconcileWriteFailsHarnessAndReopeningAppliesIt(mode: String) async throws {
+        let base = ControlledStorage(), storage = HarnessSelectiveStorage(base)
         let clock = TestClock()
         let definition = harnessHoldingTask(clock: clock)
         let opened = try await openTasks(storage: storage, tasks: [AnyTaskDefinition(definition)], clock: clock)
@@ -29,14 +30,16 @@ import PiSwiftDurableTesting
                 try tx.setTask(child.replacing(state: .terminal(outcome: .completed(result: .number(2)))))
             } else { try tx.setTask(parent.replacing(state: .completing(outcome: .failed(error: .init(message: "held failure"))))) }
         }, context: .background)
-        try await harnessEventually { opened.reports.count > 0 }
-        #expect(try await harness.getTask(id: tree.owner, context: .background)?.state.status == "completing")
-        if mode != "finalization" { #expect(try await harness.getTask(id: tree.child, context: .background)?.abortRequested == false) }
-        _ = try await root.commit({ tx in try await tx.appendEntry(root.id, value: EntryDraft(kind: "retry")) }, context: .background)
-        let receipt = try await harness.waitForTask(id: tree.owner, context: .background)
-        #expect(receipt.outcome.status == (mode == "finalization" ? "completed" : "failed"))
-        if mode != "finalization" { #expect(try await harness.waitForTask(id: tree.child, context: .background).outcome.status == "aborted") }
+        let failure = TestFailure("selected write rejected")
+        #expect(endedFailed(await harness.closed, failure))
+        #expect(opened.reports.values.count == 1 && opened.reports.values.first as? TestFailure == failure)
         try await harness.close(context: .background)
+        // Reopening derives the cascade or the finalization again.
+        let reopened = try await openTasks(storage: await base.reopen(), tasks: [AnyTaskDefinition(definition)], clock: clock)
+        let receipt = try await reopened.harness.waitForTask(id: tree.owner, context: .background)
+        #expect(receipt.outcome.status == (mode == "finalization" ? "completed" : "failed"))
+        if mode != "finalization" { #expect(try await reopened.harness.waitForTask(id: tree.child, context: .background).outcome.status == "aborted") }
+        try await reopened.harness.close(context: .background)
     }
 
     // upstream ownership:492
@@ -71,8 +74,9 @@ import PiSwiftDurableTesting
         #expect(try await harness.waitForTask(id: parent, context: .background).outcome.status == "aborted")
         try await harness.close(context: .background)
     }
-    // upstream ownership:522; loaded owner edges are restored from SQLite before the rejected mark.
-    @Test func reopenedOwnerEdgeMarkRetriesAfterStorageRejection() async throws {
+    // upstream ownership:521 "applies marks found through an edge loaded after reopen once a failed cascade commit is
+    // reopened"; loaded owner edges are restored from SQLite before the failed mark.
+    @Test func reopenedOwnerEdgeMarkAppliesAfterFailedCascadeIsReopened() async throws {
         let directory = try sqliteTestDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let path = directory.appendingPathComponent("edge-retry.sqlite").path
@@ -93,13 +97,14 @@ import PiSwiftDurableTesting
         let clock = TestClock()
         let definition = harnessHoldingTask(clock: clock)
         let opened = try await openTasks(storage: storage, tasks: [AnyTaskDefinition(definition)], clock: clock)
-        try await harnessEventually { opened.reports.count > 0 }
-        #expect(try await opened.harness.getTask(id: child, context: .background)?.abortRequested == false)
-        let root = try await opened.harness.root(context: .background)
-        _ = try await root.commit({ tx in try await tx.appendEntry(root.id, value: EntryDraft(kind: "retry")) }, context: .background)
-        #expect(try await opened.harness.waitForTask(id: child, context: .background).outcome.status == "aborted")
-        #expect(try await opened.harness.waitForTask(id: parent, context: .background).outcome.status == "failed")
+        // The failed cascade commit fails the Harness.
+        #expect(endedFailed(await opened.harness.closed, TestFailure("selected write rejected")))
         try await opened.harness.close(context: .background)
+        // Reopening derives the mark again.
+        let again = try await openTasks(storage: SqliteStorage.open(path: path), tasks: [AnyTaskDefinition(definition)], clock: clock)
+        #expect(try await again.harness.waitForTask(id: child, context: .background).outcome.status == "aborted")
+        #expect(try await again.harness.waitForTask(id: parent, context: .background).outcome.status == "failed")
+        try await again.harness.close(context: .background)
     }
 
 }

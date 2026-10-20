@@ -34,7 +34,7 @@ private final class ReadGate: Sendable {
         throw IsolationTestError.gateTimedOut
     }
 }
-private enum IsolationTestError: Error { case gateTimedOut, closeFailed }
+private enum IsolationTestError: Error { case gateTimedOut, closeFailed, injectedRejection }
 
 private final class GatedSqliteExecutor: SqliteExecutor {
     let delegate: AppleSqliteDatabase
@@ -57,7 +57,7 @@ private final class GatedSqliteExecutor: SqliteExecutor {
             if escapeNextTransaction {
                 escapeNextTransaction = false
                 try handle.exec("COMMIT")
-                throw StorageRejected("injected rejection after escaped commit")
+                throw IsolationTestError.injectedRejection
             }
             return value
         }
@@ -130,7 +130,7 @@ struct SqliteIsolationTests {
         try await storage.close(context: .background)
     }
 
-    @Test func injectedRollbackFailureIsNotStorageRejected() async throws {
+    @Test func injectedRollbackFailureIsARollbackError() async throws {
         let storage = try await SqliteStorage.open(executor: GatedSqliteExecutor(gate: ReadGate()))
         await storage.escapeNextCommit()
         await #expect(throws: SqliteRollbackError.self) { _ = try await storage.commit([], context: .background) }

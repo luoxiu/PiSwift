@@ -22,10 +22,11 @@ public typealias ConversationWatch = CommittedWatch<ConversationView>
 internal final class ConversationViewObserver: Sendable {
     let advance: (@Sendable (ConversationView, [Delta.Op], ChordContext) -> Void)?
     let publication: (@Sendable (ConversationView, ConversationView, [Delta.Op], CommitPublication, ChordContext) -> Void)?
-    let closeSession: @Sendable () -> Void
+    /// Ends the observer with the Session's failure, if it failed.
+    let closeSession: @Sendable ((any Error)?) -> Void
     init(advance: (@Sendable (ConversationView, [Delta.Op], ChordContext) -> Void)? = nil,
          publication: (@Sendable (ConversationView, ConversationView, [Delta.Op], CommitPublication, ChordContext) -> Void)? = nil,
-         closeSession: @escaping @Sendable () -> Void) {
+         closeSession: @escaping @Sendable ((any Error)?) -> Void) {
         self.advance = advance; self.publication = publication; self.closeSession = closeSession
     }
 }
@@ -59,8 +60,9 @@ internal final class ConversationViews: Sendable {
     }
     init(session: Session, storage: any DurableStorage) throws {
         self.session = session; self.storage = storage
-        let commits = try session.subscribeCommits { [weak self] publication, context in
-            self?.advance(publication, context: context)
+        // A mount whose derivation throws would fall behind storage, so the internal listener fails the Session.
+        let commits = try session.observeCommits { [weak self] publication, context in
+            try self?.advance(publication, context: context)
         }
         do {
             let close = try session.subscribeClose { [weak self] in self?.close() }
@@ -69,6 +71,9 @@ internal final class ConversationViews: Sendable {
     }
 
     deinit { for subscription in state.withLock({ $0.subscriptions }) { subscription.cancel() } }
+
+    /// Report an observer's listener error through the Harness.
+    func report(_ error: any Error) { session.hooks.report(error) }
 
     /// Hydrate and register atomically, so no committed revision can be missed.
     func attach(id: ConversationID, context: ChordContext,
@@ -86,24 +91,25 @@ internal final class ConversationViews: Sendable {
             do {
                 try context.abortSignal?.throwIfAborted()
                 try state.withLock { state in
-                    guard !state.closed else { throw closedError() }
+                    guard !state.closed else { throw closedError(session) }
                     mount.state.withLock { $0.observers[ObjectIdentifier(observer)] = observer }
                     state.mounts[id] = mount
                 }
                 return observer
-            } catch { observer.closeSession(); throw error }
+            } catch { observer.closeSession(nil); throw error }
         }
     }
     func watch(id: ConversationID, context: ChordContext) async throws -> CommittedWatch<ConversationView> {
         let result = Mutex<CommittedWatch<ConversationView>?>(nil)
         _ = try await attach(id: id, context: context) { value, release, _ in
             let tree = Mutex(try JSONValue(encoding: value))
-            let watch = CommittedWatch(value: value, replacement: { _ in tree.withLock { $0 } }, detach: release)
+            let watch = CommittedWatch(value: value, replacement: { _ in tree.withLock { $0 } }, detach: release,
+                                       report: { [weak self] in self?.report($0) })
             result.withLock { $0 = watch }
             return ConversationViewObserver(advance: { value, ops, context in
                 do { let next = try JSONValue(encoding: value); tree.withLock { $0 = next }; watch.advance(value: value, ops: ops, context: context) }
                 catch { watch.fail(error) }
-            }, closeSession: { watch.closeSession() })
+            }, closeSession: { watch.closeSession(failure: $0) })
         }
         let watch = result.withLock { $0! }
         do {
@@ -118,11 +124,11 @@ internal final class ConversationViews: Sendable {
             let source = CommittedStateSource(value: value, release: release)
             result.withLock { $0 = source }
             return ConversationViewObserver(advance: { value, ops, context in source.advance(value: value, ops: ops, context: context) },
-                closeSession: { source.closeSession() })
+                closeSession: { _ in source.closeSession() })
         }
         let source = result.withLock { $0! }
         do {
-            let attached = try replicatedState(source)
+            let attached = try replicatedState(source, onError: { [weak self] in self?.report($0) })
             do { try context.abortSignal?.throwIfAborted() }
             catch { attached.dispose(); throw error }
             return attached
@@ -162,69 +168,66 @@ internal final class ConversationViews: Sendable {
         let mounts = state.withLock { state -> [ConversationMount] in
             state.closed = true; let mounts = Array(state.mounts.values); state.mounts.removeAll(); return mounts
         }
+        let failure = session.failure
         for mount in mounts {
             let observers = mount.state.withLock { Array($0.observers.values) }
-            for observer in observers { observer.closeSession() }
+            for observer in observers { observer.closeSession(failure) }
         }
     }
-    private func advance(_ publication: CommitPublication, context: ChordContext) {
+    /// Derive each mount's operations from one publication, apply them, and hand the revision to every observer.
+    private func advance(_ publication: CommitPublication, context: ChordContext) throws {
         let mounts = state.withLock { Array($0.mounts) }
         for (id, mount) in mounts {
-            do {
-                let next = try mount.state.withLock { state -> (ConversationView, ConversationView, [Delta.Op], [ConversationViewObserver]) in
-                    let before = state.value
-                    var entries = before.entries
-                    var docOps: [Delta.Op] = []; var entryOps: [Delta.Op] = []
-                    for change in publication.changes {
-                        if case .entry(let entry) = change, entry.conversationId == id {
-                            let value = try JSONValue(encoding: entry)
-                            if let target = entry.head {
-                                let kept = entries.firstIndex { $0.head == nil && $0.id >= target } ?? entries.count
-                                entryOps.append(.splice(["entries"], index: 0, remove: kept, items: [value]))
-                                entries = [entry] + Array(entries[kept...])
-                            } else {
-                                entryOps.append(.splice(["entries"], index: entries.count, remove: 0, items: [value])); entries.append(entry)
-                            }
-                            continue
+            let next = try mount.state.withLock { state -> (ConversationView, ConversationView, [Delta.Op], [ConversationViewObserver]) in
+                let before = state.value
+                var entries = before.entries
+                var docOps: [Delta.Op] = []; var entryOps: [Delta.Op] = []
+                for change in publication.changes {
+                    if case .entry(let entry) = change, entry.conversationId == id {
+                        let value = try JSONValue(encoding: entry)
+                        if let target = entry.head {
+                            let kept = entries.firstIndex { $0.head == nil && $0.id >= target } ?? entries.count
+                            entryOps.append(.splice(["entries"], index: 0, remove: kept, items: [value]))
+                            entries = [entry] + Array(entries[kept...])
+                        } else {
+                            entryOps.append(.splice(["entries"], index: entries.count, remove: 0, items: [value])); entries.append(entry)
                         }
-                        guard case .document(let change) = change, change.source == nil,
-                              change.conversationId == id, change.record.key == nil,
-                              Self.mounted.contains(where: { $0.kind == change.record.kind }) else { continue }
-                        let kind = change.record.kind; let path: Delta.Path = ["docs", .key(kind)]
-                        let mounted = state.docs[kind]
-                        if let value = change.value {
-                            if mounted?.id == change.record.id, mounted?.version == change.version {
-                                docOps += change.ops.map { prefixedViewOp($0, prefix: path) }
-                            } else {
-                                state.docs[kind] = .init(id: change.record.id, version: change.version!)
-                                docOps.append(.set(path, .object(value)))
-                            }
-                        } else if mounted?.id == change.record.id {
-                            state.docs.removeValue(forKey: kind); docOps.append(.delete(path))
-                        }
+                        continue
                     }
-                    let ops = docOps + entryOps
-                    if !ops.isEmpty {
-                        state.tree = try Delta.applyImmutable(state.tree, ops)!
-                        var docs = before.docs
-                        if !docOps.isEmpty {
-                            let mountedDocs = state.tree.objectValue!["docs"]!.objectValue!
-                            for definition in Self.mounted {
-                                let value = mountedDocs[definition.kind]?.objectValue
-                                if docs[definition.kind] != value { docs[definition.kind] = value }
-                            }
+                    guard case .document(let change) = change, change.source == nil,
+                          change.conversationId == id, change.record.key == nil,
+                          Self.mounted.contains(where: { $0.kind == change.record.kind }) else { continue }
+                    let kind = change.record.kind; let path: Delta.Path = ["docs", .key(kind)]
+                    let mounted = state.docs[kind]
+                    if let value = change.value {
+                        if mounted?.id == change.record.id, mounted?.version == change.version {
+                            docOps += change.ops.map { prefixedViewOp($0, prefix: path) }
+                        } else {
+                            state.docs[kind] = .init(id: change.record.id, version: change.version!)
+                            docOps.append(.set(path, .object(value)))
                         }
-                        state.value = .init(conversation: before.conversation, entries: entries, docs: docs)
+                    } else if mounted?.id == change.record.id {
+                        state.docs.removeValue(forKey: kind); docOps.append(.delete(path))
                     }
-                    return (before, state.value, ops, Array(state.observers.values))
                 }
-                let frameContext = context.withoutAbortSignal()
-                if !next.2.isEmpty { for observer in next.3 { observer.advance?(next.1, next.2, frameContext) } }
-                for observer in next.3 { observer.publication?(next.0, next.1, next.2, publication, frameContext) }
-            } catch {
-                let observers = mount.state.withLock { Array($0.observers.values) }
-                for observer in observers { observer.closeSession() }
+                let ops = docOps + entryOps
+                if !ops.isEmpty {
+                    state.tree = try Delta.applyImmutable(state.tree, ops)!
+                    var docs = before.docs
+                    if !docOps.isEmpty {
+                        let mountedDocs = state.tree.objectValue!["docs"]!.objectValue!
+                        for definition in Self.mounted {
+                            let value = mountedDocs[definition.kind]?.objectValue
+                            if docs[definition.kind] != value { docs[definition.kind] = value }
+                        }
+                    }
+                    state.value = .init(conversation: before.conversation, entries: entries, docs: docs)
+                }
+                return (before, state.value, ops, Array(state.observers.values))
             }
+            let frameContext = context.withoutAbortSignal()
+            if !next.2.isEmpty { for observer in next.3 { observer.advance?(next.1, next.2, frameContext) } }
+            for observer in next.3 { observer.publication?(next.0, next.1, next.2, publication, frameContext) }
         }
     }
 }

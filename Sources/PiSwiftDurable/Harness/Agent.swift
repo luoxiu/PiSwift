@@ -60,8 +60,11 @@ public struct AgentState: Sendable, Equatable, Codable {
     public var thinkingLevel: ModelThinkingLevel?
     /// The selected extensions or extension-selection change.
     public var extensions: ExtensionSelection?
-    /// The tool registrations or live tool slots in this value.
+    /// Filters the selected extensions' tools: the enabled tools. An exact list enables exactly these, in order.
     public var tools: ToolSelection?
+    /// Filters the enabled tools the model may call (`callers` includes `model`): the tools offered to it. An exact list
+    /// offers exactly these, in order. Never widens: other tools can still call the ones it leaves out.
+    public var modelTools: ToolSelection?
     /// Additional agent or compaction instructions.
     public var instructions: String?
     /// The working directory used by this conversation or command.
@@ -69,9 +72,9 @@ public struct AgentState: Sendable, Equatable, Codable {
     /// Creates stored agent overrides. Absent fields use host defaults.
     public init(model: ModelRef? = nil, thinkingLevel: ModelThinkingLevel? = nil,
                 extensions: ExtensionSelection? = nil, tools: ToolSelection? = nil,
-                instructions: String? = nil, cwd: String? = nil) {
+                modelTools: ToolSelection? = nil, instructions: String? = nil, cwd: String? = nil) {
         self.model = model; self.thinkingLevel = thinkingLevel; self.extensions = extensions
-        self.tools = tools; self.instructions = instructions; self.cwd = cwd
+        self.tools = tools; self.modelTools = modelTools; self.instructions = instructions; self.cwd = cwd
     }
 }
 
@@ -91,6 +94,7 @@ public func configure(tx: Transaction, conversationId: ConversationID, change: A
     try applyAgentField(draft, key: "thinkingLevel", change: change.thinkingLevel, value: value)
     try applyAgentField(draft, key: "extensions", change: change.extensions, value: value)
     try applyAgentField(draft, key: "tools", change: change.tools, value: value)
+    try applyAgentField(draft, key: "modelTools", change: change.modelTools, value: value)
     try applyAgentField(draft, key: "instructions", change: change.instructions, value: value)
     try applyAgentField(draft, key: "cwd", change: change.cwd, value: value)
 }
@@ -133,7 +137,7 @@ public enum ExtensionChange: Sendable {
     /// Adds and removes names relative to the host defaults.
     case edit(add: [Extension]? = nil, remove: [Extension]? = nil)
 }
-/// Replace the offered tool list or remove tools from the selected extensions.
+/// Replace the enabled or offered tool list, or remove tools from it.
 public enum ToolChange: Sendable {
     /// Replaces the selection with precisely these names or definitions.
     case exact([ToolRegistration])
@@ -148,8 +152,10 @@ public struct AgentChange: Sendable {
     public var thinkingLevel: AgentFieldChange<ModelThinkingLevel>
     /// Whether to keep, clear, replace, or edit the saved extension selection.
     public var extensions: AgentFieldChange<ExtensionChange>
-    /// Whether to keep, clear, or replace the saved tool offer policy.
+    /// Whether to keep, clear, or replace the saved filter of enabled tools.
     public var tools: AgentFieldChange<ToolChange>
+    /// Whether to keep, clear, or replace the saved filter of the enabled tools the model is offered.
+    public var modelTools: AgentFieldChange<ToolChange>
     /// Whether to keep, clear, or replace the saved agent instructions.
     public var instructions: AgentFieldChange<String>
     /// Whether to keep, clear, or replace the saved working directory.
@@ -157,9 +163,10 @@ public struct AgentChange: Sendable {
     /// Selects the fields to keep, clear, or replace in stored agent configuration.
     public init(model: AgentFieldChange<ModelRef> = .unchanged, thinkingLevel: AgentFieldChange<ModelThinkingLevel> = .unchanged,
                 extensions: AgentFieldChange<ExtensionChange> = .unchanged, tools: AgentFieldChange<ToolChange> = .unchanged,
+                modelTools: AgentFieldChange<ToolChange> = .unchanged,
                 instructions: AgentFieldChange<String> = .unchanged, cwd: AgentFieldChange<String> = .unchanged) {
         self.model = model; self.thinkingLevel = thinkingLevel; self.extensions = extensions
-        self.tools = tools; self.instructions = instructions; self.cwd = cwd
+        self.tools = tools; self.modelTools = modelTools; self.instructions = instructions; self.cwd = cwd
     }
 }
 
@@ -172,27 +179,36 @@ public func applyAgentChange(_ state: inout AgentState, _ change: AgentChange) {
     case .set(.exact(let items)): state.extensions = .exact(items.map(\.name))
     case .set(.edit(let add, let remove)): state.extensions = .edit(add: add?.map(\.name), remove: remove?.map(\.name))
     }
-    switch change.tools {
-    case .unchanged: break
-    case .clear: state.tools = nil
-    case .set(.exact(let items)): state.tools = .exact(items.map(\.name))
-    case .set(.remove(let items)): state.tools = .remove(items.map(\.name))
-    }
+    applyToolChange(&state.tools, change.tools)
+    applyToolChange(&state.modelTools, change.modelTools)
     apply(&state.instructions, change.instructions); apply(&state.cwd, change.cwd)
+}
+private func applyToolChange(_ value: inout ToolSelection?, _ change: AgentFieldChange<ToolChange>) {
+    switch change {
+    case .unchanged: break
+    case .clear: value = nil
+    case .set(.exact(let items)): value = .exact(items.map(\.name))
+    case .set(.remove(let items)): value = .remove(items.map(\.name))
+    }
 }
 private func apply<Value>(_ value: inout Value?, _ change: AgentFieldChange<Value>) {
     switch change { case .unchanged: break; case .clear: value = nil; case .set(let next): value = next }
 }
-/// Adds tool names to the stored offer policy without duplicate names.
+/// `addTools` of a tool round, applied to `tools` and `modelTools`, so the next request offers the tools: an exact list
+/// gets each name it lacks appended, `remove` loses the names, and an unset filter already lets every tool through.
 public func addAgentTools(_ state: inout AgentState, _ added: [String]) {
-    switch state.tools {
+    addToolNames(&state.tools, added)
+    addToolNames(&state.modelTools, added)
+}
+private func addToolNames(_ filter: inout ToolSelection?, _ added: [String]) {
+    switch filter {
     case nil: break
     case .exact(var names):
         for name in added where !names.contains(where: { harnessNamesEqual($0, name) }) { names.append(name) }
-        state.tools = .exact(names)
+        filter = .exact(names)
     case .remove(let names):
         let removed = names.filter { name in !added.contains { harnessNamesEqual($0, name) } }
-        if removed.count != names.count { state.tools = .remove(removed) }
+        if removed.count != names.count { filter = .remove(removed) }
     }
 }
 
@@ -240,14 +256,22 @@ public func resolveAgent(state: AgentState? = nil, snapshot: RegistrySnapshot, s
             }
         }
     }
-    switch state?.tools {
-    case nil: break
-    case .exact(let names): tools = uniqueHarnessNames(names).compactMap { name in tools.first { harnessNamesEqual($0.name, name) } }
-    case .remove(let names): tools = tools.filter { tool in !names.contains { harnessNamesEqual($0, tool.name) } }
-    }
+    let enabled = filterTools(tools, state?.tools)
+    let callableBy = { (caller: ToolCaller) in { (tool: ToolRegistration) in tool.callers?.contains(caller) ?? true } }
+    let offered = filterTools(enabled.filter(callableBy(.model)), state?.modelTools)
+    let callable = enabled.filter(callableBy(.tools))
     if let instructions = state?.instructions { sections.append(section(instructionsKey) { _, _ in instructions }) }
     return Agent(model: state?.model, thinkingLevel: state?.thinkingLevel ?? .off, extensions: extensions,
-                 tools: tools, sections: sections, instructions: state?.instructions, cwd: state?.cwd)
+                 tools: offered, callable: callable, sections: sections, instructions: state?.instructions, cwd: state?.cwd)
+}
+
+/// `tools` through a stored filter: an exact list selects exactly its names, in its order; `remove` drops names.
+private func filterTools(_ tools: [ToolRegistration], _ filter: ToolSelection?) -> [ToolRegistration] {
+    switch filter {
+    case nil: tools
+    case .exact(let names): uniqueHarnessNames(names).compactMap { name in tools.first { harnessNamesEqual($0.name, name) } }
+    case .remove(let names): tools.filter { tool in !names.contains { harnessNamesEqual($0, tool.name) } }
+    }
 }
 
 private func applyWrap<Value>(_ values: inout [Value], name: String, nameOf: (Value) -> String,

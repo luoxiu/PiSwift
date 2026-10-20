@@ -2,7 +2,7 @@ import Synchronization
 import PiSwiftChord
 import PiSwiftDurable
 
-/// Reject one selected write batch before it reaches storage.
+/// Fail one selected write batch before it reaches storage.
 final class HarnessSelectiveStorage: DurableStorage, Sendable {
     let base: any DurableStorage
     private let rejection = Mutex<(@Sendable ([StorageWrite]) -> Bool)?>(nil)
@@ -13,7 +13,7 @@ final class HarnessSelectiveStorage: DurableStorage, Sendable {
             guard let check = predicate, check(writes) else { return false }
             predicate = nil; return true
         }
-        if reject { throw StorageRejected("selected write rejected") }
+        if reject { throw TestFailure("selected write rejected") }
         return try await base.commit(writes, context: context)
     }
     func mintId<Kind: DurableIDKind>() async throws -> DurableID<Kind> {

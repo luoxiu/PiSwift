@@ -196,17 +196,17 @@ public func scanStart(requested: ScanOrder?, cursor: Cursor?, fallback: ScanOrde
     guard let cursor else { return ScanStart(order: requested ?? fallback, after: nil) }
     guard let value = cursor["after"]?.numberValue, value.isFinite,
           let after = Int64(exactly: value), after >= -Seq.maximumRawValue, after <= Seq.maximumRawValue else {
-        throw DurableStorageError.invalidCursor
+        throw StorageRequestError(DurableStorageError.invalidCursor)
     }
     let order: ScanOrder
     if let stored = cursor["order"] {
         guard let text = stored.stringValue, let parsed = ScanOrder(rawValue: text) else {
-            throw DurableStorageError.invalidCursor
+            throw StorageRequestError(DurableStorageError.invalidCursor)
         }
         order = parsed
     } else { order = fallback }
     if let requested, requested != order {
-        throw DurableStorageError.cursorOrderMismatch(stored: order, requested: requested)
+        throw StorageRequestError(DurableStorageError.cursorOrderMismatch(stored: order, requested: requested))
     }
     return ScanStart(order: order, after: after)
 }

@@ -29,6 +29,8 @@ public struct DurableAgentSnapshot: Sendable, Equatable, Codable {
     public var generation: LiveGeneration?
     /// The visible tool-call slots and their current progress.
     public var tools: [ToolSlot]
+    /// `pi.live.nestedTools`: nested calls of running tool calls.
+    public var nestedTools: [NestedToolSlot]
     /// The active compaction tasks and their progress.
     public var compactions: [CompactionStatus]
     /// The queued conversation submissions.
@@ -41,16 +43,19 @@ public struct DurableAgentSnapshot: Sendable, Equatable, Codable {
     public var type: String { "snapshot" }
     /// Creates a detached snapshot of entries, live progress, queues, and usage.
     public init(entries: [EntryRecord] = [], run: DurableSnapshotRun? = nil, generation: LiveGeneration? = nil,
-                tools: [ToolSlot] = [], compactions: [CompactionStatus] = [], inbox: [DurableQueuedItem] = [],
-                agent: AgentState = .init(), usage: JSONObject = ["models": [:], "tools": [:]]) {
+                tools: [ToolSlot] = [], nestedTools: [NestedToolSlot] = [], compactions: [CompactionStatus] = [],
+                inbox: [DurableQueuedItem] = [], agent: AgentState = .init(),
+                usage: JSONObject = ["models": [:], "tools": [:]]) {
         self.entries = entries; self.run = run; self.generation = generation; self.tools = tools
-        self.compactions = compactions; self.inbox = inbox; self.agent = agent; self.usage = usage
+        self.nestedTools = nestedTools; self.compactions = compactions; self.inbox = inbox; self.agent = agent
+        self.usage = usage
     }
     /// Decodes this value from its durable JSON representation.
     public init(from decoder: any Decoder) throws {
         let o = try recordObject(decoder)
         entries = try recordRequired(o, "entries"); run = try recordOptional(o, "run")
         generation = try recordOptional(o, "generation"); tools = try recordRequired(o, "tools")
+        nestedTools = try recordOptional(o, "nestedTools") ?? []
         compactions = try recordRequired(o, "compactions"); inbox = try recordRequired(o, "inbox")
         agent = try recordRequired(o, "agent"); usage = try recordRequired(o, "usage")
     }
@@ -59,6 +64,7 @@ public struct DurableAgentSnapshot: Sendable, Equatable, Codable {
         var o: JSONObject = ["type": .string(type)]
         try recordSet(&o, "entries", entries); try recordSetOptional(&o, "run", run)
         try recordSetOptional(&o, "generation", generation); try recordSet(&o, "tools", tools)
+        try recordSet(&o, "nestedTools", nestedTools)
         try recordSet(&o, "compactions", compactions); try recordSet(&o, "inbox", inbox)
         try recordSet(&o, "agent", agent); try recordSet(&o, "usage", usage)
         try o.encode(to: encoder)
@@ -160,6 +166,40 @@ public enum DurableToolOutputChange: Sendable, Equatable, Codable {
     }
 }
 
+/// Which call a tool event is about. `toolCallId` is the call's ID in the transcript and in tool events: the provider's
+/// ID for a model-issued call, `<parent call ID>/<key>` for a nested one. Match events by it; do not parse it. `taskId`
+/// is the call's tool task, absent for a call that never got one (not offered, or not started in a sequential round).
+/// A nested call also names the call that made it, by call ID and by tool task.
+public struct DurableToolEventCall: Sendable, Equatable {
+    /// The call's ID.
+    public var toolCallId: String
+    /// The called tool's name.
+    public var toolName: String
+    /// The call's tool task.
+    public var taskId: TaskID?
+    /// A nested call's caller, by call ID.
+    public var parentToolCallId: String?
+    /// A nested call's caller, by tool task.
+    public var parentTaskId: TaskID?
+    /// Names a call and, for a nested one, its caller.
+    public init(toolCallId: String, toolName: String, taskId: TaskID? = nil, parentToolCallId: String? = nil,
+                parentTaskId: TaskID? = nil) {
+        self.toolCallId = toolCallId; self.toolName = toolName; self.taskId = taskId
+        self.parentToolCallId = parentToolCallId; self.parentTaskId = parentTaskId
+    }
+    fileprivate init(_ object: JSONObject) throws {
+        toolCallId = try recordRequired(object, "toolCallId"); toolName = try recordRequired(object, "toolName")
+        taskId = try recordOptional(object, "taskId"); parentToolCallId = try recordOptional(object, "parentToolCallId")
+        parentTaskId = try recordOptional(object, "parentTaskId")
+    }
+    fileprivate func set(_ object: inout JSONObject) throws {
+        object["toolCallId"] = .string(toolCallId); object["toolName"] = .string(toolName)
+        try recordSetOptional(&object, "taskId", taskId)
+        try recordSetOptional(&object, "parentToolCallId", parentToolCallId)
+        try recordSetOptional(&object, "parentTaskId", parentTaskId)
+    }
+}
+
 /// Experimental events from committed durable records. JSON uses the upstream type names.
 public enum DurableAgentEvent: Sendable, Equatable, Codable {
     /// Publishes a complete conversation snapshot after queued events overflow.
@@ -178,13 +218,15 @@ public enum DurableAgentEvent: Sendable, Equatable, Codable {
     case messageUpdate(usage: JSONObject, changes: [DurableMessageChange])
     /// Reports the committed entry of a completed assistant message.
     case messageEnd(entry: EntryRecord)
-    /// Reports the start of a tool call with its name and prepared arguments.
-    case toolExecutionStart(toolCallId: String, toolName: String, args: JSONObject)
+    /// Reports the start of a tool call with the arguments it runs with.
+    case toolExecutionStart(call: DurableToolEventCall, args: JSONObject)
     /// Reports visible output, details, or diagnostics from a tool call.
-    case toolExecutionUpdate(toolCallId: String, toolName: String, output: DurableToolOutputChange? = nil,
+    case toolExecutionUpdate(call: DurableToolEventCall, output: DurableToolOutputChange? = nil,
                              details: JSONValue? = nil, diagnostics: [ToolDiagnostic]? = nil)
-    /// Reports the end of a tool call and its result entry when present.
-    case toolExecutionEnd(toolCallId: String, toolName: String, entry: EntryRecord? = nil)
+    /// A model-issued call ends with its result `entry`, a nested call with its `result`. Both are absent when the tool
+    /// task faulted or was orphaned, or when the call's slot left `pi.live` unfinished: its run ended, or its parent
+    /// settled first.
+    case toolExecutionEnd(call: DurableToolEventCall, entry: EntryRecord? = nil, result: NestedToolExecutionResult? = nil)
     /// Reports the current queued submission IDs and admission modes.
     case inboxUpdate(items: [DurableQueuedItem])
     /// Reports the new durable state of a submission.
@@ -247,11 +289,13 @@ public enum DurableAgentEvent: Sendable, Equatable, Codable {
         case "message_start": self = .messageStart(message: try recordRequired(o, "message"))
         case "message_update": self = .messageUpdate(usage: try recordRequired(o, "usage"), changes: try recordRequired(o, "changes"))
         case "message_end": self = .messageEnd(entry: try recordRequired(o, "entry"))
-        case "tool_execution_start": self = .toolExecutionStart(toolCallId: try recordRequired(o, "toolCallId"), toolName: try recordRequired(o, "toolName"), args: try recordRequired(o, "args"))
+        case "tool_execution_start": self = .toolExecutionStart(call: try DurableToolEventCall(o), args: try recordRequired(o, "args"))
         case "tool_execution_update":
-            self = .toolExecutionUpdate(toolCallId: try recordRequired(o, "toolCallId"), toolName: try recordRequired(o, "toolName"),
+            self = .toolExecutionUpdate(call: try DurableToolEventCall(o),
                 output: try recordOptional(o, "output"), details: o["details"], diagnostics: try recordOptional(o, "diagnostics"))
-        case "tool_execution_end": self = .toolExecutionEnd(toolCallId: try recordRequired(o, "toolCallId"), toolName: try recordRequired(o, "toolName"), entry: try recordOptional(o, "entry"))
+        case "tool_execution_end":
+            self = .toolExecutionEnd(call: try DurableToolEventCall(o), entry: try recordOptional(o, "entry"),
+                                     result: try recordOptional(o, "result"))
         case "inbox_update": self = .inboxUpdate(items: try recordRequired(o, "items"))
         case "submission": self = .submission(record: try recordRequired(o, "record"))
         case "auto_retry_start": self = .autoRetryStart(attempt: try recordRequired(o, "attempt"), at: try recordRequired(o, "at"), errorMessage: try recordRequired(o, "errorMessage"))
@@ -276,11 +320,12 @@ public enum DurableAgentEvent: Sendable, Equatable, Codable {
         case .messageStart(let message): o["message"] = .object(message)
         case let .messageUpdate(usage, changes): o["usage"] = .object(usage); try recordSet(&o, "changes", changes)
         case .messageEnd(let entry), .entryAppended(let entry): try recordSet(&o, "entry", entry)
-        case let .toolExecutionStart(id, name, args): o["toolCallId"] = .string(id); o["toolName"] = .string(name); o["args"] = .object(args)
-        case let .toolExecutionUpdate(id, name, output, details, diagnostics):
-            o["toolCallId"] = .string(id); o["toolName"] = .string(name)
+        case let .toolExecutionStart(call, args): try call.set(&o); o["args"] = .object(args)
+        case let .toolExecutionUpdate(call, output, details, diagnostics):
+            try call.set(&o)
             try recordSetOptional(&o, "output", output); o["details"] = details; try recordSetOptional(&o, "diagnostics", diagnostics)
-        case let .toolExecutionEnd(id, name, entry): o["toolCallId"] = .string(id); o["toolName"] = .string(name); try recordSetOptional(&o, "entry", entry)
+        case let .toolExecutionEnd(call, entry, result):
+            try call.set(&o); try recordSetOptional(&o, "entry", entry); try recordSetOptional(&o, "result", result)
         case .inboxUpdate(let items): try recordSet(&o, "items", items)
         case .submission(let record): try recordSet(&o, "record", record)
         case let .autoRetryStart(attempt, at, error): try recordSet(&o, "attempt", attempt); try recordSet(&o, "at", at); o["errorMessage"] = .string(error)

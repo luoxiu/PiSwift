@@ -120,7 +120,7 @@ struct HarnessGenerationHooksTests {
             var tools: [TaskID] = [], slots: [ToolSlot] = []
             for index in 0..<2 {
                 let call = ToolCall(id: "call-\(index)", name: "old", arguments: [:])
-                let task = try await tx.createTask(generationToolKind, input: GenerationToolInput(assistant: assistant.id, callId: call.id), options: .init(ownership: .task(taskId: generation)))
+                let task = try await tx.createTask(generationToolKind, input: .model(assistant: assistant.id, callId: call.id), options: .init(ownership: .task(taskId: generation)))
                 let result = try await appendGenerationToolError(tx: tx, conversationId: opened.root.id, call: call, code: "fixture", text: "fixture", now: 1)
                 tools.append(task); slots.append(ToolSlot(callId: call.id, name: call.name, taskId: task, status: .done, entry: result.id))
             }

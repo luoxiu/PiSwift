@@ -2,33 +2,41 @@ import Foundation
 import PiSwiftChord
 
 extension TaskScheduler {
-    func abort(id: TaskID, context: ChordContext) async throws -> TaskAbortResult {
+    /// Commit the abort mark, or settle a task that no registered definition can take as `orphaned` when nothing it owns
+    /// is live, then join the run invocation seen on the line. A request replaces a `restart` mark, so a task abandoned
+    /// after a restart that waits for its definition is orphaned; with `keepRestart`, as for an owner's own cleanup, such
+    /// a task keeps its mark and waits on.
+    func abort(id: TaskID, context: ChordContext, keepRestart: Bool = false) async throws -> TaskAbortResult {
         let marked: (TaskAbortResult, TaskInvocation?) = try await session.commit({ tx in
             guard let record = try await tx.task(id) else { throw SessionError.message("Task \(id.rawValue) does not exist") }
             if record.state.status == "terminal" { return (.terminal, nil) }
             let invocation = state.withLock { $0.invocations[id] }
+            // A restart-marked task has no run invocation; it only waits for its abort.
+            if keepRestart && record.abortReason == .restart { return (.marked, nil) }
             if invocation == nil && record.state.status != "completing" {
                 try await loadScopes()
                 if !ownedLive().contains(id), let reason = fit(record, definition: registry.snapshot().task(name: record.kind)).reason {
                     try await terminate(tx, record: record, outcome: .orphaned(reason: reason)); return (.marked, nil)
                 }
             }
-            if !record.abortRequested { try tx.setTask(record.replacing(abortRequested: true)) }
+            if !record.abortRequested || record.abortReason != nil { try tx.setTask(record.withAbortMark()) }
             return (.marked, invocation?.abort == false ? invocation : nil)
         }, context: context)
         // Upstream abortTask does not enable scheduling (harness.ts:275-277, scheduler.ts:282-304).
+        // The commit listener signalled the run; join it. A run that ignores its signal can outlive a failed Session,
+        // which ends the wait instead.
         if let invocation = marked.1 {
-            let work = Task { try await invocation.done.value() }
+            let work = Task { [session] in try await session.untilFailed { try await invocation.done.value() } }
             try await awaitWithContext(work, context)
         }
         return marked.0
     }
     func waitForTask(id: TaskID, context: ChordContext) async throws -> SettledTask {
         let promise: HarnessPromise<SettledTask> = try await session.readOnLine {
-            if closing { throw closedError() }
+            if closing { throw closedError(session) }
             if current(id) != nil {
                 return try state.withLock { state in
-                    if state.closing { throw closedError() }
+                    if state.closing { throw closedError(session) }
                     return try taskWaiters.add(id, context: context)
                 }
             }
@@ -40,12 +48,12 @@ extension TaskScheduler {
     }
     func waitForIdle(conversationId: ConversationID?, context: ChordContext) async throws {
         let promise: HarnessPromise<Void>? = try await session.readOnLine {
-            if closing { throw closedError() }
+            if closing { throw closedError(session) }
             try context.abortSignal?.throwIfAborted()
             if idle(conversationId) { return nil }
             scheduleReconcile()
             return try state.withLock { state in
-                if state.closing { throw closedError() }
+                if state.closing { throw closedError(session) }
                 return try idleWaiters.add(conversationId, context: context)
             }
         }
@@ -60,7 +68,7 @@ extension TaskScheduler {
                 if record.background && !background { continue }
                 if inScope(record.parent, conversationId: id, background: background) != true { continue }
                 reached.append(record.id)
-                if !record.abortRequested { try tx.setTask(record.replacing(abortRequested: true)) }
+                if !record.abortRequested || record.abortReason != nil { try tx.setTask(record.withAbortMark()) }
             }
             for queuedID in queued where inScope(.conversation(queuedID), conversationId: id, background: background) == true { try await withdrawInputs(tx, queuedID) }
             return reached
@@ -97,7 +105,7 @@ extension TaskScheduler {
         try invocation.check()
         return try await session.commitWith({ tx in
             try invocation.check()
-            if closing { throw closedError() }
+            if closing { throw closedError(session) }
             guard let found = current(invocation.taskId) else { throw SessionError.message("Task \(invocation.taskId.rawValue) is terminal") }
             guard found.state.status == "running" else { throw SessionError.message("Task \(invocation.taskId.rawValue) is \(found.state.status)") }
             if !invocation.abort && found.abortRequested { throw SessionError.message("Task \(invocation.taskId.rawValue) has a durable abort mark") }

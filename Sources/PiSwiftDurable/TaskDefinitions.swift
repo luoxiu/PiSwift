@@ -25,11 +25,18 @@ public struct TaskOptions: Sendable {
     public let conversationId: ConversationID?
     /// Whether this task can outlive ordinary conversation work.
     public let background: Bool
-    /// Selects task ownership, optional conversation, and background lifetime.
-    public init(ownership: TaskOwnership, conversationId: ConversationID? = nil, background: Bool = false) {
+    /// Its creator awaits it only in memory and does not resume after a restart, so it is pointless once the Harness that
+    /// created it is gone. When scheduling starts in a later Harness, the task, if still live, is abort-marked with reason
+    /// `restart`, and the mark cascades to its ordinary owned work, before any of it runs again. Nil leaves the choice to
+    /// the creator's default (a tool that is not replay-safe abandons its child tasks).
+    public let abandonOnRestart: Bool?
+    /// Selects task ownership, optional conversation, background lifetime, and restart abandonment.
+    public init(ownership: TaskOwnership, conversationId: ConversationID? = nil, background: Bool = false,
+                abandonOnRestart: Bool? = nil) {
         self.ownership = ownership
         self.conversationId = conversationId
         self.background = background
+        self.abandonOnRestart = abandonOnRestart
     }
 }
 

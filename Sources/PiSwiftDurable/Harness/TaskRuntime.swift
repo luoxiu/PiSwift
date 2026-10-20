@@ -118,6 +118,22 @@ public final class TaskRuntime: Sendable {
             return try await scheduler.waitForTask(id: id, context: context.withAbortSignal(signal))
         }
     }
+    /// Abort a task this task owns, as `Harness.abortTask()` does, and return once it is terminal. Throws for a task
+    /// another owns; returns at once for a terminal one. A task abandoned after a restart keeps its `restart` mark, so one
+    /// whose definition is missing waits for it instead of becoming orphaned.
+    public func abortOwned(_ id: TaskID, context: ChordContext) async throws {
+        try await withTaskCancellationContext(context) { context in
+            try invocation.check()
+            let bound = context.withAbortSignal(signal)
+            let record = try await scheduler.session.readOnLine { try await scheduler.storage.task(id, context: bound) }
+            guard let record, record.owner == taskId else {
+                throw SessionError.message("Task \(id.rawValue) is not owned by task \(taskId.rawValue)")
+            }
+            if record.state.status == "terminal" { return }
+            _ = try await scheduler.abort(id: id, context: bound, keepRestart: true)
+            _ = try await scheduler.waitForTask(id: id, context: bound)
+        }
+    }
     /// Returns the terminal outcomes of the supplied tasks in ID-list order.
     public func outcomes(_ ids: [TaskID], context: ChordContext) async throws -> [TaskOutcome] {
         try await withTaskCancellationContext(context) { context in

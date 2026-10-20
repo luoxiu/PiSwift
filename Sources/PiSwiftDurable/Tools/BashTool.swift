@@ -53,14 +53,42 @@ internal func bashTimeout(_ timeout: Double?) throws -> Duration? {
     return .seconds(timeout)
 }
 
-/// Creates a tool that streams raw shell output and lets the harness retain its tail.
+/// What a program that calls `bash` receives.
+public struct ShellStructuredOutput: Codable, Sendable, Equatable {
+    /// Combined stdout and stderr: the retained tail, as the model sees it.
+    public var output: String
+    /// Whether earlier output was dropped.
+    public var truncated: Bool
+    /// File with the complete output, when it was spilled.
+    public var fullOutputPath: String?
+    /// The command's exit code.
+    public var exitCode: Int
+    /// Creates the structured output of one command.
+    public init(output: String, truncated: Bool, fullOutputPath: String? = nil, exitCode: Int) {
+        self.output = output; self.truncated = truncated; self.fullOutputPath = fullOutputPath; self.exitCode = exitCode
+    }
+}
+/// The schema of `ShellStructuredOutput`.
+private let shellStructuredOutputSchema: JSONObject = ["type": "object", "properties": [
+    "output": ["type": "string", "description": "Combined stdout and stderr: the retained tail, as the model sees it"],
+    "truncated": ["type": "boolean", "description": "Whether earlier output was dropped"],
+    "fullOutputPath": ["type": "string", "description": "File with the complete output, when it was spilled"],
+    "exitCode": ["type": "number"],
+], "required": ["output", "truncated", "exitCode"]]
+
+/// Runs a command through the environment's shell. Its output streams to `api.output()`, where the Harness keeps the
+/// tail within the default limits; the result's output is that retained output. Output beyond the limits is spilled to a
+/// file whose path is reported as a diagnostic. A nonzero exit is an error result with the exit code; a timeout throws,
+/// which makes an error result that still carries the output and diagnostics. The structured output repeats the retained
+/// output with the exit code.
 /// Local shell execution is unavailable on iOS. A mobile host can omit this tool or supply a remote shell.
 public func createBashTool(options: BashToolOptions = .init()) throws -> ToolRegistration {
     try defineTool(name: "bash", description: "Execute a bash command in the current working directory. Returns combined stdout and stderr. Output is truncated to last \(defaultMaxLines) lines or \(defaultMaxBytes / 1024)KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.",
         parameters: ["type": "object", "properties": [
             "command": ["type": "string", "description": "Bash command to execute"],
             "timeout": ["type": "number", "description": "Timeout in seconds (optional, no default timeout)"]
-        ], "required": ["command"]], args: BashToolInput.self, outputLimits: .init(retain: .tail)) { args, api, context in
+        ], "required": ["command"]], args: BashToolInput.self, outputLimits: .init(retain: .tail),
+        structuredOutputSchema: shellStructuredOutputSchema) { args, api, context in
             let timeout = try bashTimeout(args.timeout)
             let env = try requireEnv(api)
             let prefix = options.commandPrefix.flatMap { $0.isEmpty ? nil : $0 }
@@ -88,8 +116,13 @@ public func createBashTool(options: BashToolOptions = .init()) throws -> ToolReg
                 if error.code == .aborted { throw DurableToolError(message: "Command aborted") }
                 throw error
             case .success(let value):
-                if value.exitCode != 0 { throw DurableToolError(message: "Command exited with code \(value.exitCode)") }
+                let retained = try api.retainedOutput()
+                let structured = ShellStructuredOutput(output: retained.text, truncated: retained.truncated,
+                                                       fullOutputPath: spillPath, exitCode: Int(value.exitCode))
+                let structuredOutput = try JSONValue(encoding: structured)
+                if value.exitCode == 0 { return ToolExecutionResult(structuredOutput: structuredOutput) }
+                let exited = ToolDiagnostic(severity: .error, message: "Command exited with code \(value.exitCode)", code: "exit_code")
+                return ToolExecutionResult(structuredOutput: structuredOutput, isError: true, diagnostics: [exited])
             }
-            return ToolExecutionResult()
         }
 }

@@ -1,11 +1,35 @@
-/// A batch was rejected before any durable effect. The owning Session can continue.
-public struct StorageRejected: Error, Sendable, Equatable, CustomStringConvertible {
-    /// Text that describes the error, diagnostic, or model response.
-    public let message: String
-    /// Stores a rejection message for a batch with no durable effect.
-    public init(_ message: String) { self.message = message }
+/// A Storage read rejected an invalid request, such as an unknown conversation or a cursor from another scan, with no
+/// durable effect. Unlike any other error a Storage throws, it fails only that read, not the Session; from `commit()` it
+/// is fatal like any other.
+public struct StorageRequestError: Error, Sendable, Equatable, CustomStringConvertible {
     /// Text that describes this value or error to the caller.
-    public var description: String { message }
+    public let description: String
+    /// The built-in backends' typed reason, when one applies.
+    public let reason: DurableStorageError?
+    /// Stores the message of an invalid request.
+    public init(_ description: String) { self.description = description; reason = nil }
+    /// Wraps a built-in backend's typed reason; the message is the reason's.
+    public init(_ reason: DurableStorageError) { description = reason.description; self.reason = reason }
+}
+
+/// The Session failed, so nothing runs or commits any more. It fails when a Storage method throws, a commit cannot be
+/// adopted, or the Harness's own bookkeeping throws (a scheduler commit, an internal commit listener). `cause` is that
+/// first error. Reopen the Session; reopening recovers from what was committed.
+public struct SessionFailed: Error, Sendable, CustomStringConvertible {
+    /// The first error, usually a storage error.
+    public let cause: any Error
+    /// Wraps the first error.
+    public init(_ cause: any Error) { self.cause = cause }
+    /// Text that describes this value or error to the caller.
+    public var description: String { "Session failed after a storage error; close and reopen it" }
+}
+
+/// Why a Session ended: `close()`, or a failed Storage call, whose error it carries.
+public enum SessionEnd: Sendable {
+    /// `close()` closed the Session.
+    case closed
+    /// The Session failed with `error` and closed itself.
+    case failed(any Error)
 }
 
 /// Storage contract failures. Descriptions use the upstream backend error text.
@@ -62,6 +86,10 @@ public enum DurableStorageError: Error, Sendable, Equatable, CustomStringConvert
     case forkSourceDoesNotMatch(DocumentID)
     /// Prepared document copy was not resolved.
     case preparedDocumentCopyNotResolved
+    /// Document copy the supplied value was rejected.
+    case documentCopyRejected(DocumentID)
+    /// Document copy the supplied value source is changed in the copy batch.
+    case documentCopySourceChanged(DocumentID)
 
     /// Text that describes this value or error to the caller.
     public var description: String {
@@ -92,6 +120,8 @@ public enum DurableStorageError: Error, Sendable, Equatable, CustomStringConvert
         case .forkSourceCannotBeRead(let id): "Fork source document \(id.rawValue) cannot be read"
         case .forkSourceDoesNotMatch(let id): "Fork source document \(id.rawValue) does not match the copied record"
         case .preparedDocumentCopyNotResolved: "Prepared document copy was not resolved"
+        case .documentCopyRejected(let id): "Document copy \(id.rawValue) was rejected"
+        case .documentCopySourceChanged(let id): "Document copy \(id.rawValue) source is changed in the copy batch"
         }
     }
 }

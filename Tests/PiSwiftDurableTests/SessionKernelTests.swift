@@ -6,7 +6,8 @@ import PiSwiftChord
 private enum SessionKernelFailure: Error, Equatable { case storage, callback }
 
 @Suite struct SessionKernelTests {
-    @Test func SessionPoisonAfterStorageAdmission() async throws {
+    /// Upstream session-documents: "fails the Session after a Storage failure and publishes nothing".
+    @Test func SessionFailsAfterStorageFailure() async throws {
         let harness = try await openTestSession()
         let token = try SessionDocToken<JSONObject>(kind: "poison", version: 1, initial: { ["count": 0] })
         try await harness.session.commit({ tx in _ = try await tx.doc(token) }, context: .background)
@@ -20,32 +21,38 @@ private enum SessionKernelFailure: Error, Equatable { case storage, callback }
         }
         #expect(harness.publications.count == published)
         #expect(before == ["count": 0])
-        await #expect(throws: SessionError.poisoned) {
-            try await harness.session.snapshot(token, context: .background)
+        await expectSessionFailed(cause: SessionKernelFailure.storage) {
+            _ = try await harness.session.snapshot(token, context: .background)
         }
-        await #expect(throws: SessionError.poisoned) {
+        await expectSessionFailed(cause: SessionKernelFailure.storage) {
             try await harness.session.commit({ _ in }, context: .background)
         }
+        #expect(endedFailed(await harness.session.closed, SessionKernelFailure.storage))
         try await harness.session.close(context: .background)
     }
 
-    @Test func SessionStorageRejectedRollsBackAndRemainsUsable() async throws {
+    /// A rejection from `commit()` is fatal like any other error: once admitted, whether the batch committed is unknown.
+    @Test func SessionFailsOnRejectedCommit() async throws {
         let harness = try await openTestSession()
         let conversation = try await createConversation(harness.session)
         let published = harness.publications.count
-        await harness.storage.failNextCommit(StorageRejected("rejected"))
-        await #expect(throws: StorageRejected("rejected")) {
+        let rejection = StorageRequestError("rejected")
+        await harness.storage.failNextCommit(rejection)
+        await #expect(throws: rejection) {
             try await harness.session.commit({ tx in
                 try await tx.appendEntry(conversation, value: EntryDraft(kind: "rejected"))
             }, context: .background)
         }
         #expect(harness.publications.count == published)
-        let entry = try await harness.session.commit({ tx in
-            try await tx.appendEntry(conversation, value: EntryDraft(kind: "accepted"))
-        }, context: .background)
-        #expect(try await harness.storage.entry(entry.id, context: .background)?.entry == entry)
-        #expect(harness.publications.count == published + 1)
-        try await harness.session.close(context: .background)
+        await expectSessionFailed(cause: rejection) {
+            _ = try await harness.session.commit({ tx in
+                try await tx.appendEntry(conversation, value: EntryDraft(kind: "accepted"))
+            }, context: .background)
+        }
+        #expect(endedFailed(await harness.session.closed, rejection))
+        await harness.storage.reopen()
+        let entries = try await harness.storage.scanEntries(.init(conversationId: conversation), limit: 10, cursor: nil, context: .background)
+        #expect(entries.items.isEmpty)
     }
 
     @Test func SessionPublicationIsSynchronousAndCarriesContext() async throws {

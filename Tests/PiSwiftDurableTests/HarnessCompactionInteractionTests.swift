@@ -132,15 +132,16 @@ func interactionBlockingRun(_ chat: CompactionChat) async throws -> (Submission,
         gate.release(); #expect(try await compactionOutcome(chat, id).status == "completed")
         try await chat.harness.close(context: .background)
     }
-    // Upstream :1456, :1880. A rejected response commit replaces a throwing model call in Swift.
+    // Upstream :1456, :1880. A summary response with a nonfinite cost, which faults the classifying commit, replaces a
+    // throwing model lookup in Swift: `DurableModels.getModel` cannot throw, and a storage failure now fails the Harness.
     @Test(arguments: [false, true])
     func faultedCompactionRemovesStatusAndBlockingGenerationContinues(blocking: Bool) async throws {
-        let storage = ControlledStorage(), chat = try await compactionOpen(contextWindow: 1000, storage: storage)
+        let setup = HarnessChatSetup(options: .init(models: [.init(id: "faux-1", contextWindow: 1000, maxTokens: 900)]), clock: TestClock(now: 1000))
+        try setup.registry.install(Extension(name: "compaction-preamble", sections: [section("preamble", tag: false) { _, _ in "You are helpful." }]))
+        let chat = try await compactionOpen(setup: setup, script: CompactionScript(setup: setup),
+                                            models: NonfiniteSummaryModels(base: setup.models))
         try await compactionHistory(chat)
-        chat.script.appendSummary([.factory { _, _, _, _ in
-            await storage.failNextCommit(StorageRejected("models broke"))
-            return chatAssistant("SUMMARY")
-        }])
+        chat.script.appendSummary([.message(chatAssistant("SUMMARY"))])
         if blocking {
             chat.setup.updateSettings { $0.compaction = .init(enabled: true, reserveTokens: 500, keepRecentTokens: 150, backgroundTokens: 0) }
             try await compactionTurn(chat, compactionText("u4", 200), "a4")
@@ -248,5 +249,25 @@ func interactionBlockingRun(_ chat: CompactionChat) async throws -> (Submission,
         #expect(view.entries.dropFirst().allSatisfy { before.contains($0) })
         #expect(view.entries.dropFirst().count == 2)
         try await chat.harness.close(context: .background)
+    }
+}
+
+/// Gives every summary response a nonfinite cost, which makes the commit that classifies it throw.
+private struct NonfiniteSummaryModels: DurableModels {
+    let base: FakeDurableModels
+    func getModel(provider: String, modelId: String) -> Model? { base.getModel(provider: provider, modelId: modelId) }
+    func streamSimple(model: Model, context: PiSwiftAI.Context, options: SimpleStreamOptions) -> AssistantMessageEventStream {
+        base.streamSimple(model: model, context: context, options: options)
+    }
+    func completeSimple(model: Model, context: PiSwiftAI.Context, options: SimpleStreamOptions) async -> AssistantMessage {
+        var message = await base.completeSimple(model: model, context: context, options: options)
+        message.usage.cost.total = .infinity
+        return message
+    }
+    func fetchDeferred(model: Model, handle: DeferredHandle, options: DeferredFetchOptions) async -> AssistantMessage {
+        await base.fetchDeferred(model: model, handle: handle, options: options)
+    }
+    func cancelDeferred(model: Model, handle: DeferredHandle, options: DeferredCancelOptions) async throws {
+        try await base.cancelDeferred(model: model, handle: handle, options: options)
     }
 }

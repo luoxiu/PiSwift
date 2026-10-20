@@ -6,7 +6,12 @@ private struct WeakHarness: Sendable { weak var value: Harness? }
 private final class HarnessSessionHooks: SessionHooks {
     let scheduler = Mutex<TaskScheduler?>(nil)
     let app: (@Sendable (Transaction, ConversationRecord) async throws -> Void)?
-    init(app: (@Sendable (Transaction, ConversationRecord) async throws -> Void)?) { self.app = app }
+    let onReport: @Sendable (any Error) -> Void
+    init(app: (@Sendable (Transaction, ConversationRecord) async throws -> Void)?, onReport: @escaping @Sendable (any Error) -> Void) {
+        self.app = app; self.onReport = onReport
+    }
+    /// The Session's failure, once, and listener errors go to `onReport`, the last place an error goes.
+    func report(_ error: any Error) { onReport(error) }
     func conversationCreated(_ tx: Transaction, record: ConversationRecord) async throws {
         _ = try await tx.doc(LiveDoc, conversationId: record.id)
         _ = try await tx.doc(InboxDoc, conversationId: record.id)
@@ -30,7 +35,7 @@ public final class Harness: Sendable {
     internal let submissions: Submissions
     internal let views: ConversationViews
     internal let graph: TaskGraphView
-    private let closed = Mutex(false)
+    private let closing = Mutex(false)
     private init(session: Session, storage: any DurableStorage, options: HarnessOptions,
                  tasks: TaskScheduler, submissions: Submissions) throws {
         self.session = session; self.storage = storage; self.options = options; self.tasks = tasks; self.submissions = submissions
@@ -38,17 +43,19 @@ public final class Harness: Sendable {
         self.graph = try TaskGraphView(session: session, storage: storage)
     }
     /// Opens the session and restores runnable task state with scheduling paused.
-    public static func open(storage: any DurableStorage, options: HarnessOptions,
+    public static func open(storage rawStorage: any DurableStorage, options: HarnessOptions,
                             context: ChordContext) async throws -> Harness {
         try await withTaskCancellationContext(context) { context in
             try context.abortSignal?.throwIfAborted()
             let snapshot = options.registry.snapshot()
             let missing = ["pi.generation", "pi.tool", "pi.compaction"].filter { snapshot.task(name: $0) == nil }
             if !missing.isEmpty { throw HarnessOpenError.missingBuiltins(missing) }
-            let hooks = HarnessSessionHooks(app: options.conversationCreated)
-            let now = options.now ?? { options.clock.now() }
-            let session = try await Session.open(storage: storage, now: now, hooks: hooks, context: context)
             let report: @Sendable (any Error) -> Void = options.onReport ?? { _ in }
+            let hooks = HarnessSessionHooks(app: options.conversationCreated, onReport: report)
+            let now = options.now ?? { options.clock.now() }
+            let session = try await Session.open(storage: rawStorage, now: now, hooks: hooks, context: context)
+            // Every component reads and writes through the Session's failure guard: `rawStorage` serves only the Session.
+            let storage = session.storage
             let settings: @Sendable () -> Settings = { options.settings?.resolve() ?? resolveSettings() }
             let reference = Mutex(WeakHarness())
             let scheduler = TaskScheduler(session: session, registry: options.registry, models: options.models,
@@ -63,7 +70,7 @@ public final class Harness: Sendable {
                 }, conversation: { id, binding, callContext in
                     let found = try await session.readOnLine { try await storage.conversation(id, context: callContext) }
                     guard found != nil else { return nil }
-                    guard let harness = reference.withLock({ $0.value }) else { throw closedError() }
+                    guard let harness = reference.withLock({ $0.value }) else { throw closedError(session) }
                     return ConversationHandle(Conversation(id: id, harness: harness, binding: binding))
                 }, report: report, context: context.withoutAbortSignal(),
                 settleOutcome: { tx, record, outcome in try await settleSchedulerOutcome(tx: tx, record: record, outcome: outcome) },
@@ -74,32 +81,44 @@ public final class Harness: Sendable {
             reference.withLock { $0.value = harness }
             do { try await scheduler.open(context: context) }
             catch {
-                do { try await harness.close(context: context.withoutAbortSignal()) } catch { report(error) }
+                // The caller's context may be what failed open: close without it, and rethrow the open error. A failing
+                // Storage close fails the Session, which reports it.
+                try? await harness.close(context: context.withoutAbortSignal())
                 throw error
             }
             return harness
         }
     }
-    internal func assertOpen() throws { if closed.withLock({ $0 }) { throw closedError() } }
+    /// Throw `SessionFailed` after a failure, else an error once closing.
+    internal func assertOpen() throws {
+        try session.assertHealthy()
+        if closing.withLock({ $0 }) || session.isClosing { throw closedError(session) }
+    }
     /// Starts task scheduling after a harness is opened or paused.
     public func resume() throws { try assertOpen(); tasks.resume() }
     /// Releases this object's resources and rejects later operations.
     public func close(context: ChordContext) async throws {
-        closed.withLock { $0 = true }
+        closing.withLock { $0 = true }
         try await withTaskCancellationContext(context) { try await session.close(context: $0) }
     }
+    /// Settles once the Harness has closed, by `close()` or after a storage error, Storage included: `.closed`, or
+    /// `.failed(error)`. A failure closes the Harness by itself; `closed` settles once that close is done, even if the
+    /// storage could not close cleanly. Closing waits for running task code to return.
+    public var closed: SessionEnd { get async { await session.closed } }
     /// Commits the supplied changes atomically and publishes them after storage succeeds.
     public func commit<T>(_ change: (Transaction) async throws -> T, context: ChordContext) async throws -> T {
         try await withTaskCancellationContext(context) { context in
             try assertOpen(); return try await session.commit(change, context: context)
         }
     }
-    /// Adds a listener on the session mutation line after commit adoption; it must not call session operations.
-    public func subscribeCommits(_ listener: @escaping @Sendable (CommitPublication, ChordContext) -> Void) throws -> SessionSubscription {
+    /// Adds a listener on the session mutation line after commit adoption; it must not call session operations. A throw is
+    /// reported through `onReport`, and the other listeners still run.
+    public func subscribeCommits(_ listener: @escaping @Sendable (CommitPublication, ChordContext) throws -> Void) throws -> SessionSubscription {
         try assertOpen(); return try session.subscribeCommits(listener)
     }
-    /// Adds a listener called when close seals session admission; it must not call session operations.
-    public func subscribeClose(_ listener: @escaping @Sendable () -> Void) throws -> SessionSubscription {
+    /// Adds a listener called when close seals session admission, also when a failure closes the session; it must not
+    /// call session operations. A throw is reported through `onReport`, and the other listeners still run.
+    public func subscribeClose(_ listener: @escaping @Sendable () throws -> Void) throws -> SessionSubscription {
         try assertOpen(); return try session.subscribeClose(listener)
     }
     /// Returns the root conversation, creating and initializing it when absent.

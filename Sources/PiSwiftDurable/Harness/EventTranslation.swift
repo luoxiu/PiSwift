@@ -19,7 +19,8 @@ private func queuedEvents(_ inbox: InboxState?) -> [DurableQueuedItem] {
 internal func durableEventSnapshot(_ view: ConversationView) throws -> DurableAgentSnapshot {
     let parts = try EventParts(view)
     return DurableAgentSnapshot(entries: view.entries, run: parts.live.run.map { .init(inputs: $0.inputs) },
-        generation: parts.live.generation, tools: parts.live.tools ?? [], compactions: parts.live.compactions ?? [],
+        generation: parts.live.generation, tools: parts.live.tools ?? [], nestedTools: parts.live.nestedTools ?? [],
+        compactions: parts.live.compactions ?? [],
         inbox: queuedEvents(parts.inbox), agent: parts.agent ?? .init(), usage: parts.usage ?? ["models": [:], "tools": [:]])
 }
 
@@ -44,7 +45,7 @@ extension Harness {
             let initialSnapshot = try durableEventSnapshot(initial)
             let current = Mutex(initialSnapshot)
             let watch = CommittedWatch<[DurableAgentEvent]>(value: [], replacement: { _ in .array([]) }, detach: release,
-                replace: { [.snapshot(current.withLock { $0 })] })
+                report: { [views] in views.report($0) }, replace: { [.snapshot(current.withLock { $0 })] })
             backing.withLock { $0 = watch }
             result.withLock { $0 = DurableAgentEventWatch(snapshot: initialSnapshot, watch: watch) }
             return ConversationViewObserver(publication: { before, after, ops, publication, context in
@@ -57,7 +58,7 @@ extension Harness {
                     }
                     if !events.isEmpty { watch.advance(value: events, ops: [], context: context) }
                 } catch { watch.fail(error) }
-            }, closeSession: { watch.closeSession() })
+            }, closeSession: { watch.closeSession(failure: $0) })
         }
         let watch = backing.withLock { $0! }
         do {
@@ -80,8 +81,15 @@ internal func translateDurableEvents(conversationId: ConversationID, before: Con
 ) throws -> [DurableAgentEvent] {
     var entries: [EntryRecord] = []; var tasks: [TaskID: TaskRecord] = [:]; var taskOrder: [TaskID] = []
     var submissions: [SubmissionRecord] = []
+    // Nested results this commit stored, by nested task ID; read now, since the caller's documents may retire next.
+    var nestedResults: [String: NestedToolExecutionResult] = [:]
     for change in publication.changes {
         switch change {
+        case .document(let document) where document.record.kind == NestedResultDoc.definition.kind
+            && document.conversationId == conversationId:
+            if let key = document.record.key, let value = document.value?["result"] {
+                nestedResults[key] = try value.decode(NestedToolExecutionResult.self)
+            }
         case .entry(let record) where record.conversationId == conversationId: entries.append(record)
         case .task(let record) where record.conversationId == conversationId:
             if tasks[record.id] == nil { taskOrder.append(record.id) }; tasks[record.id] = record
@@ -100,6 +108,8 @@ internal func translateDurableEvents(conversationId: ConversationID, before: Con
         if slotsBefore[key] == nil { slotOrder.append(key) }
         slotsBefore[key] = slot
     }
+    let nestedBefore = Dictionary((was.live.nestedTools ?? []).map { ($0.taskId, $0) }, uniquingKeysWith: { $1 })
+    let nested = now.live.nestedTools ?? []
     for slot in slots where slot.status == .running && slotsBefore[Array(slot.callId.utf16)]?.status != .running {
         var args: JSONObject = [:]
         if let id = slot.taskId, let task = tasks[id] {
@@ -108,7 +118,11 @@ internal func translateDurableEvents(conversationId: ConversationID, before: Con
             default: break
             }
         }
-        events.append(.toolExecutionStart(toolCallId: slot.callId, toolName: slot.name, args: args))
+        events.append(.toolExecutionStart(call: toolEventCall(slot), args: args))
+    }
+    // A nested slot carries the arguments the call runs with; a model-issued call's are in its intent checkpoint.
+    for slot in nested where slot.status == .running && nestedBefore[slot.taskId]?.status != .running {
+        events.append(.toolExecutionStart(call: toolEventCall(slot), args: slot.arguments))
     }
     let partialBefore = was.live.generation?.message; let partial = now.live.generation?.message
     if let partial, partialBefore == nil { events.append(.messageStart(message: partial)) }
@@ -118,8 +132,14 @@ internal func translateDurableEvents(conversationId: ConversationID, before: Con
     }
     for (index, slot) in slots.enumerated() {
         guard slot.status == .running, let previous = slotsBefore[Array(slot.callId.utf16)], previous.status == .running,
-              let update = durableToolUpdate(viewOps, index: index, slot: slot, previous: previous) else { continue }
-        events.append(.toolExecutionUpdate(toolCallId: slot.callId, toolName: slot.name, output: update.output,
+              let update = durableToolUpdate(viewOps, at: ["tools", .index(index)], slot: .init(slot), previous: .init(previous)) else { continue }
+        events.append(.toolExecutionUpdate(call: toolEventCall(slot), output: update.output,
+            details: update.details, diagnostics: update.diagnostics))
+    }
+    for (index, slot) in nested.enumerated() {
+        guard slot.status == .running, let previous = nestedBefore[slot.taskId], previous.status == .running,
+              let update = durableToolUpdate(viewOps, at: ["nestedTools", .index(index)], slot: .init(slot), previous: .init(previous)) else { continue }
+        events.append(.toolExecutionUpdate(call: toolEventCall(slot), output: update.output,
             details: update.details, diagnostics: update.diagnostics))
     }
     let generation = now.live.generation; let generationBefore = was.live.generation
@@ -129,25 +149,39 @@ internal func translateDurableEvents(conversationId: ConversationID, before: Con
     if generationBefore?.retry != nil, generation?.retry == nil { events.append(.autoRetryEnd(attempt: generationBefore!.attempt)) }
     if let deferred = generation?.deferred, deferred.pollAt != generationBefore?.deferred?.pollAt { events.append(.deferredPoll(pollAt: deferred.pollAt)) }
 
-    struct ToolEnd { let id: String; let name: String; let entry: EntryRecord? }
+    // Tools that end in this commit: a slot that becomes done, one created done (a call not offered), or an unfinished
+    // one that vanishes because its run ended. A done slot that vanishes ended earlier.
+    struct ToolEnd { let call: DurableToolEventCall; let entry: EntryRecord? }
     var toolEnds: [ToolEnd] = []
-    func endTool(_ id: String, _ name: String, _ entryId: EntryID?) {
-        toolEnds.append(ToolEnd(id: id, name: name, entry: entries.first { $0.id == entryId }))
+    func endTool(_ slot: ToolSlot, _ entryId: EntryID?) {
+        toolEnds.append(ToolEnd(call: toolEventCall(slot), entry: entries.first { $0.id == entryId }))
     }
     for id in slotOrder {
         let previous = slotsBefore[id]!
         if previous.status == .done { continue }
         let slot = slots.first { harnessNamesEqual($0.callId, previous.callId) }
-        if slot?.status == .done { endTool(previous.callId, previous.name, slot?.entry) }
+        if let slot, slot.status == .done { endTool(slot, slot.entry) }
+        // A slot whose run ended in this commit may have had its result appended with it, as for unstarted calls.
         else if slot == nil {
             let result = entries.first { $0.model?.first?.objectValue?["role"] == .string("toolResult") && $0.model?.first?.objectValue?["toolCallId"] == .string(previous.callId) }
-            endTool(previous.callId, previous.name, result?.id)
+            endTool(previous, result?.id)
         }
     }
-    for slot in slots where slot.status == .done && slotsBefore[Array(slot.callId.utf16)] == nil { endTool(slot.callId, slot.name, slot.entry) }
+    for slot in slots where slot.status == .done && slotsBefore[Array(slot.callId.utf16)] == nil { endTool(slot, slot.entry) }
+    // Nested calls that end in this commit, the same way, children before the calls that made them: the lists hold
+    // parents first, so walk them backwards.
+    func endNested(_ slot: NestedToolSlot) {
+        events.append(.toolExecutionEnd(call: toolEventCall(slot), result: nestedResults[String(slot.taskId.rawValue)]))
+    }
+    let nestedNow = Dictionary(nested.map { ($0.taskId, $0) }, uniquingKeysWith: { $1 })
+    for previous in (was.live.nestedTools ?? []).reversed() where previous.status != .done {
+        let slot = nestedNow[previous.taskId]
+        if slot == nil || slot?.status == .done { endNested(slot ?? previous) }
+    }
+    for slot in nested.reversed() where slot.status == .done && nestedBefore[slot.taskId] == nil { endNested(slot) }
     var assistantAppended = false
     for entry in entries {
-        for end in toolEnds where end.entry?.id == entry.id { events.append(.toolExecutionEnd(toolCallId: end.id, toolName: end.name, entry: end.entry)) }
+        for end in toolEnds where end.entry?.id == entry.id { events.append(.toolExecutionEnd(call: end.call, entry: end.entry)) }
         guard let message = entry.model?.first?.objectValue else { events.append(.entryAppended(entry: entry)); continue }
         let assistant = message["role"] == .string("assistant")
         let streamed = assistant && partialBefore != nil && !assistantAppended
@@ -155,7 +189,7 @@ internal func translateDurableEvents(conversationId: ConversationID, before: Con
         if !streamed { events.append(.messageStart(message: message)) }
         events.append(.messageEnd(entry: entry))
     }
-    for end in toolEnds where end.entry == nil { events.append(.toolExecutionEnd(toolCallId: end.id, toolName: end.name)) }
+    for end in toolEnds where end.entry == nil { events.append(.toolExecutionEnd(call: end.call)) }
     let compactionsBefore = was.live.compactions ?? []; let compactions = now.live.compactions ?? []
     for old in compactionsBefore where !compactions.contains(where: { $0.taskId == old.taskId }) { events.append(.compactionEnd(taskId: old.taskId, reason: old.reason)) }
     var turnEnded = false
@@ -237,13 +271,31 @@ internal func durableMessageChanges(_ ops: [Delta.Op], message: JSONObject) thro
     return changes
 }
 
+/// The identifying fields of a slot's tool events.
+private func toolEventCall(_ slot: ToolSlot) -> DurableToolEventCall {
+    DurableToolEventCall(toolCallId: slot.callId, toolName: slot.name, taskId: slot.taskId)
+}
+private func toolEventCall(_ slot: NestedToolSlot) -> DurableToolEventCall {
+    DurableToolEventCall(toolCallId: slot.callId, toolName: slot.name, taskId: slot.taskId,
+                         parentToolCallId: slot.parentCallId, parentTaskId: slot.parentTaskId)
+}
+
 internal struct DurableToolUpdate: Sendable {
     let output: DurableToolOutputChange?
     let details: JSONValue?
     let diagnostics: [ToolDiagnostic]?
 }
-internal func durableToolUpdate(_ ops: [Delta.Op], index: Int, slot: ToolSlot, previous: ToolSlot) -> DurableToolUpdate? {
-    let path: Delta.Path = ["docs", "pi.live", "tools", .index(index), "output"]
+/// What a running slot publishes, shared by model-issued and nested slots.
+internal struct DurableSlotProgress: Sendable {
+    let output: String?
+    let details: JSONValue?
+    let diagnostics: [ToolDiagnostic]?
+    init(_ slot: ToolSlot) { output = slot.output; details = slot.details; diagnostics = slot.diagnostics }
+    init(_ slot: NestedToolSlot) { output = slot.output; details = slot.details; diagnostics = slot.diagnostics }
+}
+/// Output, details, and diagnostics changes of a running slot at `at` in `pi.live`, from the view operations on it.
+internal func durableToolUpdate(_ ops: [Delta.Op], at: Delta.Path, slot: DurableSlotProgress, previous: DurableSlotProgress) -> DurableToolUpdate? {
+    let path: Delta.Path = ["docs", "pi.live"] + at + ["output"]
     var trim = 0; var append = ""; var set = false
     for op in ops where eventPathStarts(eventOpPath(op), path) {
         switch op { case .trim(_, let n): trim += n; case .append(_, let text): append += text; default: set = true }

@@ -13,6 +13,8 @@ public enum WatchEnd: Sendable {
     case retired
     /// A watch listener failed while processing an update.
     case listenerError(any Error)
+    /// The Session failed; the error is what failed it, usually a storage error (see `SessionFailed`).
+    case sessionFailed(any Error)
 }
 
 /// A serial watch of committed values from one document incarnation.
@@ -46,14 +48,19 @@ public final class CommittedWatch<Value: Sendable>: Sendable {
     private let replacement: @Sendable (Value) -> JSONValue
     private let replace: (@Sendable () -> Value)?
     private let detach: @Sendable () -> Void
+    private let report: @Sendable (any Error) -> Void
 
+    /// `report` gets a listener's throw, which also ends the watch. `replace` gives the value an overflow delivers; by
+    /// default the newest value.
     package init(value: Value, replacement: @escaping @Sendable (Value) -> JSONValue,
                  detach: @escaping @Sendable () -> Void,
+                 report: @escaping @Sendable (any Error) -> Void = { _ in },
                  replace: (@Sendable () -> Value)? = nil) {
         storage = Mutex(State(value: value))
         self.replacement = replacement
         self.replace = replace
         self.detach = detach
+        self.report = report
     }
 
     /// The acquisition value, followed by the value of the last delivered frame.
@@ -117,7 +124,10 @@ public final class CommittedWatch<Value: Sendable>: Sendable {
     }
 
     package func cancel() { terminate(.cancelled) }
-    package func closeSession() { terminate(.sessionClosed) }
+    /// End with `sessionClosed`, or with `sessionFailed` and the error when the Session failed.
+    package func closeSession(failure: (any Error)? = nil) {
+        terminate(failure.map(WatchEnd.sessionFailed) ?? .sessionClosed)
+    }
     package func fail(_ error: any Error) { terminate(.listenerError(error)) }
 
     /// Keep at most 100 pending frames. Overflow replaces only the pending suffix.
@@ -199,7 +209,10 @@ public final class CommittedWatch<Value: Sendable>: Sendable {
                 return
             }
             do { try await listener(frame.value, frame.ops, frame.context) }
-            catch { terminate(.listenerError(error)) }
+            catch {
+                if storage.withLock({ $0.end == nil }) { report(error) }
+                terminate(.listenerError(error))
+            }
             if frame.retired { terminate(.retired) }
         }
     }

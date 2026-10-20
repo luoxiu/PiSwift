@@ -37,6 +37,9 @@ public struct RunningTask<Input: Codable & Sendable, Checkpoint: TaskCheckpoint>
     public var conversationId: ConversationID { record.conversationId }
     /// Whether an abort request has been saved for this task.
     public var abortRequested: Bool { record.abortRequested }
+    /// Why the abort mark was set when not by a request: `restart` for a task abandoned after a restart. Abort handlers
+    /// can tell an abandonment from a request.
+    public var abortReason: TaskAbortReason? { record.abortReason }
     /// Checks that the record is running, then decodes its input and checkpoint.
     public init(_ record: TaskRecord) throws {
         guard case .running(let checkpoint, _) = record.state else {

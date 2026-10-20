@@ -34,7 +34,7 @@ extension PiSwiftDurableTests {
             #expect(cursor == ["after": 9_007_199_254_740_991, "order": .string(order.rawValue)])
             #expect(try scanStart(requested: nil, cursor: cursor, fallback: .descending).order == order)
             let other: ScanOrder = order == .ascending ? .descending : .ascending
-            #expect(throws: DurableStorageError.cursorOrderMismatch(stored: order, requested: other)) {
+            #expect(throws: StorageRequestError(DurableStorageError.cursorOrderMismatch(stored: order, requested: other))) {
                 try scanStart(requested: other, cursor: cursor, fallback: order)
             }
             for position: Double in [-9_007_199_254_740_991, -1, 0, 9_007_199_254_740_991] {
@@ -45,7 +45,7 @@ extension PiSwiftDurableTests {
                                      ["after": 9_007_199_254_740_992], ["after": -9_223_372_036_854_775_808],
                                      ["after": 1, "order": "sideways"], ["after": 1, "order": nil]]
         for cursor in invalid {
-            #expect(throws: DurableStorageError.invalidCursor) {
+            #expect(throws: StorageRequestError(DurableStorageError.invalidCursor)) {
                 try scanStart(requested: nil, cursor: cursor, fallback: .ascending)
             }
         }

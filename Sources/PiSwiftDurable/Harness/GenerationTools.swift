@@ -1,18 +1,10 @@
 import PiSwiftAI
 import PiSwiftChord
 
-/// The saved tool call and model context required for a tool task.
-public struct GenerationToolInput: Codable, Sendable {
-    /// The assistant entry that supplied this tool call.
-    public var assistant: EntryID
-    /// The model-supplied identifier of the tool call.
-    public var callId: String
-    /// Identifies the assistant entry and call ID that created the tool task.
-    public init(assistant: EntryID, callId: String) { self.assistant = assistant; self.callId = callId }
-}
 let generationToolKind = toolTask.kind
+/// A tool task for call `callId`, owned by the generation.
 func createGenerationTool(tx: Transaction, runtime: TaskRuntime, assistant: EntryID, callId: String) async throws -> TaskID {
-    try await tx.createTask(generationToolKind, input: GenerationToolInput(assistant: assistant, callId: callId),
+    try await tx.createTask(generationToolKind, input: .model(assistant: assistant, callId: callId),
                            options: .init(ownership: .task(taskId: runtime.taskId)))
 }
 func generationCalls(runtime: TaskRuntime, assistant: EntryID, callIds: [String], context: ChordContext) async throws -> [ToolCall] {
@@ -61,7 +53,10 @@ internal func finishToolRound(runtime: TaskRuntime, assistant: EntryID, tools: [
     let outcomes = try await runtime.outcomes(tools, context: context)
     var controls: [ToolControl?] = []
     for outcome in outcomes {
-        if case .completed(let result, _) = outcome { controls.append(try result["control"]?.decode(ToolControl.self)) }
+        // Version 1 results have no kind; every result a generation's round reads is a model-issued call's.
+        if case .completed(let result, _) = outcome, result["kind"] != .string("nested") {
+            controls.append(try result["control"]?.decode(ToolControl.self))
+        }
         else { controls.append(nil) }
     }
     let slots = try await runtime.snapshot(LiveDoc, conversationId: runtime.conversationId, context: context)?.tools ?? []
@@ -93,7 +88,7 @@ internal func finishToolRound(runtime: TaskRuntime, assistant: EntryID, tools: [
                 try endRun(tx: tx, live: live, taskId: runtime.taskId, settlement: .unanswered(reason: "reset"))
                 if !applied.users.isEmpty { try await startRun(tx: tx, conversationId: runtime.conversationId, live: live, inputs: applied.users) }
             } else {
-                try live.remove("tools")
+                try live.remove("tools"); try live.remove("nestedTools")
                 if let run = try live.child("run"), try run.get("taskId")?.decode(TaskID.self) == runtime.taskId {
                     try run.child("inputs")!.append(contentsOf: applied.users.map { try JSONValue(encoding: $0) })
                 }
@@ -104,19 +99,23 @@ internal func finishToolRound(runtime: TaskRuntime, assistant: EntryID, tools: [
     }, context: context)
 }
 
-/// Append selected tools in place, as agent.ts:85-97 requires.
+/// `addTools` of a tool round, applied to `tools` and `modelTools` in place (agent.ts `addTools`), so the next request
+/// offers the tools: an array gets each name it lacks appended, `{ remove }` loses the names, and an unset filter
+/// already lets every tool through, so nothing is written.
 func addGenerationTools(tx: Transaction, conversationId: ConversationID, added: [String]) async throws {
     let agent = try await tx.doc(AgentDoc, conversationId: conversationId)
-    guard let tools = try agent.get("tools") else { return }
-    if let values = tools.arrayValue, let draft = try agent.child("tools") {
-        var names = values.compactMap(\.stringValue)
-        for name in added where !names.contains(where: { harnessNamesEqual($0, name) }) {
-            try draft.append(.string(name)); names.append(name)
-        }
-    } else if let removed = tools["remove"]?.arrayValue {
-        let names = removed.compactMap(\.stringValue)
-        if names.contains(where: { name in added.contains { harnessNamesEqual($0, name) } }) {
-            try agent.set("tools", .object(["remove": .array(names.filter { name in !added.contains { harnessNamesEqual($0, name) } }.map(JSONValue.string))]))
+    for field in ["tools", "modelTools"] {
+        guard let filter = try agent.get(field) else { continue }
+        if let values = filter.arrayValue, let draft = try agent.child(field) {
+            var names = values.compactMap(\.stringValue)
+            for name in added where !names.contains(where: { harnessNamesEqual($0, name) }) {
+                try draft.append(.string(name)); names.append(name)
+            }
+        } else if let removed = filter["remove"]?.arrayValue {
+            let names = removed.compactMap(\.stringValue)
+            if names.contains(where: { name in added.contains { harnessNamesEqual($0, name) } }) {
+                try agent.set(field, .object(["remove": .array(names.filter { name in !added.contains { harnessNamesEqual($0, name) } }.map(JSONValue.string))]))
+            }
         }
     }
 }

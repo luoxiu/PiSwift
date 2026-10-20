@@ -12,8 +12,6 @@ public struct ReadAfterWrite: Error, Sendable, Equatable, CustomStringConvertibl
 public enum SessionError: Error, Sendable, Equatable, CustomStringConvertible {
     /// Session is closed.
     case closed
-    /// Session is poisoned by a failed commit after storage admission; reopen it.
-    case poisoned
     /// The submission or transaction already has a final state.
     case settled
     /// Session commit callback settled before its pending Tx operations.
@@ -25,7 +23,6 @@ public enum SessionError: Error, Sendable, Equatable, CustomStringConvertible {
     public var description: String {
         switch self {
         case .closed: "Session is closed"
-        case .poisoned: "Session is poisoned by a failed commit after storage admission; reopen it"
         case .settled: "Transaction has settled"
         case .pendingOperations: "Session commit callback settled before its pending Tx operations"
         case .message(let message): message

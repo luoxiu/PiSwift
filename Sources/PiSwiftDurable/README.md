@@ -3,7 +3,8 @@
 > **Experimental.** The API can change without notice between releases.
 
 PiSwiftDurable ports the library core of `@earendil-works/pi-durable` at
-[v1.1.0](https://github.com/earendil-works/pi/tree/v1.1.0/packages/durable).
+[v1.1.0](https://github.com/earendil-works/pi/tree/v1.1.0/packages/durable),
+plus the later upstream commits that `FLEET_FORK.md` lists as ported.
 It uses PiSwiftAI for model types and PiSwiftChord for JSON state and observation.
 The package requires macOS 15 or iOS 18. It uses Swift 6 strict concurrency.
 
@@ -107,7 +108,7 @@ let echo = try ToolRegistration(name: "echo", description: "Return text",
     parameters: ["type": "object", "properties": .object([
         "text": .object(["type": "string"])
     ]), "required": .array(["text"])], replay: .safe) { args, _, _ in
-        ToolExecutionResult(content: [.text(TextContent(
+        ToolExecutionResult(output: [.text(TextContent(
             text: args["text"]?.stringValue ?? ""))])
     }
 try registry.install(Extension(name: "echo", tools: [echo]))
@@ -120,6 +121,32 @@ API for commits, memos, owned tasks, output, details, models, and the host envir
 An extension can also supply `sections`, `hooks`, `wraps`, and `tasks`.
 Replacement keeps an extension's position. A running call keeps its selected code.
 The next call uses the new code (example 31).
+
+A result has three channels: `output` for the model, `structuredOutput` for programs that
+call the tool, and `details` for UIs. A tool that declares `structuredOutputSchema` returns
+a matching `structuredOutput`, which the Harness validates. Programs that call a tool without
+a schema get its bounded output: one text item as a string, one image as its JSON, nothing
+as `""`, and anything else as the content list. The transcript stores only `output` and
+`details`. A broken `structuredOutput` gives a nested call an `invalid_structured_output`
+error result. A model-issued call only loses it, and `onReport` gets the break.
+
+A tool calls another tool with `api.executeTool(_:arguments:options:context:)`. The nested
+call is its own `pi.tool` task, owned by the caller. It is validated, runs the tool hooks,
+whose `ToolHookCall` carries `parent`, and keeps its own output limits and replay policy.
+Its `NestedToolExecutionResult` returns to the caller, not the transcript. The result lives
+in the caller's `NestedResultDoc` until the caller settles. Nested calls show in
+`pi.live.nestedTools` and as tool events with `parentToolCallId` and `parentTaskId`.
+A key names each nested call: its position by default, or `options.key`. A replay-safe
+caller that reruns after a crash gets its nested calls back by key. A caller that is not
+replay-safe never reruns, so its unfinished nested calls are abandoned after a restart.
+Before a caller settles, it aborts the nested calls it left running.
+
+`callers` on a tool says who may call it: `.model`, `.tools`, or both by default.
+A conversation's `modelTools` narrows the tools the model is offered. Tools can still
+call the others. `Agent.callable` lists the tools nested calls resolve among.
+A task created with `abandonOnRestart` is aborted with reason `restart`, with its owned
+work, when a later Harness starts scheduling. Such a task waits for a missing definition
+instead of becoming orphaned. `runtime.abortOwned` aborts an owned task and waits for it.
 
 Busy input defaults to a follow-up. `.steer` joins after the tool round.
 `.reject` rejects busy admission. Writes append without a model call. Example 20 checks
@@ -218,7 +245,9 @@ changed line. It preserves BOM and uniform CRLF. Upstream and Swift normalize mi
 line endings to the first detected style. Unchanged fuzzy-match lines keep their text.
 
 `bash` streams raw output. The Harness keeps its tail. The environment saves full output
-to a spill file when needed. The host owns spill files. On iOS, LocalExecutionEnv returns
+to a spill file when needed. The host owns spill files. A nonzero exit is an error result
+with an `exit_code` diagnostic. `structuredOutput` repeats the retained output and the exit
+code for programs. A timeout throws. On iOS, LocalExecutionEnv returns
 `shellUnavailable`. The Harness converts this to an error result. A mobile host can
 select only the three file tools on an open `root`:
 
@@ -303,6 +332,23 @@ let cases = envConformanceCases(capabilities: .init(exec: false, symlinks: false
 for testCase in cases { try await testCase.run() }
 ```
 
+## Errors
+
+A storage error ends the Harness. The call that hit it throws the error. Every later call
+and every pending wait throws `SessionFailed`, whose `cause` is that error. Watches and
+event streams end with `.sessionFailed`. Running tasks get their abort signal. `onReport`
+gets the error once. The Harness then closes itself, and `closed` returns
+`.failed(error)`. After `close()`, `closed` returns `.closed`. Nothing retries: a custom
+storage retries its own transient failures. Reopen to recover. Commits are atomic, and a
+repeated `requestId` finds a submission that was already admitted.
+
+An invalid read fails only that call. Storages throw `StorageRequestError` for a bad
+cursor, an unknown conversation, or history a document does not keep. A read whose caller
+cancelled it also fails only itself. User code fails only its unit: a task phase faults
+its task, a tool gets an error result, and a hook is reported and skipped. A throwing
+commit or close listener is reported, and the other listeners still run. A throw in the
+Harness's own bookkeeping, such as a scheduler commit, fails the Harness.
+
 ## Swift Differences and Scope
 
 - Typed IDs, enums, optionals, errors, and Codable/Sendable values replace TypeScript
@@ -337,6 +383,14 @@ for testCase in cases { try await testCase.run() }
 - The JSONL operation gate stays held across suspended I/O and includes reads and close.
   It protects one storage instance. Typed decoding can reject corrupt state sooner.
   Edit normalization of mixed line endings is shared upstream behavior.
+- `StorageRequestError` wraps the built-in backends' `DurableStorageError` reason.
+  Listeners and `onReport` are synchronous, and `now()` cannot throw. Upstream containment
+  of rejected promises, foreign realms, unformattable values, and a throwing clock has no
+  Swift counterpart. `ToolHookCall` reads `ToolCall` members by dynamic member lookup.
+  Tool events carry a `DurableToolEventCall`. Nested summaries cut error text at 500 UTF-16
+  code units and repair a cut surrogate pair. Default nested-call keys follow the order in
+  which `executeTool` calls start running. Concurrent calls start in no fixed order, so a
+  replay-safe caller that runs them concurrently passes explicit keys.
 - This library has no CLI or TUI code. PowerShell and Windows process support are outside scope.
 
 Upstream examples 00–31 have Swift integration tests with assertions for the library

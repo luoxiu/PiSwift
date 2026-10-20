@@ -21,17 +21,21 @@ private final class ToolReported: Sendable {
         state.withLock { ToolReportSnapshot(output: output.snapshot(), details: $0.details, diagnostics: $0.diagnostics) }
     }
 }
+/// Throttled commits of what the tool reported into its slot, in `pi.live.tools` or `pi.live.nestedTools`, each writing
+/// only what changed since the last one; none when `publishes` is false.
 private actor ToolProgressWriter {
     let runtime: TaskRuntime
     let reported: ToolReported
+    let publishes: Bool
     let context: ChordContext
     var writtenText = ""
     var writtenDetails: JSONValue?
     var writtenDiagnostics = 0
-    init(runtime: TaskRuntime, reported: ToolReported, context: ChordContext) {
-        self.runtime = runtime; self.reported = reported; self.context = context
+    init(runtime: TaskRuntime, reported: ToolReported, publishes: Bool, context: ChordContext) {
+        self.runtime = runtime; self.reported = reported; self.publishes = publishes; self.context = context
     }
     func write() async throws -> Int {
+        guard publishes else { return 0 }
         let current = reported.snapshot()
         let added = Array(current.diagnostics.dropFirst(writtenDiagnostics))
         let detailsChanged = current.details != writtenDetails
@@ -68,10 +72,11 @@ internal final class ToolReporter: Sendable {
     private let lifetime: ToolInvocationLifetime
     private let events: AsyncStream<Event>.Continuation
     private let drain: Task<[ProgressWaiter], Never>
-    init(runtime: TaskRuntime, lifetime: ToolInvocationLifetime, limits: OutputLimits, context: ChordContext) {
+    init(runtime: TaskRuntime, lifetime: ToolInvocationLifetime, limits: OutputLimits, publishes: Bool = true,
+         context: ChordContext) {
         self.limits = limits; self.lifetime = lifetime
         let reported = ToolReported(limits); self.reported = reported
-        let writer = ToolProgressWriter(runtime: runtime, reported: reported, context: context)
+        let writer = ToolProgressWriter(runtime: runtime, reported: reported, publishes: publishes, context: context)
         let progress = Progress(write: { try await writer.write() }, onError: { error in
             if !runtime.signal.aborted { runtime.scheduler.report(error) }
         }, minIntervalMs: runtime.settings.progress.outputIntervalMs, clock: runtime.scheduler.clock)

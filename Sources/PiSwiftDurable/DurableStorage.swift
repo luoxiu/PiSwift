@@ -11,6 +11,10 @@ public struct EntryLookup: Sendable, Equatable, Codable {
 }
 
 /// Atomic storage for one Session. The Session serializes commits.
+/// An error a method throws is final: it fails the Session, which nothing retries, so retry transient failures inside
+/// the method. Two errors of a read fail only that read: a `StorageRequestError` for an invalid request (an unknown
+/// conversation, a foreign or malformed cursor, history a document does not keep), which must have no durable effect,
+/// and a rejection because its caller's context was aborted. Any error from `commit()` or `mintId()` is fatal.
 /// Storage trusts record references, ancestry, and transitions. It enforces atomicity,
 /// global ID ownership, immutable conversation and entry creation, document consistency,
 /// and detached values. Index keys (`kind`, document `key`, and `requestId`) must be
@@ -18,13 +22,14 @@ public struct EntryLookup: Sendable, Equatable, Codable {
 /// Context is the Chord context; Swift task cancellation does not replace it.
 public protocol DurableStorage: Sendable {
     /// Atomically stores the batch and returns a strictly increasing sequence; gaps are permitted.
-    /// Later reads see the batch after this returns. `StorageRejected` is permitted only
-    /// when no durable effect occurred. An unknown failure can have uncertain commit state.
+    /// Later reads see the batch after this returns. Any failure fails the Session: once a batch
+    /// is admitted, whether a failed one committed is unknown.
     /// Document copies read committed pre-batch state. Content precedes retirement regardless
     /// of write order; version changes require bases. The Session serializes these calls.
     func commit(_ writes: [StorageWrite], context: ChordContext) async throws -> Seq
 
-    /// Returns a fresh candidate ID from the one global numeric namespace. The kind is a phantom.
+    /// Returns a fresh candidate ID from the one global numeric namespace, greater than every ID minted or stored before,
+    /// also across reopen: scans order by ID as creation order, and the Harness relies on it. The kind is a phantom.
     /// Explicitly stored IDs also claim this namespace. Rejects when safe integer IDs are exhausted.
     func mintId<Kind: DurableIDKind>() async throws -> DurableID<Kind>
 

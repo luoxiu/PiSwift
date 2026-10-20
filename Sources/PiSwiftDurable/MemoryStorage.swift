@@ -177,7 +177,7 @@ public actor MemoryStorage: DurableStorage {
         var after: Int64?
         if let value = cursor?["after"] {
             guard let number = value.numberValue, let integer = Int64(exactly: number),
-                  integer >= -Seq.maximumRawValue, integer <= Seq.maximumRawValue else { throw DurableStorageError.invalidCursor }
+                  integer >= -Seq.maximumRawValue, integer <= Seq.maximumRawValue else { throw StorageRequestError(DurableStorageError.invalidCursor) }
             after = integer
         }
         let ids = tables.documentIdsByScope[MemoryScopeKey(query.scope)] ?? []
@@ -192,7 +192,7 @@ public actor MemoryStorage: DurableStorage {
 
     private func assertOpen() throws { if closed { throw DurableStorageError.closed(backend: "MemoryStorage") } }
     private func checkConversation(_ id: ConversationID) throws {
-        if tables.conversations[id] == nil { throw DurableStorageError.unknownConversation(id) }
+        if tables.conversations[id] == nil { throw StorageRequestError(DurableStorageError.unknownConversation(id)) }
     }
     private func visibleEntries(_ conversationId: ConversationID, minimum: Int64, maximum: Int64, order: ScanOrder) throws -> [EntryRecord] {
         try checkConversation(conversationId)

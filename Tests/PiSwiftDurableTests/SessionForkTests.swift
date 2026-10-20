@@ -245,17 +245,22 @@ private func forkCopies(_ writes: [StorageWrite]) -> [(DocumentCreate, DocumentC
         #expect(try await h.session.snapshot(copied, conversationId: parent, context: .background) == ["value": "initial"])
     }
 
-    // :553
-    @Test func ForkStorageRejectedKeepsSessionUsable() async throws {
+    // :552 "fails the Session on a rejected fork commit, which leaves no effect".
+    @Test func ForkRejectedCommitFailsSession() async throws {
         let h = try await openTestSession(); let parent = try await createConversation(h.session); let copied = try forkAsOf()
         let point = try await h.session.commit({ tx in _ = try await tx.doc(copied, conversationId: parent); return try await tx.appendEntry(parent, value: EntryDraft(kind: "point")).id }, context: .background)
-        await h.storage.failNextCommit(StorageRejected("copy rejected"))
+        let rejection = DiskGone()
+        await h.storage.failNextCommit(rejection)
         let ids = SessionTestLog<ConversationID>()
-        await forkExpectError("copy rejected") {
+        await #expect(throws: rejection) {
             try await h.session.commit({ tx in ids.append(try await tx.forkConversation(parent, at: point, ownership: .ownerless()).id) }, context: .background)
         }
-        #expect(try await h.storage.conversation(ids.values[0], context: .background) == nil)
-        let next = try await createConversation(h.session); #expect(try await h.storage.conversation(next, context: .background) != nil)
+        await expectSessionFailed(cause: rejection) {
+            _ = try await createConversation(h.session)
+        }
+        // The failed Session closed its Storage; reopened, it holds nothing of the batch.
+        #expect(endedFailed(await h.session.closed, rejection))
+        #expect(try await h.storage.reopen().conversation(ids.values[0], context: .background) == nil)
     }
 
     // :581

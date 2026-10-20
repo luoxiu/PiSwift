@@ -116,22 +116,26 @@ import PiSwiftDurableTesting
         #expect(try await compactionFirstUser(chat.root.context(context: .background).messages).contains("SECOND"))
         try await chat.harness.close(context: .background)
     }
-    // Upstream :2020.
-    @Test func rejectedClassificationCommitsNoUsageOrSummarySubmission() async throws {
+    // Upstream :2019.
+    @Test func failedClassificationCommitsNoUsageOrSummaryAndFailsHarness() async throws {
         let storage = ControlledStorage(), chat = try await compactionOpen(storage: storage)
         try await compactionHistory(chat)
         let before = try await chat.harness.usage(context: .background)
+        let failure = DiskGone()
         chat.script.appendSummary([.factory { _, _, _, _ in
-            await storage.failNextCommit(StorageRejected("rejected")); return chatAssistant("SUMMARY")
+            await storage.failNextCommit(failure); return chatAssistant("SUMMARY")
         }])
         let id = try await chat.root.compact(context: .background)
-        #expect(try await compactionOutcome(chat, id).status == "faulted")
-        #expect(try JSONValue(encoding: await chat.harness.usage(context: .background)) == JSONValue(encoding: before))
-        #expect(try await !compactionKinds(chat.root).contains("pi.compaction"))
-        #expect(try await chat.harness.inspect(context: .background).submissions.isEmpty)
-        #expect(try await storage.submissionByRequest(chat.root.id, requestId: "compaction:\(id.rawValue)", context: .background) == nil)
-        #expect(try await compactionLive(chat).compactions == nil)
+        #expect(endedFailed(await chat.harness.closed, failure))
         try await chat.harness.close(context: .background)
+        // Nothing of the failed commit landed: the task is still live, without usage, entry, or submission.
+        await storage.reopen()
+        #expect(try await storage.submissionByRequest(chat.root.id, requestId: "compaction:\(id.rawValue)", context: .background) == nil)
+        #expect(try await storage.task(id, context: .background)?.state.status != "terminal")
+        let reopened = try await compactionOpen(storage: storage, setup: chat.setup, script: chat.script, resume: false)
+        #expect(try JSONValue(encoding: await reopened.harness.usage(context: .background)) == JSONValue(encoding: before))
+        #expect(try await !compactionKinds(reopened.root).contains("pi.compaction"))
+        try await reopened.harness.close(context: .background)
     }
     // Upstream :2056.
     @Test func manualEqualCutReplacesBlockingSummaryAtFinalBoundary() async throws {

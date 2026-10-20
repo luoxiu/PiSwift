@@ -134,7 +134,8 @@ public struct HarnessOptions: Sendable {
     public var now: (@Sendable () -> Int64)?
     /// Runs inside the transaction that creates a conversation.
     public var conversationCreated: (@Sendable (Transaction, ConversationRecord) async throws -> Void)?
-    /// Receives nonfatal errors from handlers and observers.
+    /// Receives failures that do not fail the calling operation, such as a throwing hook or listener, and the error that
+    /// fails the Session, once.
     public var onReport: (@Sendable (any Error) -> Void)?
     /// Supplies host model, registry, clock, settings, and environment services.
     public init(models: any DurableModels, registry: any RegistryReader,

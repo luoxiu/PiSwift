@@ -23,3 +23,7 @@ public struct HarnessClosedError: Error, Sendable, CustomStringConvertible {
 }
 /// Creates the error returned by a closed harness.
 public func closedError() -> HarnessClosedError { HarnessClosedError() }
+/// What a closed Harness rejects with: `SessionFailed` with the cause when it closed because the Session failed.
+internal func closedError(_ session: Session) -> any Error {
+    session.failure.map { SessionFailed($0) } ?? HarnessClosedError()
+}

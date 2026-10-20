@@ -3,6 +3,9 @@ import Testing
 import PiSwiftChord
 @testable import PiSwiftDurable
 
+/// A settlement failure injected by these tests.
+private struct SettlementRejection: Error, Equatable { let message: String }
+
 extension SqliteStorage {
     func sqlitePrepareCounts() -> [String: Int] { (db as? AppleSqliteDatabase)?.prepareCounts ?? [:] }
 }
@@ -20,7 +23,7 @@ private final class RejectingSettlementExecutor: SqliteExecutor {
     func transaction<T>(_ body: (any SqliteExecutor) throws -> T) throws -> T {
         try delegate.transaction { handle in
             let value = try body(handle)
-            if reject { reject = false; throw StorageRejected("controlled settlement rejection") }
+            if reject { reject = false; throw SettlementRejection(message: "controlled settlement rejection") }
             return value
         }
     }
@@ -112,7 +115,7 @@ struct SqliteFacadeTests {
         #expect(try database.all("SELECT value FROM stale_probe") == [["value": .integer(1)]])
     }
 
-    @Test func failedRollbackChangesGuaranteedRejection() throws {
+    @Test func failedRollbackDoesNotPreserveCallbackError() throws {
         let database = try AppleSqliteDatabase(path: ":memory:")
         defer { try? database.close() }
         try database.exec("CREATE TABLE rollback_probe (value INTEGER)")
@@ -120,14 +123,14 @@ struct SqliteFacadeTests {
             try database.transaction { transaction in
                 try transaction.exec("INSERT INTO rollback_probe (value) VALUES (1)")
                 try transaction.exec("COMMIT")
-                throw StorageRejected("rejected after an escaped commit")
+                throw SettlementRejection(message: "rejected after an escaped commit")
             }
             Issue.record("Rollback failure accepted")
         } catch {
             let rollback = try #require(error as? SqliteRollbackError)
-            #expect(rollback.transactionError as? StorageRejected == StorageRejected("rejected after an escaped commit"))
+            #expect(rollback.transactionError as? SettlementRejection == SettlementRejection(message: "rejected after an escaped commit"))
             #expect(rollback.rollbackError is SqliteError)
-            #expect(!(error is StorageRejected))
+            #expect(!(error is SettlementRejection))
         }
         #expect(try database.get("SELECT value FROM rollback_probe") == ["value": .integer(1)])
     }
@@ -135,7 +138,7 @@ struct SqliteFacadeTests {
     @Test func adoptsIDsOnlyAfterSuccessfulSettlement() async throws {
         let storage = try await SqliteStorage.open(executor: RejectingSettlementExecutor())
         await storage.rejectNextSettlement()
-        await #expect(throws: StorageRejected.self) {
+        await #expect(throws: SettlementRejection.self) {
             _ = try await storage.commit([.entry(value: EntryRecord(id: EntryID(200), conversationId: rootConversationID, kind: "rejected"))], context: .background)
         }
         let first: EntryID = try await storage.mintId()

@@ -12,11 +12,13 @@ import PiSwiftChord
             .snapshot(.init(entries: [entry], run: .init(inputs: [submission.id]), generation: .init(attempt: 2, retry: .init(at: 40, error: "retry")))),
             .runStart(inputs: [submission.id]), .runEnd(inputs: [submission.id]), .turnStart, .turnEnd,
             .messageStart(message: ["role": "user", "content": "input"]), .messageUpdate(usage: ["input": 1], changes: []),
-            .messageEnd(entry: entry), .toolExecutionStart(toolCallId: "c1", toolName: "echo", args: ["text": "hello"]),
-            .toolExecutionUpdate(toolCallId: "c1", toolName: "echo", output: .delta(trimStart: 2, append: "hello"), details: .null, diagnostics: []),
-            .toolExecutionUpdate(toolCallId: "c1", toolName: "echo", output: .set("reset")),
-            .toolExecutionEnd(toolCallId: "c1", toolName: "echo", entry: entry),
-            .toolExecutionEnd(toolCallId: "c2", toolName: "echo"),
+            .messageEnd(entry: entry), .toolExecutionStart(call: .init(toolCallId: "c1", toolName: "echo", taskId: task), args: ["text": "hello"]),
+            .toolExecutionUpdate(call: .init(toolCallId: "c1", toolName: "echo"), output: .delta(trimStart: 2, append: "hello"), details: .null, diagnostics: []),
+            .toolExecutionUpdate(call: .init(toolCallId: "c1", toolName: "echo"), output: .set("reset")),
+            .toolExecutionEnd(call: .init(toolCallId: "c1", toolName: "echo"), entry: entry),
+            .toolExecutionEnd(call: .init(toolCallId: "c2", toolName: "echo")),
+            .toolExecutionEnd(call: .init(toolCallId: "c1/1", toolName: "echo", taskId: task, parentToolCallId: "c1", parentTaskId: task),
+                              result: .init(taskId: task, structuredOutput: "echo", isError: false, details: .null, durationMs: 3)),
             .inboxUpdate(items: [.init(id: submission.id, mode: .steer)]), .submission(record: submission),
             .autoRetryStart(attempt: 2, at: 50, errorMessage: "retry"), .autoRetryEnd(attempt: 2), .deferredPoll(pollAt: 60),
             .entryAppended(entry: entry), .agentChanged(agent: .init(instructions: "Use Swift")),
@@ -26,7 +28,7 @@ import PiSwiftChord
         ]
         let types = ["snapshot", "run_start", "run_end", "turn_start", "turn_end", "message_start", "message_update",
             "message_end", "tool_execution_start", "tool_execution_update", "tool_execution_update", "tool_execution_end",
-            "tool_execution_end", "inbox_update", "submission", "auto_retry_start", "auto_retry_end", "deferred_poll",
+            "tool_execution_end", "tool_execution_end", "inbox_update", "submission", "auto_retry_start", "auto_retry_end", "deferred_poll",
             "entry_appended", "agent_changed", "usage_changed", "task_failed", "compaction_start", "compaction_end"]
         for (event, type) in zip(events, types) {
             let json = try JSONValue(encoding: event)
@@ -67,10 +69,10 @@ import PiSwiftChord
         #expect(slot.details == .null)
         #expect(try JSONValue(encoding: slot)["details"] == .null)
         let previous = ToolSlot(callId: "c1", name: "echo", status: .running)
-        let update = try #require(durableToolUpdate([.set(["docs", "pi.live", "tools", 0, "details"], .null)], index: 0, slot: slot, previous: previous))
+        let update = try #require(durableToolUpdate([.set(["docs", "pi.live", "tools", 0, "details"], .null)], at: ["tools", 0], slot: .init(slot), previous: .init(previous)))
         #expect(update.details == .null)
         #expect(try JSONValue(encoding: DurableAgentSnapshot(tools: [slot]))["tools"]?[0]?["details"] == .null)
-        #expect(durableToolUpdate([], index: 0, slot: previous, previous: previous) == nil)
+        #expect(durableToolUpdate([], at: ["tools", 0], slot: .init(previous), previous: .init(previous)) == nil)
     }
 
     @Test func duplicateOldToolSlotsUseLastValueLikeUpstreamMap() throws {
@@ -82,7 +84,7 @@ import PiSwiftChord
         var held = Set<TaskID>()
         let events = try translateDurableEvents(conversationId: rootConversationID, before: before, after: after,
             viewOps: [.delete(["docs", "pi.live", "tools"])], publication: .init(seq: try Seq(1), changes: []), held: &held)
-        #expect(events == [.toolExecutionEnd(toolCallId: "c1", toolName: "last")])
+        #expect(events == [.toolExecutionEnd(call: .init(toolCallId: "c1", toolName: "last"))])
     }
 
     @Test func toolCallIDsAndOutputUseExactUnicodeUnits() throws {
@@ -97,7 +99,7 @@ import PiSwiftChord
         #expect(events.count == 2)
         var previous = ToolSlot(callId: "c1", name: "echo", status: .running); previous.output = "é"
         var slot = previous; slot.output = "e\u{301}"
-        let update = try #require(durableToolUpdate([], index: 0, slot: slot, previous: previous))
+        let update = try #require(durableToolUpdate([], at: ["tools", 0], slot: .init(slot), previous: .init(previous)))
         #expect(update.output == .set("e\u{301}"))
     }
 

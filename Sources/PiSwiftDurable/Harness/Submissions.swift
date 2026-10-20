@@ -105,9 +105,9 @@ internal final class Submissions: Sendable {
     init(session: Session, storage: any DurableStorage, now: @escaping @Sendable () -> Int64,
          settings: @escaping @Sendable () -> Settings, resume: @escaping @Sendable () -> Void) throws {
         self.session = session; self.storage = storage; self.now = now; self.settings = settings; self.resume = resume
-        let commits = try session.subscribeCommits { [weak self] publication, _ in self?.observe(publication) }
-        let close = try session.subscribeClose { [weak self] in
-            self?.state.withLock { $0.closed = true }; self?.waiters.rejectAll(closedError())
+        let commits = try session.observeCommits { [weak self] publication, _ in self?.observe(publication) }
+        let close = try session.subscribeClose { [weak self, session] in
+            self?.state.withLock { $0.closed = true }; self?.waiters.rejectAll(closedError(session))
         }
         state.withLock { $0.subscriptions = [commits, close] }
     }
@@ -136,7 +136,8 @@ internal final class Submissions: Sendable {
             try context.abortSignal?.throwIfAborted()
             guard let record = try await storage.submission(id, context: context) else { throw SessionError.message("Submission \(id.rawValue) does not exist") }
             if isSettled(record) { let promise = HarnessPromise<SettledSubmission>(); promise.finish(.success(SettledSubmission(record))); return promise }
-            if state.withLock({ $0.closed }) { throw closedError() }
+            // Close rejects registered waiters synchronously and may begin during the read.
+            if state.withLock({ $0.closed }) { throw closedError(session) }
             return try waiters.add(id, context: context)
         }
         return try await promise.value()

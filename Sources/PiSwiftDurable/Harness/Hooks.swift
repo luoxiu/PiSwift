@@ -65,16 +65,16 @@ public struct BeforeToolResult: Sendable {
     /// Selects replacement arguments or a reason to block the tool.
     public init(arguments: JSONObject? = nil, block: String? = nil) { self.arguments = arguments; self.block = block }
 }
-/// Callbacks that can block a tool or replace its arguments and result.
+/// Hooks of the built-in tool task, for model-issued and nested calls.
 public struct ToolHooks: Sendable {
-    /// Can change arguments or block the tool before execution.
-    public var beforeTool: (@Sendable (ToolCall, HookApi, ChordContext) async throws -> BeforeToolResult?)?
-    /// Can replace the result after tool execution.
-    public var afterTool: (@Sendable (ToolCall, ToolExecutionResult, HookApi, ChordContext) async throws -> ToolExecutionResult?)?
+    /// Before intent; the first `block` wins, otherwise `arguments` replace the call's arguments. A throw blocks.
+    public var beforeTool: (@Sendable (ToolHookCall, HookApi, ChordContext) async throws -> BeforeToolResult?)?
+    /// After execution, before the result is committed; replaces the result.
+    public var afterTool: (@Sendable (ToolHookCall, ToolExecutionResult, HookApi, ChordContext) async throws -> ToolExecutionResult?)?
     /// Selects optional callbacks before and after tool execution.
     public init(
-        beforeTool: (@Sendable (ToolCall, HookApi, ChordContext) async throws -> BeforeToolResult?)? = nil,
-        afterTool: (@Sendable (ToolCall, ToolExecutionResult, HookApi, ChordContext) async throws -> ToolExecutionResult?)? = nil
+        beforeTool: (@Sendable (ToolHookCall, HookApi, ChordContext) async throws -> BeforeToolResult?)? = nil,
+        afterTool: (@Sendable (ToolHookCall, ToolExecutionResult, HookApi, ChordContext) async throws -> ToolExecutionResult?)? = nil
     ) { self.beforeTool = beforeTool; self.afterTool = afterTool }
 }
 /// The context range and instructions offered to a compaction hook.

@@ -171,7 +171,7 @@ public actor SqliteStorage: DurableStorage {
         try assertOpen()
         let after: Int64
         if let value = cursor?["after"] {
-            guard let number = value.numberValue, let integer = Int64(exactly: number), integer >= -Seq.maximumRawValue, integer <= Seq.maximumRawValue else { throw DurableStorageError.invalidCursor }
+            guard let number = value.numberValue, let integer = Int64(exactly: number), integer >= -Seq.maximumRawValue, integer <= Seq.maximumRawValue else { throw StorageRequestError(DurableStorageError.invalidCursor) }
             after = integer
         } else { after = -1 }
         var params = scopeValues(query.scope) + [.integer(after)]
@@ -197,7 +197,7 @@ public actor SqliteStorage: DurableStorage {
         try db.get("SELECT record FROM \(table) WHERE id = ?", [.integer(id)]).map { try decodeRecord($0) }
     }
     func requireConversation(_ id: ConversationID) throws -> ConversationRecord {
-        guard let record: ConversationRecord = try readRecord("conversations", id: id.rawValue) else { throw DurableStorageError.unknownConversation(id) }
+        guard let record: ConversationRecord = try readRecord("conversations", id: id.rawValue) else { throw StorageRequestError(DurableStorageError.unknownConversation(id)) }
         return record
     }
     func readEntry(_ id: EntryID) throws -> EntryLookup? {
@@ -210,7 +210,7 @@ public actor SqliteStorage: DurableStorage {
     func materialize(_ executor: any SqliteExecutor, id: DocumentID, at: DocumentPoint) throws -> StoredDocument? {
         guard let row = try executor.get("SELECT record FROM documents WHERE id = ?", [.integer(id.rawValue)]) else { return nil }
         let record: DocumentRecord = try decodeRecord(row)
-        if case .sequence = at, record.memoryCurrentOnly { throw DurableStorageError.documentDoesNotRetainHistory(id) }
+        if case .sequence = at, record.memoryCurrentOnly { throw StorageRequestError(DurableStorageError.documentDoesNotRetainHistory(id)) }
         guard record.memoryAlive(at) else { return nil }
         let upper: Int64 = if case .sequence(let seq) = at { seq.rawValue } else { Seq.maximumRawValue }
         guard let base = try executor.get("SELECT seq, kind, version, content FROM document_revisions WHERE document_id = ? AND kind = 'base' AND seq <= ? ORDER BY seq DESC LIMIT 1", [.integer(id.rawValue), .integer(upper)]) else { throw DurableStorageError.documentMissingBase(id) }

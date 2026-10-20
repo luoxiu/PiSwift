@@ -1,3 +1,4 @@
+import PiSwiftAI
 import PiSwiftChord
 
 /// The active generation task and its admitted input submissions.
@@ -87,6 +88,104 @@ public struct ToolSlot: Sendable, Equatable, Codable {
         diagnostics = try recordOptional(object, "diagnostics"); entry = try recordOptional(object, "entry")
     }
 }
+/// Presentation of one nested call: a call a running tool made through `executeTool()`. `callId` is
+/// `<parentCallId>/<key>`, the call's ID in tool events and unique because keys contain no `/`. The Harness relates
+/// slots by task ID: `taskId` is the call's tool task, `parentTaskId` the calling one, model-issued or nested.
+public struct NestedToolSlot: Sendable, Equatable, Codable {
+    /// `<parentCallId>/<key>`: the call's ID in tool events.
+    public var callId: String
+    /// The call ID of the calling tool call.
+    public var parentCallId: String
+    /// The calling tool task, model-issued or nested.
+    public var parentTaskId: TaskID
+    /// The stable name used to resolve this definition in the registry.
+    public var name: String
+    /// The nested call's tool task.
+    public var taskId: TaskID
+    /// What the call was made with, replaced by the arguments it runs with, after repair, `beforeTool`, and coercion,
+    /// once it starts executing. A model-issued call's arguments are in its assistant entry instead.
+    public var arguments: JSONObject
+    /// The stored execution or submission state tag.
+    public var status: ToolSlot.Status
+    /// The retained text output visible for this tool call.
+    public var output: String?
+    /// The number of UTF-8 bytes removed from the full output.
+    public var droppedBytes: Int?
+    /// The number of lines removed from the full output.
+    public var droppedLines: Int?
+    /// Application-defined JSON details reported by a tool.
+    public var details: JSONValue?
+    /// The diagnostics reported by this tool call.
+    public var diagnostics: [ToolDiagnostic]?
+    /// Once done: how the call ended, for a status line. The result itself is in the caller's `NestedResultDoc`.
+    public var summary: NestedToolSummary?
+    /// Records a nested call and its initial execution status.
+    public init(callId: String, parentCallId: String, parentTaskId: TaskID, name: String, taskId: TaskID,
+                arguments: JSONObject, status: ToolSlot.Status = .pending, summary: NestedToolSummary? = nil) {
+        self.callId = callId; self.parentCallId = parentCallId; self.parentTaskId = parentTaskId; self.name = name
+        self.taskId = taskId; self.arguments = arguments; self.status = status; self.summary = summary
+    }
+    /// Decodes this value from its durable JSON representation.
+    public init(from decoder: any Decoder) throws {
+        let object = try recordObject(decoder)
+        callId = try recordRequired(object, "callId"); parentCallId = try recordRequired(object, "parentCallId")
+        parentTaskId = try recordRequired(object, "parentTaskId"); name = try recordRequired(object, "name")
+        taskId = try recordRequired(object, "taskId"); arguments = try recordRequired(object, "arguments")
+        status = try recordRequired(object, "status")
+        output = try recordOptional(object, "output"); droppedBytes = try recordOptional(object, "droppedBytes")
+        droppedLines = try recordOptional(object, "droppedLines")
+        // An explicit null is a reported value. Absence means no details were reported.
+        details = object["details"]
+        diagnostics = try recordOptional(object, "diagnostics"); summary = try recordOptional(object, "summary")
+    }
+    /// Encodes this value in the upstream key order.
+    public func encode(to encoder: any Encoder) throws {
+        var object = JSONObject()
+        try recordSet(&object, "callId", callId); try recordSet(&object, "parentCallId", parentCallId)
+        try recordSet(&object, "parentTaskId", parentTaskId); try recordSet(&object, "name", name)
+        try recordSet(&object, "taskId", taskId); object["arguments"] = .object(arguments)
+        try recordSet(&object, "status", status)
+        try recordSetOptional(&object, "output", output); try recordSetOptional(&object, "droppedBytes", droppedBytes)
+        try recordSetOptional(&object, "droppedLines", droppedLines)
+        if let details { object["details"] = details }
+        try recordSetOptional(&object, "diagnostics", diagnostics); try recordSetOptional(&object, "summary", summary)
+        try object.encode(to: encoder)
+    }
+}
+/// How a nested call ended: an error flag, its execution time, its spend, and up to 500 characters of error text.
+public struct NestedToolSummary: Sendable, Equatable, Codable {
+    /// Whether the call ended with an error result.
+    public var isError: Bool
+    /// Execution time of the attempt that produced the result.
+    public var durationMs: Int?
+    /// The call's spend.
+    public var usage: Usage?
+    /// Up to 500 characters of error text.
+    public var error: String?
+    /// Records how a nested call ended.
+    public init(isError: Bool, durationMs: Int? = nil, usage: Usage? = nil, error: String? = nil) {
+        self.isError = isError; self.durationMs = durationMs; self.usage = usage; self.error = error
+    }
+    /// Decodes this value from its durable JSON representation.
+    public init(from decoder: any Decoder) throws {
+        let object = try recordObject(decoder)
+        isError = try recordRequired(object, "isError"); durationMs = try recordOptional(object, "durationMs")
+        usage = try object["usage"].map(durableUsage); error = try recordOptional(object, "error")
+    }
+    /// Encodes this value in the upstream key order.
+    public func encode(to encoder: any Encoder) throws {
+        var object = JSONObject()
+        try recordSet(&object, "isError", isError); try recordSetOptional(&object, "durationMs", durationMs)
+        if let usage { object["usage"] = usageValue(usage) }
+        try recordSetOptional(&object, "error", error)
+        try object.encode(to: encoder)
+    }
+    /// Compares every field; usage compares its counters and costs.
+    public static func == (lhs: NestedToolSummary, rhs: NestedToolSummary) -> Bool {
+        lhs.isError == rhs.isError && lhs.durationMs == rhs.durationMs && lhs.error == rhs.error
+            && lhs.usage.map(usageValue) == rhs.usage.map(usageValue)
+    }
+}
 /// Progress and retry state for one active compaction.
 public struct CompactionStatus: Sendable, Equatable, Codable {
     /// The ID of the task bound to this value or invocation.
@@ -110,27 +209,38 @@ public struct LiveState: Sendable, Equatable, Codable {
     public var run: LiveRun?
     /// The current partial model response and retry state.
     public var generation: LiveGeneration?
-    /// The tool registrations or live tool slots in this value.
+    /// The current tool round in call order, from the tool-calling answer until the generation's `tools` phase ends it.
     public var tools: [ToolSlot]?
+    /// Nested calls of running tool calls, in creation order, so a parent precedes its children and task IDs ascend. A
+    /// call's nested slots are removed when the call settles.
+    public var nestedTools: [NestedToolSlot]?
     /// The active compaction tasks and their progress.
     public var compactions: [CompactionStatus]?
     /// Creates the visible state of active generation, tools, and compactions.
-    public init(run: LiveRun? = nil, generation: LiveGeneration? = nil, tools: [ToolSlot]? = nil, compactions: [CompactionStatus]? = nil) {
-        self.run = run; self.generation = generation; self.tools = tools; self.compactions = compactions
+    public init(run: LiveRun? = nil, generation: LiveGeneration? = nil, tools: [ToolSlot]? = nil,
+                nestedTools: [NestedToolSlot]? = nil, compactions: [CompactionStatus]? = nil) {
+        self.run = run; self.generation = generation; self.tools = tools; self.nestedTools = nestedTools
+        self.compactions = compactions
     }
 }
 /// The typed token for the built-in live conversation document.
+/// A complete base whenever nothing runs (spec section 8.2): no generation and no running tool or nested slot. A slot
+/// holds output only while running, so every base is small; a nested call's result lives in its caller's task
+/// documents, never here.
 public let LiveDoc = try! ConversationDocToken<LiveState>(kind: "pi.live", version: 1, fork: .initial,
     initial: { LiveState() }, checkpointWhen: { value, _, _ in
-        value["generation"] == nil && !(value["tools"]?.arrayValue ?? []).contains { $0.objectValue?["status"] == .string("running") }
+        let running = { (key: String) in (value[key]?.arrayValue ?? []).contains { $0.objectValue?["status"] == .string("running") } }
+        return value["generation"] == nil && !running("tools") && !running("nestedTools")
     })
 
+/// End the run owned by `taskId`: settle each of its inputs and remove `run`. Always removes `generation`, `tools`, and
+/// `nestedTools`, whose presentation belongs to the ending run.
 internal func endRun(tx: Transaction, live: JSONDraft, taskId: TaskID, settlement: SubmissionSettlement) throws {
     if let run = try live.get("run")?.decode(LiveRun.self), run.taskId == taskId {
         for id in run.inputs { try tx.settleSubmission(id, settlement: settlement) }
         try live.remove("run")
     }
-    try live.remove("generation"); try live.remove("tools")
+    try live.remove("generation"); try live.remove("tools"); try live.remove("nestedTools")
 }
 internal func startRun(tx: Transaction, conversationId: ConversationID, live: JSONDraft, inputs: [SubmissionID]) async throws {
     let id = try await createGeneration(tx: tx, conversationId: conversationId)
@@ -140,20 +250,53 @@ internal func handOver(live: JSONDraft, from: TaskID, to: TaskID) throws {
     guard let run = try live.child("run"), try run.get("taskId")?.decode(TaskID.self) == from else { return }
     try run.set("taskId", JSONValue(encoding: to))
 }
+/// The slot of tool task `taskId`, model-issued or nested, if `pi.live` still lists it. Nested slots are found by binary
+/// search: a tool may make thousands of nested calls, each of which looks up its slot in several commits. Their task IDs
+/// ascend: each slot is appended in the commit that creates its task, task IDs ascend in commit order, and removal keeps
+/// the order.
 internal func toolSlot(live: JSONDraft, taskId: TaskID) throws -> JSONDraft? {
-    guard let slots = try live.child("tools") else { return nil }
-    for index in 0..<(try slots.count()) {
-        if let slot = try slots.child(index), try slot.get("taskId")?.decode(TaskID.self) == taskId { return slot }
+    if let slots = try live.child("tools") {
+        for index in 0..<(try slots.count()) {
+            if let slot = try slots.child(index), try slot.get("taskId")?.decode(TaskID.self) == taskId { return slot }
+        }
+    }
+    guard let nested = try live.child("nestedTools") else { return nil }
+    var low = 0, high = try nested.count() - 1
+    while low <= high {
+        let middle = (low + high) / 2
+        guard let candidate = try nested.child(middle), let id = try candidate.get("taskId")?.decode(TaskID.self) else { return nil }
+        if id == taskId { return candidate }
+        if id < taskId { low = middle + 1 } else { high = middle - 1 }
     }
     return nil
 }
+/// Whether a slot draft is a nested call's.
+internal func isNestedSlot(_ slot: JSONDraft) throws -> Bool { try slot.get("parentTaskId") != nil }
+/// Remove what a tool published while running; its result or a rerun replaces it.
 internal func clearProgress(slot: JSONDraft) throws {
     for key in ["output", "droppedBytes", "droppedLines", "details", "diagnostics"] { try slot.remove(key) }
 }
-internal func finishSlot(slot: JSONDraft, entry: EntryID?) throws {
+/// Mark a slot done and clear its running output; the caller sets a model-issued call's result `entry`, or a nested
+/// call's `summary`. Neither is set when the task faulted or was orphaned.
+internal func finishSlot(slot: JSONDraft) throws {
     try slot.set("status", .string("done"))
-    if let entry { try slot.set("entry", JSONValue(encoding: entry)) }
     try clearProgress(slot: slot)
+}
+/// Remove the nested slots below tool task `taskId`, transitively; the list holds parents before their children.
+internal func removeNestedSlots(live: JSONDraft, taskId: TaskID) throws {
+    guard let nested = try live.child("nestedTools") else { return }
+    var removed: Set<TaskID> = [taskId]
+    var parents: [TaskID?] = []
+    for index in 0..<(try nested.count()) {
+        let slot = try nested.get(index)?.objectValue
+        let parent = try slot?["parentTaskId"]?.decode(TaskID.self)
+        parents.append(parent)
+        if let parent, removed.contains(parent), let id = try slot?["taskId"]?.decode(TaskID.self) { removed.insert(id) }
+    }
+    for index in parents.indices.reversed() where parents[index].map(removed.contains) == true {
+        try nested.splice(index, deleteCount: 1)
+    }
+    if try nested.count() == 0 { try live.remove("nestedTools") }
 }
 internal func addCompactionStatus(live: JSONDraft, status: CompactionStatus) throws {
     if try live.child("compactions") == nil { try live.set("compactions", .array([])) }
@@ -176,7 +319,11 @@ internal func removeCompactionStatus(live: JSONDraft, taskId: TaskID) throws {
 internal func settleSchedulerOutcome(tx: Transaction, record: TaskRecord, outcome: TaskOutcome) async throws {
     guard ["pi.generation", "pi.tool", "pi.compaction"].contains(record.kind) else { return }
     let live = try await tx.doc(LiveDoc, conversationId: record.conversationId)
-    if record.kind == "pi.tool" { if let slot = try toolSlot(live: live, taskId: record.id) { try finishSlot(slot: slot, entry: nil) }; return }
+    if record.kind == "pi.tool" {
+        if let slot = try toolSlot(live: live, taskId: record.id) { try finishSlot(slot: slot) }
+        try removeNestedSlots(live: live, taskId: record.id)
+        return
+    }
     if record.kind == "pi.compaction" { try removeCompactionStatus(live: live, taskId: record.id); return }
     guard try live.get("run")?.decode(LiveRun.self).taskId == record.id else { return }
     try await convertPartial(tx: tx, live: live, conversationId: record.conversationId)

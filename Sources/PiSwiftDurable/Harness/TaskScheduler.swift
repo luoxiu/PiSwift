@@ -72,6 +72,9 @@ internal final class TaskScheduler: Sendable {
         var pumping = false
         var worker: Task<Void, Never>?
         var cascadePending = false
+        /// Live tasks with `abandonOnRestart` found at open, from an earlier Harness. The first reservation pass
+        /// abort-marks them with reason `restart`, so nothing of them or below them runs a phase again.
+        var abandoned: Set<TaskID> = []
         var reconcileScheduled = false
         var reconciles: [UUID: Task<Void, Never>] = [:]
         var subscriptions: [SessionSubscription] = []
@@ -102,7 +105,7 @@ internal final class TaskScheduler: Sendable {
     func records() -> [TaskRecord] { state.withLock { state in state.order.compactMap { state.live[$0] } } }
     func current(_ id: TaskID) -> TaskRecord? { state.withLock { $0.live[id] } }
     func open(context: ChordContext) async throws {
-        let commits = try session.subscribeCommits { [weak self] publication, _ in self?.observe(publication) }
+        let commits = try session.observeCommits { [weak self] publication, _ in self?.observe(publication) }
         let close = try session.subscribeClose { [weak self] in self?.seal() }
         let unsubscribe = registry.subscribe { [weak self] in self?.kick() }
         state.withLock { $0.subscriptions = [commits, close]; $0.unsubscribe = unsubscribe }
@@ -112,7 +115,10 @@ internal final class TaskScheduler: Sendable {
                 found += try await scanAll { cursor in try await tx.scanTasks(.init(status: status), limit: 256, cursor: cursor) }
             }
             state.withLock { state in
-                for record in found { state.live[record.id] = record; state.nodes[record.id] = record; state.order.append(record.id) }
+                for record in found {
+                    state.live[record.id] = record; state.nodes[record.id] = record; state.order.append(record.id)
+                    if record.abandonOnRestart { state.abandoned.insert(record.id) }
+                }
             }
             for record in found {
                 if case .running(let checkpoint, _) = record.state { try tx.setTask(record.replacing(state: .pending(checkpoint: checkpoint))) }
@@ -122,22 +128,31 @@ internal final class TaskScheduler: Sendable {
         scheduleReconcile()
     }
     func resume() { state.withLock { $0.enabled = true }; kick() }
+    /// Signal every invocation and wait for them; writes nothing. Close calls this after every close listener has run,
+    /// so waits, watches, and streams a task holds end with the Session's reason, not as cancelled by its signal.
     func join() async {
         let (invocations, worker, reconciles) = state.withLock { (Array($0.joining.values), $0.worker, Array($0.reconciles.values)) }
+        for invocation in invocations { invocation.controller.abort() }
         for invocation in invocations { _ = try? await invocation.done.value() }
         await worker?.value
         for work in reconciles { await work.value }
     }
+    /// Close listener: runs synchronously once admission is sealed, before `join()`, or when the Session fails.
     private func seal() {
-        let (invocations, expiry, unsubscribe) = state.withLock { state in
+        let (expiry, unsubscribe) = state.withLock { state in
             state.closing = true; state.contexts = [:]
             let expiry = state.expiry; state.expiry = nil; state.expiryAt = nil
             let unsubscribe = state.unsubscribe; state.unsubscribe = nil
-            return (Array(state.joining.values), expiry, unsubscribe)
+            return (expiry, unsubscribe)
         }
         unsubscribe?(); expiry?.cancel()
-        taskWaiters.rejectAll(closedError()); idleWaiters.rejectAll(closedError())
-        for invocation in invocations { invocation.controller.abort() }
+        taskWaiters.rejectAll(closedError(session)); idleWaiters.rejectAll(closedError(session))
+    }
+    /// Fail the Session, which reports it, for a throw in one of the scheduler's own commits; ignored once closing.
+    /// Close seals the Session before its listeners seal the scheduler, and another thread can commit in between, so
+    /// the Session's own closing counts too: a commit refused by close is not a failure.
+    func failSession(_ error: any Error) {
+        if !closing && !session.isClosing { session.fail(error) }
     }
     private func observe(_ publication: CommitPublication) {
         var aborts: [TaskInvocation] = [], settled: [TaskRecord] = [], updated: [TaskRecord] = []
@@ -161,6 +176,8 @@ internal final class TaskScheduler: Sendable {
                             state.cascadePending = true
                             if let invocation = state.invocations[record.id], !invocation.abort { aborts.append(invocation) }
                         }
+                        // A request replacing a `restart` mark upgrades the marks of the work below.
+                        if previous?.abortReason != nil && record.abortReason == nil { state.cascadePending = true }
                         if record.state.status == "completing" && previous?.state.status != "completing" {
                             repair = true
                             if record.abortRequested || record.failedOutcome { state.cascadePending = true }
@@ -216,7 +233,10 @@ internal final class TaskScheduler: Sendable {
                     let reservations = try await reserve()
                     for reservation in reservations { start(reservation) }
                 }
-            } catch { if !closing { report(error) } }
+            } catch {
+                // As in `reconcile()`: the reservation commit runs no extension code but `migrate`, whose throw is caught.
+                failSession(error)
+            }
             settleIdle()
         }
     }
@@ -230,7 +250,11 @@ internal final class TaskScheduler: Sendable {
                 guard let self else { return }
                 self.state.withLock { $0.reconcileScheduled = false; $0.cascadePending = false }
                 do { try await self.reconcile() }
-                catch { self.state.withLock { $0.cascadePending = true }; if !self.closing { self.report(error) } }
+                catch {
+                    // No extension code runs in this commit: a throw is a storage failure, a host callback, or a bug.
+                    // None is fixed by running the pass again, so it fails the Session, which reports it.
+                    self.failSession(error)
+                }
                 self.settleIdle()
                 _ = self.state.withLock { $0.reconciles.removeValue(forKey: id) }
             }
@@ -310,14 +334,16 @@ internal final class TaskScheduler: Sendable {
         }
         return conversationId == nil
     }
-    func belowCancelled(_ start: OwnershipUp) -> Bool {
+    func belowCancelled(_ start: OwnershipUp) -> Bool { cancellingOwner(start) != nil }
+    /// The nearest live owner above `start` whose cancellation intent reaches it, if any; see `belowCancelled`.
+    func cancellingOwner(_ start: OwnershipUp) -> TaskRecord? {
         for step in above(start) {
             if case .task(let record) = step {
-                if let live = current(record.id), live.abortRequested || live.failedOutcome { return true }
-                if record.background { return false }
+                if let live = current(record.id), live.abortRequested || live.failedOutcome { return live }
+                if record.background { return nil }
             }
         }
-        return false
+        return nil
     }
     func idle(_ id: ConversationID?) -> Bool { !records().contains { !$0.background && inScope($0.parent, conversationId: id) != false } }
     func waitingOn(_ record: TaskRecord, owned: Set<TaskID>) -> [TaskID] {
@@ -330,9 +356,21 @@ internal final class TaskScheduler: Sendable {
             guard !closing else { return }
             try await loadScopes()
             let queued = try await loadQueuedScopes()
-            var marks = Set<TaskID>()
+            // A cascade from an abandoned owner passes its `restart` reason on; any other intent marks, or upgrades a
+            // `restart` mark, as a request. Collected first, so a request wins over a `restart` mark of the same pass.
+            var marks: [TaskID: (record: TaskRecord, reason: TaskAbortReason?)] = [:], order: [TaskID] = []
+            func mark(_ record: TaskRecord, _ reason: TaskAbortReason?) {
+                if let staged = marks[record.id], staged.reason == nil { return }
+                if record.abortRequested && (record.abortReason == nil || reason != nil) { return }
+                if marks[record.id] == nil { order.append(record.id) }
+                marks[record.id] = (record, reason)
+            }
+            // Loading edges can reveal a cancelled owner, so marks are derived on every pass.
             for record in records() {
-                if !record.background && belowCancelled(record.parent) { marks.insert(record.id) }
+                if !record.background, let owner = cancellingOwner(record.parent) {
+                    // Only an owner abandoned after a restart, and nothing else, passes its reason on.
+                    mark(record, owner.abortReason == .restart && !owner.failedOutcome ? .restart : nil)
+                }
                 if case .waiting(_, let on, .failFast, _) = record.state {
                     var failed = false
                     for id in on {
@@ -340,10 +378,11 @@ internal final class TaskScheduler: Sendable {
                         if let live = current(id) { found = live } else { found = try await storage.task(id, context: context) }
                         if found?.failedOutcome == true { failed = true; break }
                     }
-                    if failed { for id in on { if let live = current(id), !live.failedOutcome { marks.insert(id) } } }
+                    // Every other live task: the failed one keeps its own outcome.
+                    if failed { for id in on { if let live = current(id), !live.failedOutcome { mark(live, nil) } } }
                 }
             }
-            for id in marks { if let record = current(id), !record.abortRequested { try tx.setTask(record.replacing(abortRequested: true)) } }
+            for id in order { let staged = marks[id]!; try tx.setTask(staged.record.withAbortMark(staged.reason)) }
             for id in queued where belowCancelled(.conversation(id)) { try await withdrawInputs(tx, id) }
             while true {
                 let overlay = try TaskOverlay(tx), owned = ownedLive(overlay)
@@ -374,15 +413,30 @@ internal final class TaskScheduler: Sendable {
         return (nil, nil, true)
     }
     struct Reservation: Sendable { let invocation: TaskInvocation; let definition: AnyTaskDefinition; let snapshot: RegistrySnapshot; let joinID: UUID }
+    /// Reserve every eligible task in one commit; orphan abort-marked tasks no definition can take, unless abandoned
+    /// after a restart. The first pass after open only abort-marks the abandoned tasks, so later passes see the marks.
     private func reserve() async throws -> [Reservation] {
         var reservations: [Reservation] = []
+        var abandoned: [TaskID] = []
         do {
             try await session.commit({ tx in
                 guard !closing else { return }
+                let pending = state.withLock { Array($0.abandoned) }
+                for id in pending {
+                    if let record = current(id), !record.abortRequested { try tx.setTask(record.withAbortMark(.restart)) }
+                }
+                if !pending.isEmpty { abandoned = pending; return }
                 try await loadScopes()
                 let owned = ownedLive(), snapshot = registry.snapshot()
                 for original in records() {
                     if state.withLock({ $0.invocations[original.id] != nil }) || original.state.status == "completing" || !waitingOn(original, owned: owned).isEmpty { continue }
+                    // Work below an owner with cancellation intent waits for its cascade mark instead of running a phase;
+                    // schedule the cascade, which may not have run yet.
+                    if !original.abortRequested && !original.background && belowCancelled(original.parent) {
+                        state.withLock { $0.cascadePending = true }
+                        scheduleReconcile()
+                        continue
+                    }
                     var record = original
                     let definition = snapshot.task(name: record.kind)
                     var resolution = fit(record, definition: definition)
@@ -397,7 +451,10 @@ internal final class TaskScheduler: Sendable {
                         }
                     }
                     if let reason = resolution.reason {
-                        if record.abortRequested { try await terminate(tx, record: record, outcome: .orphaned(reason: reason)) }
+                        // An abandoned task waits for its definition, so its abort handler can clean up.
+                        if record.abortRequested && record.abortReason == nil {
+                            try await terminate(tx, record: record, outcome: .orphaned(reason: reason))
+                        }
                         continue
                     }
                     guard let definition, let checkpoint = record.state.checkpoint else { continue }
@@ -409,11 +466,18 @@ internal final class TaskScheduler: Sendable {
                     reservations.append(Reservation(invocation: invocation, definition: definition, snapshot: snapshot, joinID: id))
                 }
             }, context: context)
-            return reservations
         } catch {
             for reservation in reservations { end(reservation.invocation); finish(reservation) }
             throw error
         }
+        // Marked, or already marked or gone: done with them. Reserve again, now seeing the marks.
+        if !abandoned.isEmpty {
+            state.withLock { state in
+                for id in abandoned { state.abandoned.remove(id) }
+                state.dirty = true
+            }
+        }
+        return reservations
     }
     private func start(_ reservation: Reservation) {
         let work = Task {
@@ -450,7 +514,11 @@ internal final class TaskScheduler: Sendable {
                     return nil
                 }
             }, context: context)
-        } catch { end(invocation); if !closing { report(error) }; return nil }
+        } catch {
+            // The step writes the scheduler's own decision, a fault or a terminal record; a throw there would otherwise
+            // leave the task running, to be reserved and run again.
+            end(invocation); failSession(error); return nil
+        }
     }
     private func run(_ reservation: Reservation) async {
         let invocation = reservation.invocation, phase = RuntimePhase(reservation.definition, reservation.snapshot)
@@ -466,6 +534,12 @@ internal final class TaskScheduler: Sendable {
         while true {
             let found = await step(invocation) { tx, current in
                 if current.abortRequested { return .end }
+                // An owner's cancellation intent ends it too, before its cascade marks it; reservation then holds it back.
+                if !current.background && belowCancelled(current.parent) {
+                    state.withLock { $0.cascadePending = true }
+                    scheduleReconcile()
+                    return .end
+                }
                 guard let previous else { return .proceed }
                 if let failure { return .fault(failure) }
                 if jsonStructurallyEqual(current.state.checkpoint!, previous) {
@@ -521,8 +595,17 @@ internal extension TaskRecord {
         let next = state ?? self.state
         return TaskRecord(id: id, conversationId: conversationId, kind: kind, version: version ?? self.version,
                           input: input ?? self.input, state: next, owner: owner, background: background,
-                          abortRequested: abortRequested ?? self.abortRequested, startedAt: startedAt, endedAt: endedAt,
+                          abortRequested: abortRequested ?? self.abortRequested, abortReason: abortReason,
+                          abandonOnRestart: abandonOnRestart, startedAt: startedAt, endedAt: endedAt,
                           memos: next.outcome == nil ? (memos ?? self.memos) : nil, extensionFields: extensionFields)
+    }
+    /// The record with an abort mark: `restart` for an abandonment; without a reason, a request, which replaces
+    /// `restart`.
+    func withAbortMark(_ reason: TaskAbortReason? = nil) -> TaskRecord {
+        TaskRecord(id: id, conversationId: conversationId, kind: kind, version: version, input: input, state: state,
+                   owner: owner, background: background, abortRequested: true, abortReason: reason,
+                   abandonOnRestart: abandonOnRestart, startedAt: startedAt, endedAt: endedAt, memos: memos,
+                   extensionFields: extensionFields)
     }
 }
 internal func jsonStructurallyEqual(_ lhs: JSONValue, _ rhs: JSONValue) -> Bool {

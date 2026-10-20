@@ -17,26 +17,27 @@ import PiSwiftDurableTesting
             try tx.setTask(record.replacing(state: .running(checkpoint: ["phase": "run"])))
         }, context: .background)
         let reader = countingReader(createRegistry()); let held = await storage.holdCommits()
-        await storage.failNextCommit(StorageRejected("disk full"))
+        await storage.failNextCommit(TestFailure("disk full"))
         let caller = ChordContext.background.withCancel()
         let opening = Task { try await Harness.open(storage: storage, options: .init(models: FakeDurableModels(), registry: reader), context: caller.context) }
-        await held.waitUntilEntered(); caller.cancel(StorageRejected("caller gave up")); await held.release()
+        await held.waitUntilEntered(); caller.cancel(TestFailure("caller gave up")); await held.release()
         do { _ = try await opening.value; Issue.record("Open must fail") }
         catch { #expect(String(describing: error).contains("disk full")) }
         #expect(reader.subscriptionCount == 0)
         await #expect(throws: (any Error).self) { _ = try await storage.scanTasks(.init(), limit: 1, cursor: nil, context: .background) }
     }
-    // harness-lifecycle.test.ts:105
-    @Test func failedOpenReportsCloseFailureAndKeepsOpenFailure() async throws {
+    // harness-lifecycle.test.ts:105 "rethrows the open error and reports it once, though closing then fails too"
+    @Test func failedOpenReportsOpenFailureOnceThoughCloseFails() async throws {
         let base = ControlledStorage(); let session = try await Session.open(storage: base, context: .background)
         try await seedFacadeRunningTask(session)
-        await base.failNextCommit(StorageRejected("disk full"))
+        await base.failNextCommit(TestFailure("disk full"))
         let reports = HarnessReports()
         do {
             _ = try await Harness.open(storage: HarnessFailingCloseStorage(base: base), options: .init(models: FakeDurableModels(), registry: createRegistry(), onReport: { reports.append($0) }), context: .background)
             Issue.record("Open must fail")
         } catch { #expect(String(describing: error).contains("disk full")) }
-        #expect(reports.values.map { String(describing: $0) } == ["close failed"])
+        // The storage failure that failed open is the cause; the close that fails after it adds no report.
+        #expect(reports.values.map { String(describing: $0) } == ["disk full"])
     }
     // harness-lifecycle.test.ts:197
     @Test func newHarnessRunsNoOldInvocationAfterClose() async throws {
@@ -74,7 +75,7 @@ import PiSwiftDurableTesting
         try harness.resume(); await entered.wait()
         let caller = ChordContext.background.withCancel()
         let first = Task { try await harness.close(context: caller.context) }
-        try await harnessEventually { harness.tasks.closing }; caller.cancel(StorageRejected("stop waiting"))
+        try await harnessEventually { harness.tasks.closing }; caller.cancel(TestFailure("stop waiting"))
         do { try await first.value; Issue.record("Close waiter must cancel") }
         catch { #expect(String(describing: error).contains("stop waiting")) }
         await #expect(throws: HarnessClosedError.self) { _ = try await harness.root(context: .background) }
@@ -89,7 +90,7 @@ import PiSwiftDurableTesting
         let storage = ControlledStorage(); let h = try await openHarness(storage: storage); let root = try await h.harness.root(context: .background)
         let held = await storage.holdCommits(); let caller = ChordContext.background.withCancel()
         let commit = Task { try await root.commit({ tx in try await tx.appendEntry(root.id, value: EntryDraft(kind: "note")) }, context: caller.context) }
-        await held.waitUntilEntered(); caller.cancel(StorageRejected("committer gave up")); await held.release()
+        await held.waitUntilEntered(); caller.cancel(TestFailure("committer gave up")); await held.release()
         let entry = try await commit.value
         let page = try await root.entries(limit: 10, context: .background); #expect(page.items.map(\.id) == [entry.id])
         try await h.harness.close(context: .background)
@@ -117,7 +118,7 @@ import PiSwiftDurableTesting
         await held.waitUntilEntered()
         let caller = ChordContext.background.withCancel()
         let acquire = Task { try await h.harness.watchDoc(token, context: caller.context) }
-        caller.cancel(StorageRejected("stop acquisition")); await held.release(); try await blocking.value
+        caller.cancel(TestFailure("stop acquisition")); await held.release(); try await blocking.value
         await #expect(throws: (any Error).self) { _ = try await acquire.value }
         try await h.harness.close(context: .background)
     }

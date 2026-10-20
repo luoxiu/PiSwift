@@ -32,45 +32,6 @@ import PiSwiftDurableTesting
         try await harness.close(context: .background)
     }
 
-    // upstream harness-tasks.test.ts:774
-    @Test func wakeupDuringRejectedReservationIsKept() async throws {
-        let storage = ControlledStorage(), registry = Registry()
-        let first = harnessOneStep("test.wake-first") { _, runtime, context in
-            try await runtime.commit({ _, _ in .terminal(outcome: .completed(result: .null)) }, context: context)
-        }
-        let late = harnessOneStep("test.wake-late") { _, runtime, context in
-            try await runtime.commit({ _, _ in .terminal(outcome: .completed(result: .null)) }, context: context)
-        }
-        let opened = try await openTasks(storage: storage, tasks: [AnyTaskDefinition(first)], registry: registry)
-        let harness = opened.harness, root = try await harness.root(context: .background)
-        let firstID = try await harnessStart(root, first), lateID = try await harnessStart(root, late)
-        let held = await storage.holdCommits()
-        await storage.failNextCommit(StorageRejected("busy"))
-        try harness.resume(); await held.waitUntilEntered()
-        try registry.install(Extension(name: "late", tasks: [AnyTaskDefinition(late)]))
-        await held.release()
-        #expect(try await harness.waitForTask(id: firstID, context: .background).outcome.status == "completed")
-        #expect(try await harness.waitForTask(id: lateID, context: .background).outcome.status == "completed")
-        #expect(opened.reports.count == 1)
-        try await harness.close(context: .background)
-    }
-
-    // upstream harness-tasks.test.ts:797
-    @Test func rejectedFaultWriteRerunsTheTask() async throws {
-        let storage = ControlledStorage(), runs = Mutex(0)
-        let definition = harnessOneStep("test.retry-fault") { _, _, _ in
-            let run = runs.withLock { $0 += 1; return $0 }
-            if run == 1 { await storage.failNextCommit(StorageRejected("busy")) }
-            throw TaskDefinitionError("boom")
-        }
-        let opened = try await openTasks(storage: storage, tasks: [AnyTaskDefinition(definition)])
-        let harness = opened.harness, root = try await harness.root(context: .background), id = try await harnessStart(root, definition)
-        #expect(try await harness.waitForTask(id: id, context: .background).outcome == .faulted(error: .init(message: "boom")))
-        #expect(runs.withLock { $0 } == 2)
-        #expect(opened.reports.count == 1)
-        try await harness.close(context: .background)
-    }
-
     // upstream harness-tasks.test.ts:1067
     @Test func repeatedAbortLeavesAbortInvocationSignalAlone() async throws {
         let runEntered = SessionTestGate(), runRelease = SessionTestGate(), abortEntered = SessionTestGate(), abortRelease = SessionTestGate()

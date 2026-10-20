@@ -8,10 +8,11 @@ import PiSwiftDurableTesting
 func toolTestApi(env: (any ExecutionEnv)? = nil,
                  output: @escaping @Sendable (ToolOutputChunk, ShellOutputSkip?) throws -> Void = { _, _ in },
                  diagnostic: @escaping @Sendable (ToolDiagnostic) throws -> Void = { _ in },
-                 outputWindow: ShellOutputWindow? = nil) throws -> ToolExecutionApi {
+                 outputWindow: ShellOutputWindow? = nil,
+                 retainedOutput: @escaping @Sendable () throws -> RetainedToolOutput = { .init(text: "", truncated: false) }) throws -> ToolExecutionApi {
     ToolExecutionApi(taskId: try TaskID(2), conversationId: rootConversationID, callId: "tool-test",
         registry: .init(), models: FakeDurableModels(), env: env, outputWindow: outputWindow,
-        agent: { _ in Agent() }, output: output, diagnostic: diagnostic)
+        agent: { _ in Agent() }, output: output, diagnostic: diagnostic, retainedOutput: retainedOutput)
 }
 
 final class ToolTestReports: Sendable {
@@ -35,7 +36,7 @@ final class ToolTestReports: Sendable {
             }
         }, diagnostic: { [self] diagnostic in
             state.withLock { $0.diagnostics.append(diagnostic) }
-        }, outputWindow: outputWindow)
+        }, outputWindow: outputWindow, retainedOutput: { [self] in .init(text: text, truncated: false) })
     }
 }
 
@@ -46,5 +47,5 @@ func toolTestDirectory() throws -> URL {
 }
 
 func toolResultText(_ result: ToolExecutionResult) -> String {
-    (result.content ?? []).compactMap { if case .text(let text) = $0 { text.text } else { nil } }.joined()
+    (result.output ?? []).compactMap { if case .text(let text) = $0 { text.text } else { nil } }.joined()
 }
