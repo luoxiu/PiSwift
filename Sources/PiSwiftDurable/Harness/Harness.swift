@@ -105,7 +105,9 @@ public final class Harness: Sendable {
     /// `.failed(error)`. A failure closes the Harness by itself; `closed` settles once that close is done, even if the
     /// storage could not close cleanly. Closing waits for running task code to return.
     public var closed: SessionEnd { get async { await session.closed } }
-    /// Commits the supplied changes atomically and publishes them after storage succeeds.
+    /// Commits the supplied changes atomically and publishes them after storage succeeds. Inside the callback read only
+    /// through `tx`: `snapshot`, `documentState`, `watchDoc`, `getTask`, and the other Session and runtime reads may
+    /// queue on the line the callback holds, and then never return.
     public func commit<T>(_ change: (Transaction) async throws -> T, context: ChordContext) async throws -> T {
         try await withTaskCancellationContext(context) { context in
             try assertOpen(); return try await session.commit(change, context: context)

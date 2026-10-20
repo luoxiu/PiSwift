@@ -20,6 +20,11 @@ The package requires macOS 15 or iOS 18. It uses Swift 6 strict concurrency.
 - **Registry** holds extensions, tools, prompt sections, hooks, wrappers, and tasks.
   Conversations store choices by name. Install extensions again when you reopen storage.
 
+A commit callback holds the Session line. Inside it, read only through `tx`. `snapshot`,
+`documentState`, `watchDoc`, `getTask`, and other Session, Harness, and runtime reads can
+queue on that line. There they never return, and the line stays held. A cache hit returns,
+so the hang is intermittent.
+
 Changes go to storage before observers receive them. A transcript normally contains
 `pi.user`, a positional `pi.system` entry, and `pi.assistant`. Tool rounds also add
 `pi.tool-result`. Built-in documents include `pi.agent`, `pi.provider`, `pi.live`,

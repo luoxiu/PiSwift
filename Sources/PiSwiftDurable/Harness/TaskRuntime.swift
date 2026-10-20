@@ -49,7 +49,9 @@ public final class TaskRuntime: Sendable {
     public func now() throws -> Int64 { try invocation.check(); return scheduler.now() }
     /// Sends a nonfatal handler error to the host report callback.
     public func report(_ error: any Error) throws { try invocation.check(); scheduler.report(error) }
-    /// Commits state only while this invocation still owns the task.
+    /// Commits state only while this invocation still owns the task. Inside the callback read only through `tx`:
+    /// `snapshot`, `documentState`, `watchDoc`, `getTask`, and the other Session and runtime reads may queue on the line
+    /// the callback holds, and then never return.
     public func commit(_ change: (Transaction, TaskRecord) async throws -> TaskState?,
                        context: ChordContext) async throws {
         try await withTaskCancellationContext(context) { context in

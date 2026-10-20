@@ -124,7 +124,9 @@ public final class Session: Sendable {
         try assertHealthy()
         if isClosing { throw SessionError.closed }
     }
-    /// Commits the supplied changes atomically and publishes them after storage succeeds.
+    /// Commits the supplied changes atomically and publishes them after storage succeeds. Inside the callback read only
+    /// through `tx`: `snapshot`, `documentState`, `watchDoc`, `getTask`, and the other Session and runtime reads may
+    /// queue on the line the callback holds, and then never return.
     public func commit<T>(_ change: (Transaction) async throws -> T,
                           context: ChordContext) async throws -> T {
         try await commitWith(change, context: context, scope: TransactionScope())
