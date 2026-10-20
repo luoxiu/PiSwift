@@ -146,23 +146,17 @@ struct ReplicatedStateSourceTests {
         #expect(deliveries.withLock { $0 } == [.hydrate(sequence: 0)])
     }
 
-    @Test("Publishes exact values and operation batches without applying or re-diffing")
+    @Test("Publishes exact source values without applying or re-diffing")
     func exactPublications() async throws {
         let source = SourceTestSource(SourceTestValue(0))
         let state = try replicatedState(source)
         defer { state.dispose() }
         let next = SourceTestValue(1)
-        // Deliberately unrelated to the value. Applying or re-diffing changes this batch.
+        // Deliberately not the operations that produce `next`: Chord must publish the source value as is.
         let ops: [Delta.Op] = [.delete(["absent"]), .set(["value"], 99), .set(["value"], 99)]
         let marker = ChordContextKey<String>("commit")
         let context = ChordContext.todo.withValue("exact", for: marker)
-        let receivedOps = Mutex<[[Delta.Op]]>([])
         let receivedValues = Mutex<[SourceTestValue]>([])
-        state.subscribeOperations { batch, sequence, receivedContext in
-            #expect(sequence == 1)
-            #expect(receivedContext.value(marker) == "exact")
-            receivedOps.withLock { $0.append(batch) }
-        }
         state.subscribe { value, receivedContext, delivery in
             if delivery.kind == .update {
                 #expect(receivedContext.value(marker) == "exact")
@@ -173,18 +167,19 @@ struct ReplicatedStateSourceTests {
         await state.waitUntilIdle()
         #expect(state.value === next)
         #expect(receivedValues.withLock { $0.first } === next)
-        #expect(receivedOps.withLock { $0 } == [ops])
     }
 
     @Test("Buffers reentrant frames and skips updates covered by late hydration")
-    func lateHydrationDuringOperations() async throws {
+    func lateHydrationDuringDelivery() async throws {
         let source = SourceTestSource(SourceTestValue(0))
         let state = try replicatedState(source)
         defer { state.dispose() }
         let received = Mutex<[Int]>([])
         let late = Mutex<[SourceTestDelivery]>([])
-        state.subscribeOperations { _, sequence, _ in
-            if sequence != 1 { return }
+        let nested = Mutex(false)
+        state.subscribe { _, _, delivery in
+            guard delivery == .update(sequence: 1), !nested.withLock({ $0 }) else { return }
+            nested.withLock { $0 = true }
             source.commit(SourceTestValue(2), ops: [.set(["value"], 2)])
             state.subscribe { value, _, delivery in late.withLock { $0.append(.init(value: value.value, delivery: delivery)) } }
         }
@@ -330,46 +325,5 @@ struct ReplicatedStateSourceTests {
         await second.waitUntilIdle()
         #expect(calls.withLock { $0 } == 2)
         #expect(second.value == 1)
-    }
-
-    @Test("Collects operations failures across reentrant publications")
-    func collectedOperationsFailures() throws {
-        let source = SourceTestSource(0)
-        let reports = Mutex<[any Error]>([])
-        let state = try replicatedState(source, onError: { error in reports.withLock { $0.append(error) } })
-        defer { state.dispose() }
-        state.subscribeOperations { _, sequence, _ in
-            if sequence == 1 { source.commit(2) }
-            throw SourceTestError(message: "first")
-        }
-        state.subscribeOperations { _, _, _ in throw SourceTestError(message: "second") }
-        source.commit(1)
-        let errors = reports.withLock { $0 }
-        #expect(errors.count == 1)
-        let aggregate = try #require(errors.first as? ReplicatedStateOperationsErrors)
-        #expect(aggregate.errors.compactMap { ($0 as? SourceTestError)?.message } == ["first", "second", "first", "second"])
-        #expect(state.value == 2)
-    }
-
-    @Test("Cancels the operations hook and reports its failures")
-    func operationsCancellation() throws {
-        let source = SourceTestSource(0)
-        let errors = Mutex<[SourceTestError]>([])
-        let state = try replicatedState(source, onError: { error in
-            if let error = error as? SourceTestError { errors.withLock { $0.append(error) } }
-        })
-        defer { state.dispose() }
-        let received = Mutex<[[Delta.Op]]>([])
-        let subscription = state.subscribeOperations { ops, _, _ in
-            received.withLock { $0.append(ops) }
-            throw SourceTestError(message: "hook failure")
-        }
-        source.commit(1, ops: [])
-        subscription.cancel()
-        subscription.cancel()
-        source.commit(2, ops: [.replace(2)])
-        #expect(state.value == 2)
-        #expect(received.withLock { $0 } == [[]])
-        #expect(errors.withLock { $0.map(\.message) } == ["hook failure"])
     }
 }

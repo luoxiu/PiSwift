@@ -115,30 +115,30 @@ struct WatchCoreTests {
         source.closeSession()
     }
 
-    @Test("Generic state uses exact operations and removes producer cancellation")
+    @Test("Generic state publishes source values and removes producer cancellation")
     func genericStateContext() async throws {
         let source = CommittedStateSource<Int?>(value: 0, release: {})
         let state = try replicatedState(source)
         let key = ChordContextKey<String>("commit")
         let child = ChordContext.background.withValue("kept", for: key).withCancel()
         let contexts = SessionTestLog<ChordContext>()
-        let operations = SessionTestLog<[Delta.Op]>()
-        let subscription = state.subscribeOperations { ops, _, context in
-            operations.append(ops)
+        let values = SessionTestLog<Int?>()
+        let subscription = state.subscribe { value, context, delivery in
+            guard delivery.kind == .update else { return }
+            values.append(value)
             contexts.append(context)
         }
-        let exact: [Delta.Op] = [.set(["unrelated"], true), .set(["unrelated"], true)]
-        source.advance(value: 9, ops: exact, context: child.context)
+        await state.waitUntilIdle()
+        source.advance(value: 9, ops: [.set(["unrelated"], true), .set(["unrelated"], true)], context: child.context)
         child.cancel()
         #expect(state.value == 9)
-        #expect(operations.values == [exact])
-        #expect(contexts.values[0].value(key) == "kept")
-        #expect(contexts.values[0].abortSignal == nil)
         source.advance(value: nil, ops: [], context: .background, retired: true)
         source.advance(value: 99, ops: [], context: .background)
         #expect(state.value == nil)
-        #expect(operations.values == [exact, [.replace(.null)]])
         await state.waitUntilIdle()
+        #expect(values.values == [9, nil])
+        #expect(contexts.values[0].value(key) == "kept")
+        #expect(contexts.values[0].abortSignal == nil)
         subscription.cancel()
         state.dispose()
     }

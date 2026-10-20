@@ -92,13 +92,13 @@ private struct DeliveryTestEvent: Sendable {
     let delivery: ReplicatedStateDelivery
 }
 
-// Port only the attached rows from chord v1.1.0 state-delivery.test.ts.
-// Mutable state and replica rows need the state types outside work order CH6.
+// Port only the attached rows from chord replicated-state-delivery.test.ts
+// (state-delivery.test.ts at v1.1.0). Swift has no mutable replicated state.
 // A Swift async listener starts in a task. Readiness gates replace immediate
 // JavaScript callback assertions and timer-based vi.waitFor calls.
 @Suite("ReplicatedState attached public delivery")
 struct ReplicatedStateDeliveryTests {
-    @Test("Awaits hydration and each update independently of other subscribers and exact listeners")
+    @Test("Awaits hydration and each update independently of other subscribers")
     func independentSubscribers() async throws {
         let source = DeliveryTestSource()
         let state = try replicatedState(source)
@@ -106,9 +106,7 @@ struct ReplicatedStateDeliveryTests {
         let hydration = DeliveryTestGate()
         let update = DeliveryTestGate()
         let events = DeliveryTestLog<String>()
-        let exact = DeliveryTestLog<Int>()
         let fast = DeliveryTestLog<Int>()
-        state.subscribeOperations { _, sequence, _ in exact.append(sequence) }
         state.subscribe { value, _, _ in
             events.append("start:\(value.value)")
             if value.value == 0 { await hydration.wait() }
@@ -123,7 +121,6 @@ struct ReplicatedStateDeliveryTests {
         #expect(events.elements == ["start:0"])
         #expect(fast.elements == [0, 1, 2])
         #expect(state.value.value == 2)
-        #expect(exact.elements == [1, 2])
         await hydration.open()
         await events.waitForCount(3)
         #expect(events.elements == ["start:0", "end:0", "start:1"])
@@ -132,15 +129,13 @@ struct ReplicatedStateDeliveryTests {
         #expect(events.elements == ["start:0", "end:0", "start:1", "end:1", "start:2", "end:2"])
     }
 
-    @Test("Bounds pending deliveries without changing exact publication", arguments: [100, 101, 102, 201, 202])
+    @Test("Bounds pending deliveries", arguments: [100, 101, 102, 201, 202])
     func boundedDeliveries(count: Int) async throws {
         let source = DeliveryTestSource()
         let state = try replicatedState(source)
         defer { state.dispose() }
         let hydration = DeliveryTestGate()
         let received = DeliveryTestLog<Int>()
-        let exact = DeliveryTestLog<Int>()
-        state.subscribeOperations { _, sequence, _ in exact.append(sequence) }
         state.subscribe { value, _, _ in
             received.append(value.value)
             if value.value == 0 { await hydration.wait() }
@@ -148,7 +143,6 @@ struct ReplicatedStateDeliveryTests {
         await received.waitForCount(1)
         for value in 1...count { source.publish(value) }
         #expect(received.elements == [0])
-        #expect(exact.elements == Array(1...count))
         await hydration.open()
         await state.waitUntilIdle()
         let first = ((count - 1) / 100) * 100 + 1

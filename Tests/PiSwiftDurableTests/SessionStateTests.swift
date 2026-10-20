@@ -30,12 +30,10 @@ struct ObservationStateDelivery: Sendable, Equatable { let value: ObservationVal
         #expect(first.value?.value == 1); #expect(second.value?.value == 2); second.dispose()
     }
 
-    @Test("shares exact committed value and operation references with Chord") func exactCommittedOps() async throws {
-        let (harness, token) = try await createObservationState(); let state = try #require(try await harness.session.documentState(token, context: .background)); let batches = SessionTestLog<[Delta.Op]>()
-        state.subscribeOperations { ops, _, _ in batches.append(ops) }
+    @Test("shares exact committed value references with Chord") func exactCommittedValues() async throws {
+        let (harness, token) = try await createObservationState(); let state = try #require(try await harness.session.documentState(token, context: .background))
         try await setObservation(4, harness, token); await state.waitUntilIdle()
-        let published = documentChanges(harness.publications.values.last!)[0]
-        #expect(state.value?.value == 4); #expect(batches.values == [published.ops]); #expect(state.value?.retained == (try await harness.session.snapshot(token, context: .background))?.retained); state.dispose()
+        #expect(state.value?.value == 4); #expect(state.value?.retained == (try await harness.session.snapshot(token, context: .background))?.retained); state.dispose()
     }
 
     @Test("captures a late baseline without redelivering an already covered commit") func lateBaseline() async throws {
@@ -46,10 +44,9 @@ struct ObservationStateDelivery: Sendable, Equatable { let value: ObservationVal
     }
 
     @Test("publishes null retirement and never follows a replacement incarnation") func retirementAndReplacement() async throws {
-        let (harness, token) = try await createObservationState(); let old = try #require(try await harness.session.documentState(token, context: .background)); let batches = SessionTestLog<[Delta.Op]>()
-        old.subscribeOperations { ops, _, _ in batches.append(ops) }
+        let (harness, token) = try await createObservationState(); let old = try #require(try await harness.session.documentState(token, context: .background))
         try await harness.session.commit({ tx in try await tx.retireDoc(token); try await tx.doc(token).set("value", 10) }, context: .background); await old.waitUntilIdle()
-        #expect(old.value == nil); #expect(batches.values == [[.replace(nil)]])
+        #expect(old.value == nil)
         let replacement = try #require(try await harness.session.documentState(token, context: .background)); #expect(replacement.value?.value == 10)
         try await setObservation(11, harness, token); await replacement.waitUntilIdle()
         #expect(old.value == nil); #expect(replacement.value?.value == 11); old.dispose(); replacement.dispose()
@@ -67,11 +64,11 @@ struct ObservationStateDelivery: Sendable, Equatable { let value: ObservationVal
         let harness = try await openTestSession(); let old = try SessionDocToken<JSONObject>(kind: "state.migration", version: 1, initial: { ["value": 3] }); let current = try SessionDocToken<JSONObject>(kind: "state.migration", version: 2, initial: { ["value": 0, "migrated": false] }, migrate: { value, _ in ["value": value["value"]!, "migrated": true] })
         try await harness.session.commit({ tx in _ = try await tx.doc(old) }, context: .background); try await harness.session.unloadDocuments(); let commits = await harness.storage.commits.count
         let state = try #require(try await harness.session.documentState(current, context: .background)); #expect(state.value == ["value": 3, "migrated": true]); #expect(await harness.storage.commits.count == commits)
-        let batches = SessionTestLog<[Delta.Op]>(); state.subscribeOperations { ops, _, _ in batches.append(ops) }
+        let deliveries = SessionTestLog<ReplicatedStateDelivery>(); state.subscribe { _, _, delivery in deliveries.append(delivery) }
         try await harness.session.commit({ tx in _ = try await tx.doc(current) }, context: .background); await state.waitUntilIdle()
-        #expect(await harness.storage.commits.count == commits + 1); #expect(state.value == ["value": 3, "migrated": true]); #expect(batches.count == 0)
+        #expect(await harness.storage.commits.count == commits + 1); #expect(state.value == ["value": 3, "migrated": true]); #expect(deliveries.values == [.hydrate(sequence: 0)])
         try await harness.session.commit({ tx in try await tx.doc(current).set("value", 4) }, context: .background); await state.waitUntilIdle()
-        #expect(state.value == ["value": 4, "migrated": true]); #expect(batches.count == 1); state.dispose()
+        #expect(state.value == ["value": 4, "migrated": true]); #expect(deliveries.values == [.hydrate(sequence: 0), .update(sequence: 1)]); state.dispose()
     }
 
     @Test("continues from exact committed values after the tracker cache unloads") func cacheUnload() async throws {

@@ -11,7 +11,6 @@ public final class AttachedReplicatedState<Value: Sendable>: Sendable {
         let frame: ReplicatedStateSourceFrame<Value>
         let sequence: Int
     }
-    private typealias OperationsListener = @Sendable ([Delta.Op], Int, ChordContext) throws -> Void
     private struct State {
         var value: Value
         var cursor: Int
@@ -20,7 +19,6 @@ public final class AttachedReplicatedState<Value: Sendable>: Sendable {
         var delivering = false
         var publications: [Publication] = []
         var subscribers: [Subscriber] = []
-        var operations: [(ReplicatedStateSubscription, OperationsListener)] = []
     }
     private let storage: Mutex<State>
     private let attachment: any ReplicatedStateSourceAttachment<Value>
@@ -83,20 +81,6 @@ public final class AttachedReplicatedState<Value: Sendable>: Sendable {
         if dispose { attachment.dispose() }
     }
 
-    /// Observe exact operation batches, synchronously in publication order.
-    /// There is no hydration batch. Errors go to the creation error handler.
-    @discardableResult
-    package func subscribeOperations(
-        _ listener: @escaping @Sendable ([Delta.Op], Int, ChordContext) throws -> Void
-    ) -> ReplicatedStateSubscription {
-        // The identity token has no capture of this state.
-        let identity = ReplicatedStateSubscription {}
-        storage.withLock { $0.operations.append((identity, listener)) }
-        return ReplicatedStateSubscription { [weak self] in
-            self?.storage.withLock { $0.operations.removeAll { $0.0 === identity } }
-        }
-    }
-
     /// Wait for publication drains and all queued or running public deliveries.
     /// Call this outside listeners. Waiting inside a listener would wait for itself.
     /// Producers must stop before this call if the caller needs a stable idle boundary.
@@ -136,35 +120,20 @@ public final class AttachedReplicatedState<Value: Sendable>: Sendable {
     }
 
     private func drainPublications() {
-        var errors: [any Error] = []
-        while let next = storage.withLock({ state -> (Publication, [OperationsListener])? in
+        while storage.withLock({ state -> Bool in
             guard !state.publications.isEmpty else {
                 state.delivering = false
-                return nil
+                return false
             }
-            return (state.publications.removeFirst(), state.operations.map { $0.1 })
-        }) {
-            let (publication, listeners) = next
-            for listener in listeners {
-                do { try listener(publication.frame.ops, publication.sequence, publication.frame.context) }
-                catch { errors.append(error) }
+            let publication = state.publications.removeFirst()
+            for subscriber in state.subscribers where publication.sequence > subscriber.hydratedSequence {
+                subscriber.listener.push(.init(value: publication.frame.value,
+                    context: publication.frame.context, delivery: .update(sequence: publication.sequence)))
             }
-            storage.withLock { state in
-                for subscriber in state.subscribers where publication.sequence > subscriber.hydratedSequence {
-                    subscriber.listener.push(.init(value: publication.frame.value,
-                        context: publication.frame.context, delivery: .update(sequence: publication.sequence)))
-                }
-            }
-        }
-        if errors.count == 1, let error = errors.first { report(error) }
-        else if !errors.isEmpty { report(ReplicatedStateOperationsErrors(errors: errors)) }
+            return true
+        }) {}
         idle.finish()
     }
 
     private func report(_ error: any Error) { try? onError(error) }
-}
-
-/// Multiple exact operations listeners failed in one publication drain.
-package struct ReplicatedStateOperationsErrors: Error, Sendable {
-    package let errors: [any Error]
 }
