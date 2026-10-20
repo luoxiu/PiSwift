@@ -203,6 +203,19 @@ public struct CompactionStatus: Sendable, Equatable, Codable {
         self.taskId = taskId; self.reason = reason; self.blocking = blocking; self.attempt = attempt; self.retry = retry
     }
 }
+/// The newest compaction that failed since a compaction last produced a summary.
+public struct CompactionFailure: Sendable, Equatable, Codable {
+    /// The failed compaction task.
+    public var taskId: TaskID
+    /// The saved cause of the compaction.
+    public var reason: CompactionReason
+    /// The failed or faulted outcome's error message, or why the scheduler orphaned the task.
+    public var error: String
+    /// Records a failed compaction task, its trigger, and its error.
+    public init(taskId: TaskID, reason: CompactionReason, error: String) {
+        self.taskId = taskId; self.reason = reason; self.error = error
+    }
+}
 /// The active generation, tools, and compactions of one conversation.
 public struct LiveState: Sendable, Equatable, Codable {
     /// The active generation task and the input submissions it admitted.
@@ -216,11 +229,15 @@ public struct LiveState: Sendable, Equatable, Codable {
     public var nestedTools: [NestedToolSlot]?
     /// The active compaction tasks and their progress.
     public var compactions: [CompactionStatus]?
+    /// The newest compaction failure, so a client can show it after the task ended. A compaction that produces a summary
+    /// removes it; one that is aborted or finds nothing to compact leaves it.
+    public var compactionFailure: CompactionFailure?
     /// Creates the visible state of active generation, tools, and compactions.
     public init(run: LiveRun? = nil, generation: LiveGeneration? = nil, tools: [ToolSlot]? = nil,
-                nestedTools: [NestedToolSlot]? = nil, compactions: [CompactionStatus]? = nil) {
+                nestedTools: [NestedToolSlot]? = nil, compactions: [CompactionStatus]? = nil,
+                compactionFailure: CompactionFailure? = nil) {
         self.run = run; self.generation = generation; self.tools = tools; self.nestedTools = nestedTools
-        self.compactions = compactions
+        self.compactions = compactions; self.compactionFailure = compactionFailure
     }
 }
 /// The typed token for the built-in live conversation document.
@@ -316,6 +333,16 @@ internal func removeCompactionStatus(live: JSONDraft, taskId: TaskID) throws {
     }
     if try statuses.count() == 0 { try live.remove("compactions") }
 }
+/// Remove the status of compaction task `taskId` and record that it failed with `error`.
+internal func failCompactionStatus(live: JSONDraft, taskId: TaskID, error: String) throws {
+    if let status = try compactionStatus(live: live, taskId: taskId)?.snapshot().decode(CompactionStatus.self) {
+        try live.set("compactionFailure", JSONValue(encoding: CompactionFailure(taskId: status.taskId, reason: status.reason, error: error)))
+    }
+    try removeCompactionStatus(live: live, taskId: taskId)
+}
+/// Harness cleanup for a terminal outcome the scheduler writes itself (`faulted` or `orphaned`). A run task ends its
+/// run; a tool task's slot is marked done without an entry; a compaction task's status is removed and its failure
+/// recorded.
 internal func settleSchedulerOutcome(tx: Transaction, record: TaskRecord, outcome: TaskOutcome) async throws {
     guard ["pi.generation", "pi.tool", "pi.compaction"].contains(record.kind) else { return }
     let live = try await tx.doc(LiveDoc, conversationId: record.conversationId)
@@ -324,7 +351,14 @@ internal func settleSchedulerOutcome(tx: Transaction, record: TaskRecord, outcom
         try removeNestedSlots(live: live, taskId: record.id)
         return
     }
-    if record.kind == "pi.compaction" { try removeCompactionStatus(live: live, taskId: record.id); return }
+    if record.kind == "pi.compaction" {
+        switch outcome {
+        case .faulted(let error, _): try failCompactionStatus(live: live, taskId: record.id, error: error.message)
+        case .orphaned(let reason, _): try failCompactionStatus(live: live, taskId: record.id, error: reason)
+        default: try removeCompactionStatus(live: live, taskId: record.id)
+        }
+        return
+    }
     guard try live.get("run")?.decode(LiveRun.self).taskId == record.id else { return }
     try await convertPartial(tx: tx, live: live, conversationId: record.conversationId)
     let settlement: SubmissionSettlement

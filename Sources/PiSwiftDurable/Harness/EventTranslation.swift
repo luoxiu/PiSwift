@@ -20,7 +20,7 @@ internal func durableEventSnapshot(_ view: ConversationView) throws -> DurableAg
     let parts = try EventParts(view)
     return DurableAgentSnapshot(entries: view.entries, run: parts.live.run.map { .init(inputs: $0.inputs) },
         generation: parts.live.generation, tools: parts.live.tools ?? [], nestedTools: parts.live.nestedTools ?? [],
-        compactions: parts.live.compactions ?? [],
+        compactions: parts.live.compactions ?? [], compactionFailure: parts.live.compactionFailure,
         inbox: queuedEvents(parts.inbox), agent: parts.agent ?? .init(), usage: parts.usage ?? ["models": [:], "tools": [:]])
 }
 
@@ -192,7 +192,10 @@ internal func translateDurableEvents(conversationId: ConversationID, before: Con
     }
     for end in toolEnds where end.entry == nil { events.append(.toolExecutionEnd(call: end.call)) }
     let compactionsBefore = was.live.compactions ?? []; let compactions = now.live.compactions ?? []
-    for old in compactionsBefore where !compactions.contains(where: { $0.taskId == old.taskId }) { events.append(.compactionEnd(taskId: old.taskId, reason: old.reason)) }
+    let failure = now.live.compactionFailure
+    for old in compactionsBefore where !compactions.contains(where: { $0.taskId == old.taskId }) {
+        events.append(.compactionEnd(taskId: old.taskId, reason: old.reason, error: failure?.taskId == old.taskId ? failure?.error : nil))
+    }
     var turnEnded = false
     for id in taskOrder {
         let task = tasks[id]!

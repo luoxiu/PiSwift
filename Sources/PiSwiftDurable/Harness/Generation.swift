@@ -64,6 +64,8 @@ public struct GenerationCheckpoint: TaskCheckpoint {
     public var compacted: TaskID?
     /// Whether the model context exceeded the request limit.
     public var overflow: String?
+    /// Set when the blocking threshold started `compacted`; its outcome is checked once when `prepare` resumes.
+    public var threshold: Bool?
     /// The stored provider and model reference or entry model contribution.
     public var model: ModelRef?
     /// The reasoning effort selected for the model.
@@ -86,11 +88,12 @@ public struct GenerationCheckpoint: TaskCheckpoint {
     public var pending: [String]?
     /// Saves the generation phase and optional request, retry, and tool state.
     public init(phase: Phase, attempt: Int? = nil, compacted: TaskID? = nil, overflow: String? = nil,
-                model: ModelRef? = nil, thinkingLevel: ModelThinkingLevel? = nil,
+                threshold: Bool? = nil, model: ModelRef? = nil, thinkingLevel: ModelThinkingLevel? = nil,
                 streamOptions: ConversationStreamOptions? = nil, cutoff: EntryID? = nil,
                 until: Int64? = nil, handle: GenerationDeferredHandle? = nil, pollAt: Int64? = nil,
                 assistant: EntryID? = nil, tools: [TaskID]? = nil, pending: [String]? = nil) {
         self.phase = phase; self.attempt = attempt; self.compacted = compacted; self.overflow = overflow
+        self.threshold = threshold
         self.model = model; self.thinkingLevel = thinkingLevel; self.streamOptions = streamOptions
         self.cutoff = cutoff; self.until = until; self.handle = handle; self.pollAt = pollAt
         self.assistant = assistant; self.tools = tools; self.pending = pending
@@ -162,6 +165,14 @@ private func prepareGeneration(_ checkpoint: GenerationCheckpoint, _ runtime: Ta
             return try await failGeneration(runtime, modelError: overflow, context: context)
         }
     }
+    // A threshold compaction that found nothing to compact or was declined leaves a request that may still fit. One
+    // that failed left a context it judged too large: sending it would at best leave no room for the answer.
+    if let compacted = checkpoint.compacted, checkpoint.threshold == true {
+        let outcomes = try await runtime.outcomes([compacted], context: context)
+        if let outcome = outcomes.first, let text = compactionFailure(outcome) {
+            return try await failGeneration(runtime, modelError: text, context: context)
+        }
+    }
     let view = try await runtime.context(runtime.conversationId, context: context)
     let shown = replaySections(view.messages)
     var env: (any ExecutionEnv)?
@@ -177,7 +188,7 @@ private func prepareGeneration(_ checkpoint: GenerationCheckpoint, _ runtime: Ta
     if threshold == .blocking {
         try await runtime.commit({ tx, _ in
             let child = try await createGenerationCompaction(tx: tx, conversationId: runtime.conversationId, reason: .threshold, owner: runtime.taskId)
-            return try generationTask.waiting(GenerationCheckpoint(phase: .prepare, attempt: attempt, compacted: child), on: [child], policy: .allSettled)
+            return try generationTask.waiting(GenerationCheckpoint(phase: .prepare, attempt: attempt, compacted: child, threshold: true), on: [child], policy: .allSettled)
         }, context: context)
         return
     }
@@ -219,6 +230,15 @@ func generationStreamOptions(_ options: ConversationStreamOptions, thinkingLevel
     return SimpleStreamOptions(signal: signal, transport: options.transport, reasoning: ThinkingLevel(rawValue: thinkingLevel.rawValue),
         cacheRetention: options.cacheRetention, sessionId: sessionId, headers: options.headers, maxRetryDelayMs: options.maxRetryDelayMs,
         metadata: metadata, timeoutMs: options.timeoutMs, maxRetries: options.maxRetries, deferred: options.deferred)
+}
+/// Error text for a generation whose blocking compaction ended without completing; nil when it completed.
+private func compactionFailure(_ outcome: TaskOutcome) -> String? {
+    switch outcome {
+    case .completed: nil
+    case .failed(let error, _, _), .faulted(let error, _): "Compaction failed: \(error.message)"
+    case .orphaned(let reason, _): "Compaction failed: \(reason)"
+    case .aborted: "Compaction was aborted"
+    }
 }
 private func failGeneration(_ runtime: TaskRuntime, ref: ModelRef?, context: ChordContext) async throws {
     let text = ref.map { "Model \($0.provider)/\($0.modelId) is not available" } ?? "No model is configured"

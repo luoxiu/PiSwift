@@ -397,6 +397,14 @@ its task, a tool gets an error result, and a hook is reported and skipped. A thr
 commit or close listener is reported, and the other listeners still run. A throw in the
 Harness's own bookkeeping, such as a scheduler commit, fails the Harness.
 
+A compaction that a generation waits for at the blocking threshold fails that generation
+when the compaction fails, faults, is orphaned, or is aborted directly. No request is sent.
+Its inputs settle `unanswered` with `model_error` and detail `Compaction failed: <error>`,
+or `Compaction was aborted`. One that finds nothing to compact or is declined lets the
+request go ahead. `pi.live.compactionFailure` keeps the newest failure (task, reason, error)
+until a compaction produces a summary. The event snapshot carries it as
+`compactionFailure`, and `compaction_end` carries `error` for a failed compaction.
+
 ## Swift Differences and Scope
 
 - Typed IDs, enums, optionals, errors, and Codable/Sendable values replace TypeScript

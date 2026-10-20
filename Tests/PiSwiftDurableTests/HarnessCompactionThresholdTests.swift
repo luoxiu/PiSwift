@@ -87,6 +87,36 @@ func compactionNewInput(_ chat: CompactionChat, tokens: Int = 200) async throws 
         #expect(try await compactionLive(chat).compactions == nil)
         try await chat.harness.close(context: .background)
     }
+    // Upstream 1007 at 89e5c2c07.
+    @Test func failureStaysInLiveSnapshotAndCompactionEndUntilASummary() async throws {
+        let chat = try await compactionOpen(contextWindow: 2000)
+        try await compactionHistory(chat)
+        compactionSetPolicy(chat, compactionBackgroundPolicy)
+        let (stream, log) = try await eventListen(chat.opened)
+        chat.script.appendSummary([.message(compactionFailure("bad request"))])
+        try await compactionTurn(chat, compactionText("u4", 100), compactionText("a4", 100))
+        try await log.waitForType("compaction_end")
+        let recorded = try #require(try await compactionLive(chat).compactionFailure)
+        #expect(recorded.reason == .threshold && recorded.error == "Summarization failed: bad request")
+        #expect(log.events.first { $0["type"] == "compaction_end" } == [
+            "type": "compaction_end", "taskId": .number(Double(recorded.taskId.rawValue)), "reason": "threshold",
+            "error": "Summarization failed: bad request"
+        ])
+        let reopened = try await chat.harness.watchEvents(conversationId: chat.root.id, context: .background)
+        #expect(reopened.snapshot.compactionFailure == recorded)
+        _ = await reopened.stop()
+        // A compaction that produces a summary removes the failure, and ends without an error.
+        compactionSetPolicy(chat, compactionManualPolicy)
+        chat.script.appendSummary([.message(chatAssistant("SUMMARY"))])
+        let manual = try await chat.root.compact(context: .background)
+        #expect(try await compactionOutcome(chat, manual).status == "completed")
+        #expect(try await compactionLive(chat).compactionFailure == nil)
+        let id = JSONValue.number(Double(manual.rawValue))
+        try await eventually { log.events.contains { $0["type"] == "compaction_end" && $0["taskId"] == id } }
+        #expect(log.events.first { $0["type"] == "compaction_end" && $0["taskId"] == id }?["error"] == nil)
+        _ = await stream.stop()
+        try await chat.harness.close(context: .background)
+    }
     // Upstream 1015.
     @Test func blockingWaitsAndAppendsBeforeRequest() async throws {
         let chat = try await compactionOpen(contextWindow: 1000)
@@ -129,25 +159,55 @@ func compactionNewInput(_ chat: CompactionChat, tokens: Int = 200) async throws 
         #expect(try await compactionKinds(chat.root).filter { $0 == "pi.compaction" }.count == 1)
         try await chat.harness.close(context: .background)
     }
-    // Upstream 1072, 1084: both loop paths and direct abort.
-    @Test(arguments: ["declines", "fails", "aborted directly"])
-    func failedBlockingCompactionStillSendsRequest(how: String) async throws {
+    // Upstream 1114 at 89e5c2c07.
+    @Test func declinedBlockingCompactionStillSendsRequest() async throws {
+        let chat = try await compactionOpen(contextWindow: 1000)
+        try await compactionHistory(chat)
+        compactionSetPolicy(chat, compactionBlockingPolicy)
+        try chat.setup.registry.install(Extension(name: "decline", hooks: [hook(CompactionHooks(beforeCompact: { _, _, _ in .decline }))]))
+        try await compactionTurn(chat, compactionText("u4", 200), "a4")
+        #expect(try await !compactionKinds(chat.root).contains("pi.compaction"))
+        #expect(compactionFirstUser(try #require(chat.script.agentRequests.last).messages) == compactionText("u1", 100))
+        #expect(try await compactionLive(chat).compactionFailure == nil)
+        try await chat.harness.close(context: .background)
+    }
+    // Upstream 1128 at 89e5c2c07. A failed compaction leaves a context it judged too large; sending it once filled a
+    // 1M window and got an empty `length` answer on every turn while the failure stayed invisible.
+    @Test func failedBlockingCompactionFailsRunWithoutRequest() async throws {
+        let chat = try await compactionOpen(contextWindow: 1000)
+        try await compactionHistory(chat)
+        compactionSetPolicy(chat, compactionBlockingPolicy)
+        chat.script.appendSummary([.message(compactionFailure("bad request"))])
+        let requests = chat.script.agentRequests.count
+        let settled = try await compactionNewInput(chat).wait(context: .background)
+        #expect(settled.status == "unanswered" && settled.reason == "model_error")
+        #expect(settled.record.detail == "Compaction failed: Summarization failed: bad request")
+        #expect(chat.script.agentRequests.count == requests)
+        #expect(try await compactionKinds(chat.root).last == "pi.user")
+        let state = try await compactionLive(chat)
+        #expect(state.compactions == nil)
+        #expect(state.compactionFailure?.reason == .threshold)
+        #expect(state.compactionFailure?.error == "Summarization failed: bad request")
+        try await chat.harness.close(context: .background)
+    }
+    // Upstream 1151 at 89e5c2c07.
+    @Test func abortedBlockingCompactionFailsRun() async throws {
         let chat = try await compactionOpen(contextWindow: 1000)
         try await compactionHistory(chat)
         compactionSetPolicy(chat, compactionBlockingPolicy)
         let gate = HarnessGatedResponse(message: chatAssistant("SUMMARY"))
-        if how == "declines" {
-            try chat.setup.registry.install(Extension(name: "decline", hooks: [hook(CompactionHooks(beforeCompact: { _, _, _ in .decline }))]))
-        } else { chat.script.appendSummary([how == "fails" ? .message(compactionFailure("bad request")) : gate.step]) }
-        chat.script.appendAgent([.message(chatAssistant("a4"))])
+        chat.script.appendSummary([gate.step])
+        let requests = chat.script.agentRequests.count
         let input = try await compactionNewInput(chat)
-        if how == "aborted directly" {
-            await gate.reached.wait()
-            _ = try await chat.harness.abortTask(id: #require(await compactionTasks(chat).first).id, context: .background)
-        }
-        #expect(try await input.wait(context: .background).status == "done")
+        await gate.reached.wait()
+        _ = try await chat.harness.abortTask(id: #require(await compactionTasks(chat).first).id, context: .background)
+        let settled = try await input.wait(context: .background)
+        #expect(settled.status == "unanswered" && settled.reason == "model_error")
+        #expect(settled.record.detail == "Compaction was aborted")
+        #expect(chat.script.agentRequests.count == requests)
         #expect(try await !compactionKinds(chat.root).contains("pi.compaction"))
-        #expect(compactionFirstUser(try #require(chat.script.agentRequests.last).messages) == compactionText("u1", 100))
+        // Aborting is not a failure.
+        #expect(try await compactionLive(chat).compactionFailure == nil)
         try await chat.harness.close(context: .background)
     }
     // Upstream 1100: task and run outcomes; H9 event order is not available.

@@ -115,6 +115,10 @@ extension SubmissionRecord {
         default: return nil
         }
     }
+    var detail: JSONValue? {
+        if case .input(_, _, _, .unanswered(_, _, let detail, _)) = self { return detail }
+        return nil
+    }
 }
 extension SettledSubmission {
     var entry: EntryID? {

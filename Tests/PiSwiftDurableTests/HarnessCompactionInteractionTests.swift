@@ -132,24 +132,36 @@ func interactionBlockingRun(_ chat: CompactionChat) async throws -> (Submission,
         gate.release(); #expect(try await compactionOutcome(chat, id).status == "completed")
         try await chat.harness.close(context: .background)
     }
-    // Upstream :1456, :1880. A summary response with a nonfinite cost, which faults the classifying commit, replaces a
-    // throwing model lookup in Swift: `DurableModels.getModel` cannot throw, and a storage failure now fails the Harness.
+    // Upstream :1456, :1880 (1954 at 89e5c2c07). A summary response with a nonfinite cost, which faults the classifying
+    // commit, replaces a throwing model lookup in Swift: `DurableModels.getModel` cannot throw, and a storage failure now
+    // fails the Harness. Since 89e5c2c07 the blocking generation fails with the fault, which pi.live records.
     @Test(arguments: [false, true])
-    func faultedCompactionRemovesStatusAndBlockingGenerationContinues(blocking: Bool) async throws {
+    func faultedCompactionRecordsFailureAndFailsBlockingGeneration(blocking: Bool) async throws {
         let setup = HarnessChatSetup(options: .init(models: [.init(id: "faux-1", contextWindow: 1000, maxTokens: 900)]), clock: TestClock(now: 1000))
         try setup.registry.install(Extension(name: "compaction-preamble", sections: [section("preamble", tag: false) { _, _ in "You are helpful." }]))
         let chat = try await compactionOpen(setup: setup, script: CompactionScript(setup: setup),
                                             models: NonfiniteSummaryModels(base: setup.models))
         try await compactionHistory(chat)
         chat.script.appendSummary([.message(chatAssistant("SUMMARY"))])
+        var settled: SettledSubmission?
         if blocking {
             chat.setup.updateSettings { $0.compaction = .init(enabled: true, reserveTokens: 500, keepRecentTokens: 150, backgroundTokens: 0) }
-            try await compactionTurn(chat, compactionText("u4", 200), "a4")
+            settled = try await compactionNewInput(chat).wait(context: .background)
         } else {
             #expect(try await compactionOutcome(chat, chat.root.compact(context: .background)).status == "faulted")
         }
-        #expect(try await compactionLive(chat).compactions == nil)
         #expect(try await !compactionKinds(chat.root).contains("pi.compaction"))
+        let state = try await compactionLive(chat)
+        #expect(state.compactions == nil)
+        let failure = try #require(state.compactionFailure)
+        guard case .faulted(let error, _) = try await compactionOutcome(chat, failure.taskId) else {
+            Issue.record("The compaction must fault"); return
+        }
+        #expect(failure.reason == (blocking ? .threshold : .manual) && failure.error == error.message)
+        if let settled {
+            #expect(settled.status == "unanswered" && settled.reason == "model_error")
+            #expect(settled.record.detail == .string("Compaction failed: \(error.message)"))
+        }
         try await chat.harness.close(context: .background)
     }
     // Upstream :1492; H9 events adapted to fresh pi.live snapshots.

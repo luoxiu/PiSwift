@@ -24,12 +24,15 @@ import PiSwiftChord
             .entryAppended(entry: entry), .agentChanged(agent: .init(instructions: "Use Swift")),
             .usageChanged(usage: try JSONValue(encoding: UsageState(models: ["test/model": Usage(input: 1, output: 2, cacheRead: 3, cacheWrite: 4, totalTokens: 10)])).objectValue!),
             .taskFailed(taskId: task, kind: "pi.tool", message: "fault"),
-            .compactionStart(taskId: task, reason: .manual, blocking: true), .compactionEnd(taskId: task, reason: .manual)
+            .compactionStart(taskId: task, reason: .manual, blocking: true), .compactionEnd(taskId: task, reason: .manual),
+            .snapshot(.init(compactionFailure: .init(taskId: task, reason: .threshold, error: "bad"))),
+            .compactionEnd(taskId: task, reason: .threshold, error: "bad")
         ]
         let types = ["snapshot", "run_start", "run_end", "turn_start", "turn_end", "message_start", "message_update",
             "message_end", "tool_execution_start", "tool_execution_update", "tool_execution_update", "tool_execution_end",
             "tool_execution_end", "tool_execution_end", "inbox_update", "submission", "auto_retry_start", "auto_retry_end", "deferred_poll",
-            "entry_appended", "agent_changed", "usage_changed", "task_failed", "compaction_start", "compaction_end"]
+            "entry_appended", "agent_changed", "usage_changed", "task_failed", "compaction_start", "compaction_end",
+            "snapshot", "compaction_end"]
         for (event, type) in zip(events, types) {
             let json = try JSONValue(encoding: event)
             #expect(json["type"] == .string(type))
@@ -39,6 +42,11 @@ import PiSwiftChord
         #expect(cleared["details"] == .null && cleared["diagnostics"] == [])
         let absent = try JSONValue(encoding: events[10])
         #expect(absent["details"] == nil && absent["diagnostics"] == nil)
+        // 89e5c2c07: the failure and the error are present only when set, in upstream's shape.
+        #expect(try JSONValue(encoding: events[0])["compactionFailure"] == nil)
+        #expect(try JSONValue(encoding: events[25])["compactionFailure"] == ["taskId": 4, "reason": "threshold", "error": "bad"])
+        #expect(try JSONValue(encoding: events[24])["error"] == nil)
+        #expect(try JSONValue(encoding: events[26])["error"] == "bad")
     }
 
     @Test func allMessageChangesHaveUpstreamJSONShape() throws {
