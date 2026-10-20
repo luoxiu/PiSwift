@@ -20,7 +20,7 @@
 | 上游 | 日期 | 标题 | 决定 | 状态 |
 | --- | --- | --- | --- | --- |
 | `75a99721d` | 2026-10-07 | Add [Unreleased] section for next cycle | 不跟：只加 CHANGELOG 段落 | 不跟 |
-| `eba849739` | 2026-10-09 | feat(durable): nested tool calls, structured output, callers; storage errors end the Session | 跟。偏差：Swift 的 listener、`onReport`、`now()` 都不能抛错也不返回 Promise，所以没有 `safeReport`/`safeNow`/`contained`，7 个只测 JS 行为（Promise 拒绝、跨 realm、thenable、不可格式化的值、抛错的时钟）的用例不移植；`ToolHookCall` 用 `@dynamicMemberLookup` 包 `ToolCall`；工具事件的调用字段收进 `DurableToolEventCall`；`StorageRequestError` 包住内置后端的 `DurableStorageError`；并发 `executeTool` 的默认 key 按开始执行的顺序编号，不保证调用顺序，重跑要靠显式 key；结构化输出用 PiSwiftAI 的 `JSONSchemaValidator`，报错文字与 TypeBox 不同；Node 基准脚本不移植 | 已移植 |
+| `eba849739` | 2026-10-09 | feat(durable): nested tool calls, structured output, callers; storage errors end the Session | 跟。偏差：Swift 的 listener、`onReport`、`now()` 都不能抛错也不返回 Promise，所以没有 `safeReport`/`safeNow`/`contained`，7 个只测 JS 行为（Promise 拒绝、跨 realm、thenable、不可格式化的值、抛错的时钟）的用例不移植；`ToolHookCall` 用 `@dynamicMemberLookup` 包 `ToolCall`；工具事件的调用字段收进 `DurableToolEventCall`；`StorageRequestError` 包住内置后端的 `DurableStorageError`；并发 `executeTool` 的默认 key 按开始执行的顺序编号，不保证调用顺序，重跑要靠显式 key；结构化输出用 PiSwiftAI 的 `JSONSchemaValidator`，报错文字与 TypeBox 不同；Node 基准脚本不移植 | 已移植 5bbd2d1 |
 | `42a3497d0` | 2026-10-09 | feat(durable): read returns images, optional Photon image processor | 跟 | 待移植 |
 | `cb4375493` | 2026-10-10 | fix(durable): scheduler no longer visits every live task on each pass | 跟 | 待移植 |
 | `4ac0bd8c7` | 2026-10-10 | feat(durable): one document per nested call; TaskRuntime.ownedTasks() | 跟 | 待移植 |
