@@ -305,6 +305,18 @@ import PiSwiftDurableTesting
         // README: end
         #expect(cases.count == 8)
     }
+
+    @Test func environmentListFiles() async throws {
+        let directory = try readmeLocalDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let env = LocalExecutionEnv(cwd: directory.path)
+        // README: environment-list-files
+        let listing = await env.listFiles(".", options: .init(exclude: ["node_modules"], maxEntries: 50_000),
+            context: .background)
+        // README: end
+        guard case .failure(let error) = listing else { Issue.record("Expected notSupported"); return }
+        #expect(error.code == .notSupported)
+    }
 }
 
 private func readmeLocalDirectory() throws -> URL {

@@ -213,6 +213,47 @@ public protocol DirReader: Sendable {
     /// Closes this reader or watcher and releases its resources.
     func close(context: ChordContext) async
 }
+/// What `FileSystem.listFiles` lists.
+public struct ListFilesOptions: Sendable {
+    /// Include names starting with `.`; default true. Entries named `.git` are never listed.
+    public var hidden: Bool?
+    /// Inside a git work tree, skip what git ignores: the `.gitignore` files of the directory, its subdirectories
+    /// and its parents, `.git/info/exclude`, and the global excludes file; default true. Unlike `git ls-files`,
+    /// a tracked file that matches an ignore rule is skipped too. Outside work trees, `.gitignore` files have no effect.
+    public var gitignore: Bool?
+    /// Names of entries to skip with everything below them, such as `node_modules`.
+    public var exclude: [String]?
+    /// Most entries to list; default 50,000.
+    public var maxEntries: Int?
+    /// Most bytes of the listing: each entry's UTF-8 path plus two; default 4 MiB, at most 15.9 MiB.
+    public var maxBytes: Int?
+    /// Time after which the listing stops; default 10 seconds.
+    public var timeout: Duration?
+    /// Creates ListFilesOptions with the supplied values.
+    public init(hidden: Bool? = nil, gitignore: Bool? = nil, exclude: [String]? = nil,
+                maxEntries: Int? = nil, maxBytes: Int? = nil, timeout: Duration? = nil) {
+        self.hidden = hidden; self.gitignore = gitignore; self.exclude = exclude
+        self.maxEntries = maxEntries; self.maxBytes = maxBytes; self.timeout = timeout
+    }
+}
+/// One entry of a `FileListing`.
+public struct FileListEntry: Sendable, Equatable {
+    /// Relative to the listed directory, with `/` separators on every system.
+    public var path: String
+    /// A symbolic link is listed as such and not followed.
+    public var kind: FileKind
+    /// Creates FileListEntry with the supplied values.
+    public init(path: String, kind: FileKind) { self.path = path; self.kind = kind }
+}
+/// The entries below a directory, from `FileSystem.listFiles`.
+public struct FileListing: Sendable, Equatable {
+    /// Depth first, parents before their entries, siblings in byte order of their names.
+    public var entries: [FileListEntry]
+    /// A bound in `ListFilesOptions` ended the listing early.
+    public var truncated: Bool
+    /// Creates FileListing with the supplied values.
+    public init(entries: [FileListEntry], truncated: Bool) { self.entries = entries; self.truncated = truncated }
+}
 /// Text or binary data to write to a file.
 public enum FileContent: Sendable {
     /// UTF-8 text content.
@@ -293,6 +334,12 @@ public protocol FileSystem: Sendable {
     func fileInfo(_ path: String, context: ChordContext) async -> Result<FileInfo, FileError>
     /// Returns the entries in a directory.
     func listDir(_ path: String, context: ChordContext) async -> Result<[FileInfo], FileError>
+    /// Optional: the files, directories and symbolic links below a directory, at any depth, for indexes such as
+    /// file completion. Symbolic links are not followed; other kinds of files are not listed; entries that cannot
+    /// be read are skipped. See `ListFilesOptions` for hidden and ignored files and for the bounds. Fails with
+    /// `notSupported` when the environment cannot list right now, so callers fall back to their own walk.
+    /// The default implementation always fails with `notSupported`.
+    func listFiles(_ path: String, options: ListFilesOptions?, context: ChordContext) async -> Result<FileListing, FileError>
     /// Opens a paged directory reader.
     func openDirReader(_ path: String, context: ChordContext) async -> Result<any DirReader, FileError>
     /// Starts a watch and delivers path changes, overflow, or errors.
@@ -311,6 +358,12 @@ public protocol FileSystem: Sendable {
     func createTempFile(options: CreateTempFileOptions?, context: ChordContext) async -> Result<String, FileError>
     /// Releases resources owned by this environment.
     func cleanup(context: ChordContext) async
+}
+extension FileSystem {
+    /// Fails with `notSupported`: an environment lists trees only when it implements `listFiles` itself.
+    public func listFiles(_ path: String, options: ListFilesOptions?, context: ChordContext) async -> Result<FileListing, FileError> {
+        .failure(FileError(.notSupported, message: "The environment does not list files", path: path))
+    }
 }
 /// Output thresholds after which the environment can spill output to a file.
 public struct ShellSpillOptions: Sendable {

@@ -5,7 +5,7 @@ import PiSwiftAI
 import PiSwiftChord
 @testable import PiSwiftDurable
 
-/// A local environment with deterministic command and write hooks.
+/// A local environment with deterministic command, write, and listing hooks.
 struct ToolFixtureEnv: ExecutionEnv {
     let base: LocalExecutionEnv
     let id: String
@@ -15,6 +15,7 @@ struct ToolFixtureEnv: ExecutionEnv {
     var absolutePathHook: (@Sendable (String) -> Result<String, FileError>)?
     var canonicalPathHook: (@Sendable (String) -> Result<String, FileError>)?
     var joinPathHook: (@Sendable ([String]) -> Result<String, FileError>)?
+    var listFilesHook: (@Sendable (String, ListFilesOptions?, ChordContext) async -> Result<FileListing, FileError>)?
     var cwd: String { get { base.cwd } nonmutating set { base.cwd = newValue } }
     init(base: LocalExecutionEnv, id: String = "local",
          writeHook: (@Sendable (String, FileContent, ChordContext) async -> Result<Void, FileError>)? = nil,
@@ -42,6 +43,10 @@ struct ToolFixtureEnv: ExecutionEnv {
     func renameFile(_ sourcePath: String, destinationPath: String, context: ChordContext) async -> Result<Void, FileError> { return await base.renameFile(sourcePath, destinationPath: destinationPath, context: context) }
     func fileInfo(_ path: String, context: ChordContext) async -> Result<FileInfo, FileError> { return await base.fileInfo(path, context: context) }
     func listDir(_ path: String, context: ChordContext) async -> Result<[FileInfo], FileError> { return await base.listDir(path, context: context) }
+    func listFiles(_ path: String, options: ListFilesOptions?, context: ChordContext) async -> Result<FileListing, FileError> {
+        if let listFilesHook { return await listFilesHook(path, options, context) }
+        return await base.listFiles(path, options: options, context: context)
+    }
     func openDirReader(_ path: String, context: ChordContext) async -> Result<any DirReader, FileError> { return await base.openDirReader(path, context: context) }
     func watch(_ targets: [WatchTarget], onChange: @escaping @Sendable (WatchChange) -> Void, context: ChordContext) async -> Result<any FileWatcher, FileError> { return await base.watch(targets, onChange: onChange, context: context) }
     func canonicalPath(_ path: String, context: ChordContext) async -> Result<String, FileError> {

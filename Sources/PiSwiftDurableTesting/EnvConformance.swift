@@ -22,13 +22,15 @@ public struct EnvConformanceCase: Sendable, CustomStringConvertible {
 public struct EnvConformanceCapabilities: Sendable {
     /// Include the six shell checks.
     public var exec: Bool
-    /// Include the two symbolic link checks.
+    /// Include the symbolic link checks: two, and one more with `listFiles`.
     public var symlinks: Bool
     /// Include file watch checks.
     public var watch: Bool
-    /// Selects the supported checks. All capabilities are enabled by default.
-    public init(exec: Bool = true, symlinks: Bool = true, watch: Bool = true) {
-        self.exec = exec; self.symlinks = symlinks; self.watch = watch
+    /// Include the checks of the optional `listFiles`, which the environment then implements.
+    public var listFiles: Bool
+    /// Selects the supported checks. All capabilities except `listFiles` are enabled by default.
+    public init(exec: Bool = true, symlinks: Bool = true, watch: Bool = true, listFiles: Bool = false) {
+        self.exec = exec; self.symlinks = symlinks; self.watch = watch; self.listFiles = listFiles
     }
 }
 
@@ -88,6 +90,17 @@ public func envConformanceCases(
             ("windowed exec keeps the exact tail and counts what it skips", nil, EnvChecks.case21),
             ("argv exec distinguishes timeout from abort", nil, EnvChecks.case22),
         ]
+    }
+    if capabilities.listFiles {
+        checks += [
+            ("listFiles lists files and directories depth first in name order", nil, EnvChecks.case25),
+            ("listFiles skips what git ignores in work trees, .git, and excluded names", nil, EnvChecks.case26),
+            ("listFiles stops at its bounds and reports truncated", nil, EnvChecks.case27),
+            ("listFiles fails on missing directories, files, and aborts", nil, EnvChecks.case28),
+        ]
+        if capabilities.symlinks {
+            checks.append(("listFiles lists symbolic links without following them", nil, EnvChecks.case29))
+        }
     }
     if capabilities.symlinks {
         checks.append(("binary reader follows symlinks unless noFollow refuses the final one", nil, EnvChecks.case23))

@@ -394,6 +394,17 @@ let cases = envConformanceCases(capabilities: .init(exec: false, symlinks: false
 for testCase in cases { try await testCase.run() }
 ```
 
+Some environments also implement the optional `listFiles`: the files and directories below
+a directory at any depth, as `fd` lists them. It skips what git ignores and stops at its
+bounds with `truncated`. LocalExecutionEnv and FakeExecutionEnv do not implement it. The
+protocol's default fails with `notSupported`, and callers then fall back to their own walk.
+Enable `listFiles` in the conformance capabilities to check an implementation.
+
+```swift
+let listing = await env.listFiles(".", options: .init(exclude: ["node_modules"], maxEntries: 50_000),
+    context: .background)
+```
+
 ## Errors
 
 A storage error ends the Harness. The call that hit it throws the error. Every later call
@@ -477,6 +488,9 @@ until a compaction produces a summary. The event snapshot carries it as
   `.edit(remove:add:)`. `ToolRegistration.deferred` is `Bool?`, set to `true`. The tool search
   is part of this library rather than upstream's `/tool-search` entry. Its public names match
   PiSwiftCodingAgent's, so a file that imports both qualifies them with the module name.
+- `ListFilesOptions.timeout` is a Duration, for upstream's `timeoutMs`. A negative bound is invalid;
+  a fractional millisecond is not. An environment without `listFiles` gets the protocol's default,
+  which fails with `notSupported`, where upstream leaves the method out.
 - This library has no CLI or TUI code. PowerShell and Windows process support are outside scope.
 
 Upstream examples 00–31 have Swift integration tests with assertions for the library
