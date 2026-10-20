@@ -48,6 +48,26 @@ private func failWithQueuedInput(_ policy: AfterFailedRun?) async throws -> (har
         try await harness.close(context: .background)
     }
 
+    @Test func placeQueuedWritesAndKeepThemWithWithdraw() async throws {
+        for policy in [AfterFailedRun.continue, .withdraw] {
+            let setup = HarnessChatSetup(settings: HarnessSettings(afterFailedRun: policy))
+            let failing = failingOnce()
+            setup.models.setResponses([failing.step, .message(chatAssistant("second answer"))])
+            let chat = try await openChat(setup: setup)
+            let first = try await chat.root.submit(.input(content: .text("first")), context: .background)
+            await failing.reached.wait()
+            let note = try EntryRecord.encodeMessages([.user(UserMessage(content: .text("a note the model sees"), timestamp: 1))])
+            let write = try await chat.root.submit(.write(entry: EntryDraft(kind: "test.note", model: note)), context: .background)
+            #expect(try await write.status(context: .background).status == "queued")
+            failing.release()
+            _ = try await first.wait(context: .background)
+            try await chat.harness.waitForIdle(context: .background)
+            // `continue` places the write at the failed run's boundary; `withdraw` withdraws inputs only.
+            #expect(try await write.status(context: .background).status == (policy == .continue ? "done" : "queued"))
+            try await chat.harness.close(context: .background)
+        }
+    }
+
     @Test func settleUnansweredWithRunFailedWithWithdraw() async throws {
         let (harness, _, second) = try await failWithQueuedInput(.withdraw)
         let settled = try await second.wait(context: .background)

@@ -163,6 +163,8 @@ private func h6Reacquire(_ harness: Harness, _ id: SubmissionID) async throws ->
         #expect(checkpoint.phase == .retry && checkpoint.until == 61000 && checkpoint.attempt == 1)
         #expect(try await opened.harness.getTask(id: taskId, context: .background)?.state
             == .sleeping(checkpoint: ["phase": "retry", "attempt": 1, "until": 61000], until: 61000))
+        let reopened = opened.harness
+        try await eventually { try !reopened.wake().active }
         #expect(try opened.harness.wake() == Wake(active: false, at: 61000))
         // An early wake retries nothing.
         try opened.harness.resume()
@@ -234,6 +236,8 @@ private func h6Reacquire(_ harness: Harness, _ id: SubmissionID) async throws ->
             Issue.record("The poll must sleep"); return
         }
         #expect(until == 61000)
+        let reopened = opened.harness
+        try await eventually { try !reopened.wake().active }
         #expect(try opened.harness.wake() == Wake(active: false, at: 61000))
         clock.advance(by: 60000)
         let receipt = try await h6Reacquire(opened.harness, submitted.id).wait(context: .background)

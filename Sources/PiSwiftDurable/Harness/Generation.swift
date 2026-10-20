@@ -181,12 +181,14 @@ private func prepareGeneration(_ checkpoint: GenerationCheckpoint, _ runtime: Ta
     let shown = replaySections(view.messages)
     var env: (any ExecutionEnv)?
     do { env = try await runtime.env(context: context) }
-    catch { if context.abortSignal?.aborted == true { throw error }; try runtime.report(error) }
+    catch { if context.abortSignal?.aborted == true { throw error }; try runtime.report(error, from: .host) }
     let input = PromptInput(conversationId: runtime.conversationId, agent: agent, env: env,
                             shown: Dictionary(uniqueKeysWithValues: shown.compactMap { key, value in value.stringValue.map { (key, $0) } }),
                             read: runtime.hookApi.read)
     let desired = try await renderSections(agent.sections, input: input, shown: shown,
-                                          report: { runtime.reportTask($0) }, context: context)
+                                          report: { error, section in
+                                              runtime.reportTask(error, from: .extension(sectionExtension(agent, key: section.key)))
+                                          }, context: context)
     let entries = try planSystemEntries(view: view, desired: desired, registrations: agent.tools, timestamp: runtime.now())
     let threshold = checkpoint.compacted == nil ? try generationThresholdCompaction(view: view, planned: entries, contextWindow: model.contextWindow, policy: compactionPolicy(settings, model: ref)) : nil
     if threshold == .blocking {
@@ -296,7 +298,7 @@ private func abortGeneration(_ checkpoint: GenerationCheckpoint, _ runtime: Task
             let bridge = ContextCancellationBridge(context: context.withAbortSignal(runtime.signal))
             defer { withExtendedLifetime(bridge) {} }
             try await runtime.models.cancelDeferred(model: model, handle: handle.handle, options: DeferredCancelOptions(signal: bridge.token))
-        } catch { try runtime.report(error) }
+        } catch { try runtime.report(error, from: .host) }
     }
     let unstarted = checkpoint.phase == .tools ? try await generationCalls(runtime: runtime, assistant: required(checkpoint.assistant, "assistant"), callIds: checkpoint.pending ?? [], context: context) : []
     try await runtime.commit({ tx, _ in

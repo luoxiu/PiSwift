@@ -28,11 +28,17 @@ import PiSwiftDurableTesting
         await held.release()
         try await closing.value
         #expect(log.count == 0)
-        let taskWrites = await storage.commits.flatMap { $0 }.compactMap { write -> TaskRecord? in
-            if case .task(let task, _) = write, task.id == id { return task }; return nil
+        // The reservation landed; close wrote the task back as pending.
+        let commits = await storage.commits
+        let reserved = commits.dropLast().last?.compactMap { write -> TaskRecord? in
+            if case .task(let task, _) = write { return task }; return nil
         }
-        #expect(taskWrites.last?.state.status == "running")
-        #expect(taskWrites.last?.abortRequested == marked)
+        #expect(reserved?.map(\.id) == [id])
+        #expect(reserved?.first?.state.status == "running" && reserved?.first?.abortRequested == marked)
+        guard case .task(let released, _)? = commits.last?.first, commits.last?.count == 1 else {
+            Issue.record("Close must write only the stopped task"); return
+        }
+        #expect(released.id == id && released.state.status == "pending" && released.abortRequested == marked)
     }
 
     // upstream harness-tasks.test.ts:1309; lifecycle:450
@@ -63,6 +69,8 @@ import PiSwiftDurableTesting
         try await closing.value
         let writes = await storage.commits.flatMap { $0 }
         #expect(!writes.contains { if case .task(let task, _) = $0 { return task.id == id && task.state.status == "terminal" }; return false })
+        // Created, reserved, and written back as pending by close; the queued outcome never landed.
+        #expect(taskStatuses(writes, id) == ["pending", "running", "pending"])
     }
 
     // upstream harness-tasks.test.ts:1255
@@ -89,6 +97,8 @@ import PiSwiftDurableTesting
         try await closing.value
         let writes = await storage.commits.flatMap { $0 }
         #expect(!writes.contains { if case .task(let task, _) = $0 { return task.id == id && task.state.status == "terminal" }; return false })
+        // Created, reserved, and written back as pending by close: no fault.
+        #expect(taskStatuses(writes, id) == ["pending", "running", "pending"])
     }
 
     // upstream harness-tasks.test.ts:1175,973
@@ -105,17 +115,33 @@ import PiSwiftDurableTesting
             case .joined: log.append("joined")
             }
         }, abort: { _, _, _ in log.append("abort") })
-        let harness = try await harnessOpen([AnyTaskDefinition(definition)])
+        let storage = ControlledStorage()
+        let harness = try await harnessOpen([AnyTaskDefinition(definition)], storage: storage)
         let root = try await harness.root(context: .background)
         let id = try await harnessStart(root, definition)
         try harness.resume(); await entered.wait()
         let aborting = Task { try await harness.abortTask(id: id, context: .background) }
         try await harnessEventually { try await harness.getTask(id: id, context: .background)?.abortRequested == true }
+        let commits = await storage.commits.count
         let closing = Task { try await harness.close(context: .background) }
         try await harnessEventually { harness.tasks.closing }
         runRelease.release()
         _ = try await aborting.value
         try await closing.value
         #expect(log.values == ["run"])
+        // No outcome: close writes only the stopped task back as pending, so a reopen counts no restart.
+        let after = await storage.commits
+        #expect(after.count == commits + 1)
+        guard case .task(let released, _)? = after.last?.first, after.last?.count == 1 else {
+            Issue.record("Close must write only the stopped task"); return
+        }
+        #expect(released.id == id && released.abortRequested)
+        #expect(released.state == .pending(checkpoint: try JSONValue(encoding: HarnessTaskCheckpoint(phase: .joined))))
+    }
+}
+
+private func taskStatuses(_ writes: [StorageWrite], _ id: TaskID) -> [String] {
+    writes.compactMap { write -> String? in
+        if case .task(let task, _) = write, task.id == id { return task.state.status }; return nil
     }
 }

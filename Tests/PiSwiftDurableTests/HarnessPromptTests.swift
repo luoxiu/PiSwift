@@ -54,7 +54,7 @@ private enum PromptTestError: Error { case render, cancelled }
         let agent = resolveAgent(state: nil, snapshot: registry.snapshot(), settings: resolveSettings(nil))
         let shown: JSONObject = ["failing": .string("<failing>\nold\n</failing>"), "cwd": .string("stale")]
         let desired = try await renderSections(agent.sections, input: PromptInput(conversationId: rootConversationID, agent: agent), shown: shown,
-                                             report: { _ in reports.withLock { $0 += 1 } }, context: .background)
+                                             report: { _, _ in reports.withLock { $0 += 1 } }, context: .background)
         #expect(desired == ["preamble": .string("You are helpful."), "cwd": .string("<cwd>\n/repo (git)\n</cwd>"), "failing": .string("<failing>\nold\n</failing>")])
         #expect(reports.withLock { $0 } == 2)
     }

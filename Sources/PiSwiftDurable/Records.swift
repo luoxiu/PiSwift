@@ -549,8 +549,9 @@ public struct TaskRecord: Sendable, Equatable, Codable {
     public let startedAt: Double?
     /// The time at which task execution ended, in milliseconds.
     public let endedAt: Double?
-    /// How many times in a row a crash or close cut the task off while it ran, without the task changing its state since
-    /// (open counts them). At `HarnessSettings.restartLimit` the task is parked as blocked until `Harness.retryTask()`.
+    /// How many times in a row a crash, eviction, or reset cut the task off while it ran, without the task changing its
+    /// state since; open counts them, and a close does not. At `HarnessSettings.restartLimit` the task is parked as blocked
+    /// until `Harness.retryTask()`.
     public let restarts: Int?
     /// The durable task memos used to avoid repeated effects.
     public let memos: JSONObject?

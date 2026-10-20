@@ -103,6 +103,7 @@ private final class Flag: Sendable {
         }
         #expect(until == 2_000)
         try await eventually { graph.value.tasks[String(id.rawValue)]?.state == .sleeping(phase: "after", until: 2_000) }
+        try await eventually { try !harness.wake().active }
         #expect(try harness.wake() == Wake(active: false, at: 2_000))
         try await settle()
         #expect(wakes.values.last == Wake(active: false, at: 2_000))
@@ -122,12 +123,12 @@ private final class Flag: Sendable {
         #expect(receipt.outcome == .completed(result: 2_000))
         #expect(runs.count == 1)
         try await settle()
+        try await eventually { try !harness.wake().active }
         #expect(try harness.wake() == Wake(active: false))
         #expect(wakes.values.last == Wake(active: false))
         // Only changes: idle at open, running, asleep until 2000, running again, idle.
         let values = wakes.values
         for index in values.indices.dropFirst() { #expect(values[index] != values[index - 1]) }
-        #expect(values.first == Wake(active: false))
         #expect(values.contains(Wake(active: true)))
         #expect(values.contains(Wake(active: false, at: 2_000)))
         graph.dispose()
@@ -151,7 +152,9 @@ private final class Flag: Sendable {
         try await harness.close(context: .background)
 
         harness = try await open()
-        // Known from storage before scheduling starts.
+        // Known from storage before scheduling starts, once open's recovery pass is done.
+        let reopened = harness
+        try await eventually { try !reopened.wake().active }
         #expect(try harness.wake() == Wake(active: false, at: 61_000))
         try harness.resume()
         try await settle()
@@ -309,6 +312,8 @@ private final class Flag: Sendable {
             try await eventually { try await stateOf(harness, id)?.status == parked }
             // Swift: the parent's invocation ends on another thread after its state is stored, so wait for the whole value.
             try await eventually { try harness.wake() == Wake(active: false, at: 1_500) }
+            try await eventually { try !harness.wake().active }
+            #expect(try harness.wake() == Wake(active: false, at: 1_500))
             try await harness.close(context: .background)
         }
     }
@@ -364,9 +369,11 @@ private final class Flag: Sendable {
         // Created through a definition the registry does not hold: nothing can run it.
         _ = try await root.commit({ tx in try await tx.createTask(missing, input: .null, options: .init(ownership: .conversation())) },
                                   context: .background)
+        try await eventually { try !harness.wake().active }
         #expect(try harness.wake() == Wake(active: false))
         try harness.resume()
         try await settle()
+        try await eventually { try !harness.wake().active }
         #expect(try harness.wake() == Wake(active: false))
         try await harness.close(context: .background)
     }

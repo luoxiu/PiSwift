@@ -12,14 +12,12 @@ public struct HookRunner: Sendable {
                                      invoke: (Hooks) async throws -> Void) async throws {
         try await withTaskCancellationContext(context) { context in
             let agent = try await runtime.agent(context: context)
-            for registration in agentHooks(agent, taskName: runtime.taskKind) {
+            for (extensionName, registration) in agentHooks(agent, taskName: runtime.taskKind) {
                 guard let handlers = registration.handlers(as: type) else { continue }
                 do { try await invoke(handlers) }
                 catch {
                     if runtime.signal.aborted || context.abortSignal?.aborted == true { throw error }
-                    let info = runtime.scheduler.taskInfo(runtime.invocation)
-                    runtime.scheduler.report(error, ReportInfo(source: .extension, taskId: info.taskId, taskKind: info.taskKind,
-                                                               conversationId: info.conversationId))
+                    runtime.scheduler.report(error, runtime.scheduler.reportInfo(runtime.invocation, from: .extension(extensionName)))
                 }
             }
         }
@@ -53,10 +51,14 @@ public final class TaskRuntime: Sendable {
     internal var taskKind: String { phase.state.withLock { $0.definition.name } }
     /// Returns the clock time in milliseconds.
     public func now() throws -> Int64 { try invocation.check(); return scheduler.now() }
-    /// Forward a non-fatal failure to `HarnessOptions.onReport`, with this task in its info.
-    public func report(_ error: any Error) throws { try invocation.check(); reportTask(error) }
+    /// Forward a non-fatal failure to `HarnessOptions.onReport`, with this task in its info. `from` says whose code
+    /// failed: the task's own (default), `extension` code it called, such as a section, with the extension's name when
+    /// known, or a `host` callback, such as the environment builder.
+    public func report(_ error: any Error, from: ReportFrom = .task) throws { try invocation.check(); reportTask(error, from: from) }
     /// `report()` without the invocation check, for work that ends with it, such as a progress commit.
-    internal func reportTask(_ error: any Error) { scheduler.report(error, scheduler.taskInfo(invocation)) }
+    internal func reportTask(_ error: any Error, from: ReportFrom = .task) {
+        scheduler.report(error, scheduler.reportInfo(invocation, from: from))
+    }
     /// Commits state only while this invocation still owns the task. Inside the callback read only through `tx`:
     /// `snapshot`, `documentState`, `watchDoc`, `getTask`, and the other Session and runtime reads may queue on the line
     /// the callback holds, and then never return.

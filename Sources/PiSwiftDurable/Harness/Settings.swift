@@ -181,10 +181,11 @@ public let defaultProgressPolicy = ProgressPolicy()
 /// Default `settings.restartLimit`.
 public let defaultRestartLimit: Double = 5
 
-/// A restart limit as given when it is a number of restarts, `1` or more (`.infinity` never parks); else the default.
+/// A restart limit as given when it is a number of restarts, `1` or more, rounded down (`.infinity` never parks); else the
+/// default.
 private func restartLimit(_ limit: Double?) -> Double {
     guard let limit, limit >= 1 else { return defaultRestartLimit }
-    return limit
+    return limit.rounded(.down)
 }
 
 /// What a failed run does with the inputs queued behind it (`HarnessSettings.afterFailedRun`).
@@ -225,9 +226,9 @@ public struct HarnessSettings: Sendable {
     /// queued until the next input or queued write, `continue` starts the next run with them, as an answer would, and
     /// `withdraw` settles them `unanswered` with reason `run_failed`. Default `keep`.
     public var afterFailedRun: AfterFailedRun?
-    /// How many times in a row a task may be cut off by a crash or close without changing its state before it is parked
-    /// as blocked (`restart_limit`) instead of run again; `Harness.retryTask()` runs it again. Default 5;
-    /// `.infinity` never parks. Anything below 1 means the default.
+    /// How many times in a row a task may be cut off by a crash, eviction, or reset (a close does not count) without
+    /// changing its state before it is parked as blocked (`restart_limit`) instead of run again; `Harness.retryTask()`
+    /// runs it again. Default 5; `.infinity` never parks. Anything below 1 means the default; a fraction rounds down.
     public var restartLimit: Double?
     /// Selects host defaults and optional request, compaction, and queue policies.
     public init(extensions: [Extension]? = nil, stream: ConversationStreamOptions? = nil,

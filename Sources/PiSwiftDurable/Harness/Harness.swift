@@ -68,7 +68,7 @@ public final class Harness: Sendable {
                 agent: { id, snapshot, callContext in
                     let state = try await session.snapshot(AgentDoc, conversationId: id, context: callContext)
                     return resolveAgent(state: state, snapshot: snapshot, settings: settings(),
-                                        report: { report($0, ReportInfo(source: .extension, conversationId: id)) })
+                                        report: { report($0, ReportInfo(source: .extension, conversationId: id, extension: $1)) })
                 }, env: { id, callContext in
                     guard let build = options.env else { return nil }
                     let cwd = try await session.snapshot(AgentDoc, conversationId: id, context: callContext)?.cwd
@@ -238,7 +238,7 @@ public final class Harness: Sendable {
         let value = try await session.snapshot(AgentDoc, conversationId: id, context: context)
         let report = options.onReport ?? { _, _ in }
         return resolveAgent(state: value, snapshot: options.registry.snapshot(), settings: options.settings?.resolve() ?? resolveSettings(),
-                            report: { report($0, ReportInfo(source: .extension, conversationId: id)) })
+                            report: { report($0, ReportInfo(source: .extension, conversationId: id, extension: $1)) })
     }
 }
 /// The harness cannot use the supplied registry to load its built-in tasks.

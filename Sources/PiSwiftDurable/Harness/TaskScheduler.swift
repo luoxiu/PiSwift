@@ -123,6 +123,11 @@ internal final class TaskScheduler: Sendable {
         /// abort-marks them with reason `restart`, so nothing of them or below them runs a phase again.
         var abandoned: Set<TaskID> = []
         var reconcileScheduled = false
+        /// Reconcile passes underway (they may overlap): their commits finalize held outcomes and mark cascades, recovery
+        /// work.
+        var reconciling = 0
+        /// Tasks a pass left out as parked; each pass checks them again, as `settings.restartLimit` may have risen.
+        var parkedTasks: Set<TaskID> = []
         var sweepScheduled = false
         var reconciles: [UUID: Task<Void, Never>] = [:]
         var subscriptions: [SessionSubscription] = []
@@ -196,7 +201,7 @@ internal final class TaskScheduler: Sendable {
         for record in parked {
             let restarts = (record.restarts ?? 0) + 1
             let error = SessionError.message("Task \(record.id.rawValue) (\(record.kind)) was cut off \(restarts) times without progress; it is parked until retryTask()")
-            report(error, taskInfo(taskId: record.id, kind: record.kind, conversationId: record.conversationId))
+            report(error, taskInfo(taskId: record.id, kind: record.kind, conversationId: record.conversationId, blocked: .restartLimit))
         }
         state.withLock { $0.cascadePending = true }
         scheduleReconcile()
@@ -209,14 +214,23 @@ internal final class TaskScheduler: Sendable {
         state.withLock { state in state.enabled = true; state.wakeDue(now: now) }
         kick()
     }
-    /// Signal every invocation and wait for them; writes nothing. Close calls this after every close listener has run,
-    /// so waits, watches, and streams a task holds end with the Session's reason, not as cancelled by its signal.
+    /// Signal every invocation and wait for them, then write the tasks they ran back as `pending` (`writeAtClose`), as a
+    /// close is not a crash. Close calls this after every close listener has run, so waits, watches, and streams a task
+    /// holds end with the Session's reason, not as cancelled by its signal.
     func join() async {
         let (invocations, worker, reconciles) = state.withLock { (Array($0.joining.values), $0.worker, Array($0.reconciles.values)) }
         for invocation in invocations { invocation.controller.abort() }
         for invocation in invocations { _ = try? await invocation.done.value() }
         await worker?.value
         for work in reconciles { await work.value }
+        // A close is not a crash: a task it stopped is `pending` again, so the next open counts no restart for it.
+        let released = invocations.compactMap { invocation -> TaskRecord? in
+            guard let record = current(invocation.taskId), case .running(let checkpoint, _) = record.state else { return nil }
+            return record.replacing(state: .pending(checkpoint: checkpoint))
+        }
+        if released.isEmpty { return }
+        // A failure leaves them `running`, counted as if cut off; the Storage guard fails the Session and reports it.
+        try? await session.writeAtClose(released.map { .task(value: $0) })
     }
     /// Close listener: runs synchronously once admission is sealed, before `join()`, or when the Session fails.
     private func seal() {
@@ -335,7 +349,7 @@ internal final class TaskScheduler: Sendable {
             state.reconciles[id] = Task { [weak self] in
                 guard let self else { return }
                 let checks = self.state.withLock { state -> Set<TaskID> in
-                    state.reconcileScheduled = false; state.cascadePending = false
+                    state.reconcileScheduled = false; state.cascadePending = false; state.reconciling += 1
                     defer { state.failFastChecks = [] }
                     return state.failFastChecks
                 }
@@ -345,6 +359,8 @@ internal final class TaskScheduler: Sendable {
                     // None is fixed by running the pass again, so it fails the Session, which reports it.
                     self.failSession(error)
                 }
+                self.state.withLock { $0.reconciling -= 1 }
+                self.scheduleWake()
                 self.settleIdle()
                 _ = self.state.withLock { $0.reconciles.removeValue(forKey: id) }
             }
@@ -504,10 +520,13 @@ internal final class TaskScheduler: Sendable {
         if !held && (outcome.status == "faulted" || outcome.status == "orphaned") { try await settleOutcome(tx, record, outcome) }
     }
     func fit(_ record: TaskRecord, definition: AnyTaskDefinition?) -> (reason: String?, error: (any Error)?, migrates: Bool) {
+        fit(id: record.id, version: record.version, definition: definition)
+    }
+    func fit(id: TaskID, version: Double, definition: AnyTaskDefinition?) -> (reason: String?, error: (any Error)?, migrates: Bool) {
         guard let definition else { return ("missing_task", nil, false) }
-        if definition.version < record.version { return ("task_too_old", nil, false) }
-        if definition.version == record.version { return (nil, nil, false) }
-        if let failed = state.withLock({ $0.failedMigrations[record.id] }), failed.0 == definition.identity { return ("migration_failed", failed.1, false) }
+        if definition.version < version { return ("task_too_old", nil, false) }
+        if definition.version == version { return (nil, nil, false) }
+        if let failed = state.withLock({ $0.failedMigrations[id] }), failed.0 == definition.identity { return ("migration_failed", failed.1, false) }
         return (nil, nil, true)
     }
     struct Reservation: Sendable { let invocation: TaskInvocation; let definition: AnyTaskDefinition; let snapshot: RegistrySnapshot; let joinID: UUID }
@@ -515,6 +534,7 @@ internal final class TaskScheduler: Sendable {
     /// after a restart. The first pass after open only abort-marks the abandoned tasks, so later passes see the marks.
     private func reserve() async throws -> [Reservation] {
         var reservations: [Reservation] = []
+        var faulted: [(record: TaskRecord, message: String)] = []
         var abandoned: [TaskID] = []
         let limit = restartLimit()
         do {
@@ -530,26 +550,42 @@ internal final class TaskScheduler: Sendable {
                 // a deadline, and the wake it schedules no longer keeps a timer for a due sleep.
                 let passStart = now()
                 state.withLock { $0.wakeDue(now: passStart) }
+                unparkRaised(limit)
                 let snapshot = registry.snapshot()
                 for taskId in state.withLock({ $0.ordered($0.runnable) }) {
                     let now = now()
+                    var newlyParked = false
                     let candidate = state.withLock { state -> TaskRecord? in
                         guard let record = state.live[taskId], record.state.status != "completing", state.invocations[taskId] == nil,
                               // It returns once what it waits for ends, its record changes, or the work below it ends.
                               state.waitingOn(record, first: true).isEmpty,
                               // It returns at the first pass after its time comes, which the timer, `resume()`, or any
                               // change starts.
-                              !record.notDue(now),
-                              // It returns when `retry()` clears its restart count.
-                              !record.parked(limit) else { state.runnable.remove(taskId); return nil }
+                              !record.notDue(now) else { state.runnable.remove(taskId); return nil }
+                        // It returns when `retry()` clears its restart count, or at a pass after `settings.restartLimit` rose.
+                        if record.parked(limit) {
+                            state.runnable.remove(taskId)
+                            newlyParked = state.parkedTasks.insert(taskId).inserted
+                            return nil
+                        }
                         return record
                     }
+                    // Newly parked without a commit, as after a lowered limit: the graph must hear it.
+                    if newlyParked { notifyBlocked() }
                     guard let original = candidate else { continue }
                     // Work below an owner with cancellation intent waits for its cascade mark instead of running a phase;
                     // schedule the cascade, which may not have run yet.
                     if !original.abortRequested && !original.background && belowCancelled(original.parent) {
                         state.withLock { $0.cascadePending = true }
                         scheduleReconcile()
+                        continue
+                    }
+                    // An abort handler cut off `restartLimit` times in a row would run forever; nothing is left to park it for.
+                    if original.abortRequested, let restarts = original.restarts, Double(restarts) >= limit {
+                        let message = "Abort handler of task \(taskId.rawValue) (\(original.kind)) was cut off \(restarts) times"
+                        try await terminate(tx, record: original, outcome: .faulted(error: TaskOutcomeError(
+                            message: message, detail: .object(["reason": .string("restart_limit")]))))
+                        faulted.append((original, message))
                         continue
                     }
                     var record = original
@@ -562,8 +598,9 @@ internal final class TaskScheduler: Sendable {
                             record = record.replacing(input: next.input, version: definition.version, state: .running(checkpoint: next.checkpoint))
                         } catch {
                             state.withLock { $0.failedMigrations[record.id] = (definition.identity, error) }
-                            // Blocked now without a commit: the graph must hear it.
+                            // Blocked now without a commit: the graph and the host's wake must hear it.
                             notifyBlocked()
+                            scheduleWake()
                             report(error, taskInfo(taskId: record.id, kind: record.kind, conversationId: record.conversationId))
                             resolution = ("migration_failed", error, false)
                         }
@@ -589,6 +626,10 @@ internal final class TaskScheduler: Sendable {
         } catch {
             for reservation in reservations { end(reservation.invocation); finish(reservation) }
             throw error
+        }
+        for (record, message) in faulted {
+            report(SessionError.message(message), taskInfo(taskId: record.id, kind: record.kind, conversationId: record.conversationId,
+                                                           faulted: true, blocked: .restartLimit))
         }
         // Marked, or already marked or gone: done with them. Reserve again, now seeing the marks.
         if !abandoned.isEmpty {
@@ -738,12 +779,12 @@ internal extension TaskRecord {
                           memos: next.outcome == nil ? (memos ?? self.memos) : nil, extensionFields: extensionFields)
     }
     /// The record with an abort mark: `restart` for an abandonment; without a reason, a request, which replaces
-    /// `restart`.
+    /// `restart`. The restart count starts over: it now counts cut-offs of the abort handler.
     func withAbortMark(_ reason: TaskAbortReason? = nil) -> TaskRecord {
         TaskRecord(id: id, conversationId: conversationId, kind: kind, version: version, input: input, state: state,
                    owner: owner, background: background, abortRequested: true, abortReason: reason,
-                   abandonOnRestart: abandonOnRestart, startedAt: startedAt, endedAt: endedAt, restarts: restarts,
-                   memos: memos, extensionFields: extensionFields)
+                   abandonOnRestart: abandonOnRestart, startedAt: startedAt, endedAt: endedAt, memos: memos,
+                   extensionFields: extensionFields)
     }
     /// The record with `restarts` as its restart count; nil removes it.
     func withRestarts(_ restarts: Int?) -> TaskRecord {

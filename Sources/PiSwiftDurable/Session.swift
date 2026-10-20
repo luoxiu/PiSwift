@@ -219,6 +219,16 @@ public final class Session: Sendable {
         try assertHealthy()
         return try await job()
     }
+    /// Internal, for `beforeClose()`: write records straight to Storage, on the line, after admission is sealed. Nothing
+    /// is published, since the Session is closing; a failed Session writes nothing.
+    internal func writeAtClose(_ writes: [StorageWrite]) async throws {
+        if writes.isEmpty { return }
+        let ticket = line.reserve()
+        await ticket.wait()
+        defer { line.release() }
+        if failure != nil { return }
+        _ = try await storage.commit(writes, context: .background)
+    }
     internal func unloadDocuments() async throws {
         // This internal operation also works during harness cleanup.
         let ticket = line.reserve()

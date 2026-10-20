@@ -126,7 +126,8 @@ let settled = try await again.wait(context: context)
 try await reopened.close(context: context)
 ```
 
-Pending tasks keep checkpoints and memos on close. Reopen with their extensions installed,
+Pending tasks keep checkpoints and memos on close; close writes the tasks it stopped back as `pending`, so a
+reopen counts no restart for them (see Failures and Recovery). Reopen with their extensions installed,
 then call `resume`. Submission or waiting also enables scheduling. Example 13 resumes
 through tick 5 without duplicate ticks. Examples 24 and 31 check task and tool recovery.
 Close the Harness to stop its work and close storage.
@@ -206,33 +207,48 @@ let root = try await harness.root(context: context)
 _ = try await root.submit(.input(content: .text("Hello")), context: context)
 ```
 
-## When Work Keeps Failing
+## Failures and Recovery
 
-Work that deterministically crashes its process, by exhausting memory or CPU before its next checkpoint,
-would otherwise be resumed and crash again forever. Open counts each task a crash or close cut off
-(`TaskRecord.restarts`); a state the task commits itself (a new checkpoint, a wait, a sleep, an outcome)
-starts the count over, and memos and document writes do not. Once the count reaches
-`settings.restartLimit` (default 5; `.infinity` never parks), the task is parked: `inspect()` and the task
-graph show it as blocked with reason `restartLimit`, `wake()` does not count it as active, and `onReport`
-gets it once, at the open that parks it. `harness.retryTask(id:context:)` removes the count and runs it
-again, and does nothing for a task that is not parked; `abortTask()` still runs its abort handler.
+**Crash loops.** Work that deterministically crashes its process, by exhausting memory or CPU before its next
+checkpoint, would otherwise be resumed and crash again forever. Open counts each task a crash, eviction, or
+reset cut off (`TaskRecord.restarts`); a close is not counted, as it writes the tasks it stopped back as
+`pending` after joining them. A state the task commits itself that differs from its current one (a new
+checkpoint, a wait, a sleep, an outcome) starts the count over; the same checkpoint committed again, memos,
+and document writes do not. Once the count reaches `settings.restartLimit` (default 5; `.infinity` never
+parks), the task is parked: `inspect()` and the task graph show it as blocked with reason `restartLimit`,
+`wake()` does not count it as active, and `onReport` gets it once, at the open that parks it. Every task
+running when a process dies is counted, not only the one that killed it, so a long stream next to the culprit
+can be parked too: show parked tasks and offer `harness.retryTask(id:context:)`, which removes the count and
+runs one again, and does nothing for a task that is not parked. A parked run keeps its conversation busy.
+`abortTask()` starts the count over and still runs the abort handler; an abort handler cut off that many times
+is not run again, and the task ends `faulted` with detail `{ reason: "restart_limit" }`.
 
-Every report says where it came from: `onReport(error, info)` gets `info.source`, which is `.session` for
-the error that failed the Harness (a Storage error, often a platform reset), `.task` for a task that faulted
-(`faulted: true`), reported a failure, failed to migrate, or was parked, with `taskId`, `taskKind`, and
-`conversationId`, `.extension` for hooks and wrappers, and `.listener`, `.host`, `.timer`, or `.wake` for the
-rest. A host acts on reports outside the scheduler, and can feed task faults of one kind to its own breaker.
+**Reports.** `onReport(error, info)` says where a failure came from: `info.source` is `.session` for the error
+that failed the Harness (a Storage error, often a platform reset), `.task` for a task that faulted
+(`faulted: true`), reported a failure, failed to migrate, or was parked or faulted by the restart limit
+(`blocked: .restartLimit`), with `taskId`, `taskKind`, `conversationId`, and the name of the extension that
+installed the task in `info.extension` (built-in tasks have none), `.extension` for hooks, wrappers, system
+prompt sections, and a tool's invalid structured output, with the name of the extension whose code failed
+when it is known (the hook's or wrapper's, or the last selected extension that provides or wraps the section
+or tool), and `.listener`, `.host` (the environment builder, model provider calls such as cancelling a
+deferred response), `.timer`, or `.wake` for the rest. A task's `runtime.report(error, from:)` says whose
+code failed: its own (default), `.extension(name)`, or `.host`. A host acts on reports outside the scheduler,
+and can feed task faults of one kind to its own breaker.
 
-A run that fails with a model error (`model_error` or `no_model`) leaves the inputs queued behind it waiting
-until the next input arrives. `settings.afterFailedRun` changes that, in the commit that settles the run's
-own inputs: `.continue` applies the final boundary, so the next run starts with them, as after an answer,
-and `.withdraw` settles them `unanswered` with reason `run_failed`, keeping queued writes. A run whose task
-is aborted, faults, or is orphaned keeps its inbox.
+**Queued inputs after a failed run.** A run that fails with a model error (`model_error` or `no_model`) leaves
+the inputs queued behind it waiting until the next input arrives. `settings.afterFailedRun` changes that, in
+the commit that settles the run's own inputs: `.continue` applies the final boundary, so the next run starts
+with them, as after an answer, and `.withdraw` settles them `unanswered` with reason `run_failed`, keeping
+queued writes. A run whose task is aborted, faults, or is orphaned keeps its inbox. With `.continue`, a cause
+that persists, such as a missing model, fails the next run too, so the queue drains one failed run per input.
 
-Tasks blocked on a missing or unmigratable definition show their reason in the task graph too
-(`TaskGraphNode.blocked`), which follows registry changes and failed migrations, and a registry change that
-unblocks them makes `onWake` report the Session active, so a host need not poll them. A blocked task is not
-active in `wake()`: only a registry change, or `retryTask()` for a parked one, can let it run.
+**Blocked tasks.** Tasks blocked on a missing or unmigratable definition show their reason in the task graph
+too (`TaskGraphNode.blocked`), which follows registry changes, failed migrations, and a changed
+`restartLimit`, and a registry change that unblocks them makes `onWake` report the Session active, so a host
+need not poll them. A blocked task is not active in `wake()`: only a registry change, or `retryTask()` for a
+parked one, can let it run. A task a restart abandoned that waits for its definition shows as blocked too.
+`wake()` stays `active` while a reconcile pass, such as open's recovery, is scheduled or underway, since it
+may finalize held outcomes and mark cascades.
 
 ## Extensions and Tools
 
@@ -652,7 +668,10 @@ until a compaction produces a summary. The event snapshot carries it as
 - `onReport` takes `(error, ReportInfo)`, so a closure written for one argument becomes `{ error, _ in }`,
   where upstream's JavaScript still calls one. `ReportInfo.faulted` is a `Bool?` set to `true`.
   `TaskBlockedReason` serves both `inspect()` and `TaskGraphNode.blocked`. `restartLimit` is a `Double`, so
-  `.infinity` never parks. Errors carry no `cause`, so a parked task's report says so in its text and its info.
+  `.infinity` never parks; a fraction rounds down. Errors carry no `cause`, so a parked task's report says so in
+  its text and its info; `ReportInfo.blocked` is a `TaskBlockedReason?` set to `.restartLimit`. `ReportFrom` is an
+  enum (`.task`, `.extension(name)`, `.host`). `agentHooks(_:taskName:)` returns `(extension:hook:)` pairs, where
+  upstream returns `{ extension, handlers }`.
 - This library has no CLI or TUI code. PowerShell and Windows process support are outside scope.
 
 Upstream examples 00–31 have Swift integration tests with assertions for the library

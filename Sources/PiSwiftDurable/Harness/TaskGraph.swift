@@ -146,16 +146,16 @@ private final class TaskGraphMount: Sendable {
     struct State {
         var value: TaskGraph
         var observers: [ObjectIdentifier: TaskGraphObserver] = [:]
-        /// The live records behind the nodes, so a registry change can derive their blocked reasons again.
-        var records: [String: TaskRecord]
+        /// What the blocked reason reads of each live task, so a registry change can derive it again without payloads.
+        var records: [String: BlockedSubject]
     }
     let storage: Mutex<State>
-    init(_ value: TaskGraph, records: [String: TaskRecord]) { storage = Mutex(State(value: value, records: records)) }
+    init(_ value: TaskGraph, records: [String: BlockedSubject]) { storage = Mutex(State(value: value, records: records)) }
 }
 
-/// What the graph asks the scheduler: a record's blocked reason, and when reasons may change without a commit.
+/// What the graph asks the scheduler: a task's blocked reason, and when reasons may change without a commit.
 internal struct TaskGraphBlocking: Sendable {
-    let blocked: @Sendable (TaskRecord) -> TaskBlockedReason?
+    let blocked: @Sendable (BlockedSubject) -> TaskBlockedReason?
     let subscribeBlocked: @Sendable (@escaping @Sendable () -> Void) -> @Sendable () -> Void
 }
 
@@ -281,18 +281,19 @@ internal final class TaskGraphView: Sendable {
             }
         }
     }
-    private func build(_ context: ChordContext) async throws -> (value: TaskGraph, records: [String: TaskRecord]) {
+    private func build(_ context: ChordContext) async throws -> (value: TaskGraph, records: [String: BlockedSubject]) {
         var records: [TaskRecord] = []
         for status in [TaskStatus.pending, .running, .waiting, .sleeping, .completing] {
             records += try await scanAll { try await storage.scanTasks(.init(status: status), limit: 256, cursor: $0, context: context) }
         }
         var tasks: [String: TaskGraphNode] = [:]
-        var live: [String: TaskRecord] = [:]
+        var live: [String: BlockedSubject] = [:]
         for record in records.sorted(by: { $0.id < $1.id }) {
             let owned = try await scanAll { try await storage.scanConversations(.init(ownerTaskId: record.id), limit: 256, cursor: $0, context: context) }
+            let subject = BlockedSubject(record)
             tasks[String(record.id.rawValue)] = TaskGraphNode(record: record, conversations: owned.map(\.id).sorted(),
-                                                              blocked: blocking.blocked(record))
-            live[String(record.id.rawValue)] = record
+                                                              blocked: blocking.blocked(subject))
+            live[String(record.id.rawValue)] = subject
         }
         return (TaskGraph(tasks: tasks), live)
     }
@@ -301,7 +302,7 @@ internal final class TaskGraphView: Sendable {
         // Derived outside the mount's lock: the scheduler reads its own state.
         var reasons: [TaskID: TaskBlockedReason?] = [:]
         for change in publication.changes {
-            if case .task(let record) = change, record.state.status != "terminal" { reasons[record.id] = blocking.blocked(record) }
+            if case .task(let record) = change, record.state.status != "terminal" { reasons[record.id] = blocking.blocked(BlockedSubject(record)) }
         }
         let frame = mount.storage.withLock { state -> (TaskGraph, [Delta.Op], [TaskGraphObserver])? in
             var tasks = state.value.tasks
@@ -313,7 +314,7 @@ internal final class TaskGraphView: Sendable {
                     state.records.removeValue(forKey: key)
                     if tasks.removeValue(forKey: key) != nil { ops.append(.delete(["tasks", .key(key)])) }
                 } else {
-                    state.records[key] = record
+                    state.records[key] = BlockedSubject(record)
                     let next = TaskGraphNode(record: record, conversations: tasks[key]?.conversations ?? [],
                                              blocked: reasons[record.id] ?? nil)
                     if next != tasks[key] { tasks[key] = next; ops.append(.set(["tasks", .key(key)], next.json)) }

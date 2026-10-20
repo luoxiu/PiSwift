@@ -36,19 +36,21 @@ extension TaskScheduler {
     func retry(id: TaskID, context: ChordContext) async throws {
         try await session.commit({ tx in
             guard let current = try await tx.task(id) else { throw SessionError.message("Task \(id.rawValue) does not exist") }
-            if current.state.status == "terminal" || current.restarts == nil { return }
+            if !current.parked(restartLimit()) { return }
             try tx.setTask(current.progressed())
         }, context: context)
         resume()
     }
     /// Why a live task cannot run here, if it cannot: its definition (missing, too old, failed migration) or the restart
-    /// limit. A running task, an abort-marked one, and one holding its outcome are never blocked.
-    func blockedReason(_ record: TaskRecord) -> TaskBlockedReason? {
-        let status = record.state.status
-        if status == "running" || status == "completing" || status == "terminal" || record.abortRequested { return nil }
-        if record.parked(restartLimit()) { return .restartLimit }
+    /// limit. A running task, an abort-requested one, and one holding its outcome are never blocked.
+    func blockedReason(_ record: BlockedSubject) -> TaskBlockedReason? {
+        let status = record.status
+        if status == "running" || status == "completing" || status == "terminal" { return nil }
+        // An abort request runs its handler or orphans the task; a `restart` mark waits for the definition, blocked.
+        if record.abortRequested && record.abortReason == nil { return nil }
+        if parked(abortRequested: record.abortRequested, restarts: record.restarts) { return .restartLimit }
         let definition = registry.snapshot().task(name: record.kind)
-        let fit = fit(record, definition: definition)
+        let fit = fit(id: record.id, version: record.version, definition: definition)
         if let reason = fit.reason { return TaskBlockedReason(rawValue: reason) }
         return fit.migrates && definition?.migrate == nil ? .migrationFailed : nil
     }
@@ -58,17 +60,55 @@ extension TaskScheduler {
         state.withLock { $0.blockedListeners[id] = listener }
         return { [weak self] in _ = self?.state.withLock { $0.blockedListeners.removeValue(forKey: id) } }
     }
+    /// Make parked tasks that a raised `settings.restartLimit` no longer parks candidates again, and tell the graph.
+    func unparkRaised(_ limit: Double) {
+        let unparked = state.withLock { state -> Bool in
+            var unparked = false
+            for id in state.parkedTasks {
+                let record = state.live[id]
+                if let record, record.parked(limit) { continue }
+                state.parkedTasks.remove(id)
+                guard record != nil else { continue }
+                state.runnable.insert(id)
+                unparked = true
+            }
+            return unparked
+        }
+        if unparked { notifyBlocked() }
+    }
     func notifyBlocked() {
         for listener in state.withLock({ Array($0.blockedListeners.values) }) { listener() }
     }
     /// `settings.restartLimit`.
     func restartLimit() -> Double { settings().restartLimit }
-    /// The report info of a failure of a task.
-    func taskInfo(taskId: TaskID, kind: String, conversationId: ConversationID, faulted: Bool? = nil) -> ReportInfo {
-        ReportInfo(source: .task, taskId: taskId, taskKind: kind, conversationId: conversationId, faulted: faulted)
+    /// A task cut off `restartLimit` times in a row; an abort mark still runs its abort handler.
+    func parked(abortRequested: Bool, restarts: Int?) -> Bool {
+        guard let restarts else { return false }
+        return !abortRequested && Double(restarts) >= restartLimit()
+    }
+    /// The report info of a task's failure, with the extension that installed its definition: the code that failed is
+    /// that extension's. Built-in tasks have none.
+    func taskInfo(taskId: TaskID, kind: String, conversationId: ConversationID, faulted: Bool? = nil,
+                  blocked: TaskBlockedReason? = nil) -> ReportInfo {
+        let snapshot = registry.snapshot()
+        let installer = snapshot.task(name: kind).flatMap { installerOf(snapshot, $0) }
+        return ReportInfo(source: .task, taskId: taskId, taskKind: kind, conversationId: conversationId,
+                          extension: installer, faulted: faulted, blocked: blocked)
     }
     func taskInfo(_ invocation: TaskInvocation, faulted: Bool? = nil) -> ReportInfo {
         taskInfo(taskId: invocation.taskId, kind: invocation.kind, conversationId: invocation.conversationId, faulted: faulted)
+    }
+    /// The info of a report a task's runtime makes: the task's own failure names the task's extension; any other names
+    /// whose code failed, if anyone's.
+    func reportInfo(_ invocation: TaskInvocation, from: ReportFrom) -> ReportInfo {
+        switch from {
+        case .task: taskInfo(invocation)
+        case .extension(let name):
+            ReportInfo(source: .extension, taskId: invocation.taskId, taskKind: invocation.kind,
+                       conversationId: invocation.conversationId, extension: name)
+        case .host:
+            ReportInfo(source: .host, taskId: invocation.taskId, taskKind: invocation.kind, conversationId: invocation.conversationId)
+        }
     }
     func waitForTask(id: TaskID, context: ChordContext) async throws -> SettledTask {
         let promise: HarnessPromise<SettledTask> = try await session.readOnLine {
@@ -133,7 +173,7 @@ extension TaskScheduler {
                 let on = state.withLock { $0.waitingOn(record) }
                 if !on.isEmpty { derived = .waiting(on: on) }
                 else if record.notDue(now()), case .sleeping(_, let until, _) = record.state { derived = .sleeping(until: until) }
-                else if record.parked(restartLimit()) { derived = .blocked(reason: .restartLimit) }
+                else if parked(abortRequested: record.abortRequested, restarts: record.restarts) { derived = .blocked(reason: .restartLimit) }
                 else {
                     let definition = snapshot.task(name: record.kind), fit = fit(record, definition: definition)
                     if let reason = fit.reason { derived = .blocked(reason: TaskBlockedReason(rawValue: reason)!, error: fit.error) }
@@ -179,8 +219,11 @@ extension TaskScheduler {
                 throw SessionError.message("Only the scheduler can commit \(outcome.status) outcomes")
             }
             try await terminate(tx, record: current.progressed(), outcome: outcome)
-        // A state the task committed is progress: its restart count starts over.
-        case .running, .waiting, .sleeping: try tx.setTask(current.progressed().replacing(state: next))
+        // A state the task committed that differs from its current one is progress: its restart count starts over. The
+        // same checkpoint committed again, for example as intent before an effect, is not.
+        case .running, .waiting, .sleeping:
+            let same = try jsonStructurallyEqual(JSONValue(encoding: current.state), JSONValue(encoding: next))
+            try tx.setTask((same ? current : current.progressed()).replacing(state: next))
         default: throw SessionError.message("A task handler can commit only running, waiting, sleeping, or terminal state")
         }
     }
@@ -248,4 +291,26 @@ extension TaskScheduler {
         }
         return result.view
     }
+}
+
+/// What `blockedReason()` reads of a task: the task graph keeps only this of each record.
+internal struct BlockedSubject: Sendable, Equatable {
+    let id: TaskID
+    let kind: String
+    let version: Double
+    let abortRequested: Bool
+    let abortReason: TaskAbortReason?
+    let restarts: Int?
+    let status: String
+    /// The part of `record` `blockedReason()` reads.
+    init(_ record: TaskRecord) {
+        id = record.id; kind = record.kind; version = record.version; abortRequested = record.abortRequested
+        abortReason = record.abortReason; restarts = record.restarts; status = record.state.status
+    }
+}
+
+/// The extension that installed `task` in `snapshot`, the last one that lists it; none for a built-in task.
+internal func installerOf(_ snapshot: RegistrySnapshot, _ task: AnyTaskDefinition?) -> String? {
+    guard let task else { return nil }
+    return snapshot.installed().last { $0.tasks.contains { $0.identity == task.identity } }?.name
 }

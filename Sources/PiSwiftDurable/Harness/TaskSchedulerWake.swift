@@ -1,8 +1,9 @@
 import Foundation
 import PiSwiftChord
 
-/// When a Session next needs a running process (`Harness.wake()`). `active`: some task can run now or is running, so a
-/// process that dies must be woken again soon, for example by a recovery alarm. `at`: the earliest sleep not yet due,
+/// When a Session next needs a running process (`Harness.wake()`). `active`: some task can run now or is running, or a
+/// reconcile pass such as open's recovery has not landed yet, so a process that dies must be woken again soon, for
+/// example by a recovery alarm. `at`: the earliest sleep not yet due,
 /// when there is one. Neither: nothing needs a process until new work is submitted. Tasks blocked on a missing or
 /// unmigratable definition, `completing` tasks, and waits on live tasks do not count; the work they wait for does.
 public struct Wake: Sendable, Equatable {
@@ -21,7 +22,9 @@ extension TaskScheduler {
     func wake() -> Wake {
         let now = now(), limit = restartLimit()
         let found = state.withLock { state -> (active: Bool, at: Int64?, unblocked: [TaskRecord]) in
-            var active = !state.invocations.isEmpty
+            // A reconcile pass scheduled or underway is work too: it may finalize held outcomes and mark cascades, at open
+            // as recovery. A process that dies before it lands must be woken again.
+            var active = !state.invocations.isEmpty || state.reconcileScheduled || state.reconciling > 0
             var at: Int64?
             // The records to check against the registry, outside the lock: `fit` reads the scheduler's state.
             var unblocked: [TaskRecord] = []

@@ -268,18 +268,41 @@ func loadedModelTools(_ filter: ModelToolSelection?, _ added: [String]) -> (remo
     return (remove.isEmpty ? nil : remove, add)
 }
 
-/// Returns the hooks supplied by the selected extensions for this task.
-public func agentHooks(_ agent: Agent, taskName: String) -> [HookRegistration] {
-    agent.extensions.flatMap(\.hooks).filter { harnessNamesEqual($0.task, taskName) }
+/// Returns the hooks supplied by the selected extensions for this task, in extension order, with each one's extension.
+public func agentHooks(_ agent: Agent, taskName: String) -> [(extension: String, hook: HookRegistration)] {
+    agent.extensions.flatMap { item in
+        item.hooks.filter { harnessNamesEqual($0.task, taskName) }.map { (extension: item.name, hook: $0) }
+    }
 }
 /// Returns the hooks supplied by the selected extensions for this task.
 public func agentHooks<Handlers: Sendable>(_ agent: Agent, taskName: String, as type: Handlers.Type) -> [Handlers] {
-    agentHooks(agent, taskName: taskName).compactMap { $0.handlers(as: type) }
+    agentHooks(agent, taskName: taskName).compactMap { $0.hook.handlers(as: type) }
+}
+/// The extension whose code a section of `agent` runs: the last selected one that provides or wraps it.
+func sectionExtension(_ agent: Agent, key: String) -> String? {
+    var found: String?
+    for item in agent.extensions {
+        let provides = item.sections.contains { harnessNamesEqual($0.key, key) }
+        let wraps = item.wraps.contains { if case .section(let target, _) = $0 { return harnessNamesEqual(target, key) }; return false }
+        if provides || wraps { found = item.name }
+    }
+    return found
+}
+/// The extension whose code a tool of `agent` runs: the last selected one that provides or wraps it.
+func toolExtension(_ agent: Agent, name: String) -> String? {
+    var found: String?
+    for item in agent.extensions {
+        let provides = item.tools.contains { harnessNamesEqual($0.name, name) }
+        let wraps = item.wraps.contains { if case .tool(let target, _) = $0 { return harnessNamesEqual(target, name) }; return false }
+        if provides || wraps { found = item.name }
+    }
+    return found
 }
 
-/// Resolves stored agent names against the current registry and host defaults.
+/// Resolves stored agent names against the current registry and host defaults. A wrapper that throws or renames drops
+/// its target and is reported, with the name of the wrapper's extension.
 public func resolveAgent(state: AgentState? = nil, snapshot: RegistrySnapshot, settings: Settings = resolveSettings(),
-                         report: (any Error) -> Void = { _ in }) -> Agent {
+                         report: (any Error, String) -> Void = { _, _ in }) -> Agent {
     let selected: [String]
     switch state?.extensions {
     case .exact(let names): selected = names
@@ -304,11 +327,12 @@ public func resolveAgent(state: AgentState? = nil, snapshot: RegistrySnapshot, s
     }
     for extensionValue in extensions {
         for wrap in extensionValue.wraps {
+            let wrapReport = { (error: any Error) in report(error, extensionValue.name) }
             switch wrap {
             case let .tool(name, transform):
-                applyWrap(&tools, name: name, nameOf: { $0.name }, transform: transform, report: report)
+                applyWrap(&tools, name: name, nameOf: { $0.name }, transform: transform, report: wrapReport)
             case let .section(key, transform):
-                applyWrap(&sections, name: key, nameOf: { $0.key }, transform: transform, report: report)
+                applyWrap(&sections, name: key, nameOf: { $0.key }, transform: transform, report: wrapReport)
             }
         }
     }

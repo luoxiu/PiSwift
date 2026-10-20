@@ -18,7 +18,7 @@ public enum TaskBlockedReason: String, Sendable, Codable {
     case taskTooOld = "task_too_old"
     /// The installed task migration threw an error.
     case migrationFailed = "migration_failed"
-    /// A crash or close cut the task off `settings.restartLimit` times in a row; `Harness.retryTask()` runs it again.
+    /// A crash cut the task off `settings.restartLimit` times in a row; `Harness.retryTask()` runs it again.
     case restartLimit = "restart_limit"
 }
 /// The task definition state selected during harness inspection.

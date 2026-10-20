@@ -110,7 +110,7 @@ private enum RegistryTestError: Error { case wrapper, section }
             .tool("grep", { item in calls.withLock { $0 += 1 }; return item })
         ]))
         let reports = Mutex(0)
-        let agent = resolveAgent(snapshot: registry.snapshot(), report: { _ in reports.withLock { $0 += 1 } })
+        let agent = resolveAgent(snapshot: registry.snapshot(), report: { _, _ in reports.withLock { $0 += 1 } })
         #expect(agent.tools.map(\.name) == ["read", "bash", "edit"])
         #expect(agent.tools[1].description == "venv bash (timed) [2]")
         #expect(calls.withLock { $0 } == 0); #expect(reports.withLock { $0 } == 0)
@@ -128,10 +128,12 @@ private enum RegistryTestError: Error { case wrapper, section }
             .section("cwd", { _ in throw RegistryTestError.section })
         ]))
         let errors = Mutex<[String]>([])
-        let agent = resolveAgent(snapshot: registry.snapshot(), report: { error in errors.withLock { $0.append(String(describing: error)) } })
+        let agent = resolveAgent(snapshot: registry.snapshot(), report: { error, extensionName in
+            errors.withLock { $0.append("\(extensionName): \(error)") }
+        })
         #expect(agent.tools.map(\.name) == ["bash"])
         #expect(agent.sections.map(\.key) == ["preamble"])
-        #expect(errors.withLock { $0 } == ["wrapper", "Wrapper renamed edit to renamed", "section"])
+        #expect(errors.withLock { $0 } == ["broken: wrapper", "broken: Wrapper renamed edit to renamed", "broken: section"])
     }
 
     @Test("orders sections by extension, replaces same keys in place, and renders instructions last and unwrapped")
@@ -144,7 +146,7 @@ private enum RegistryTestError: Error { case wrapper, section }
             .section("instructions", { _ in throw RegistryTestError.wrapper })
         ]))
         let reports = Mutex(0)
-        let agent = resolveAgent(state: .init(instructions: "Be terse."), snapshot: registry.snapshot(), report: { _ in reports.withLock { $0 += 1 } })
+        let agent = resolveAgent(state: .init(instructions: "Be terse."), snapshot: registry.snapshot(), report: { _, _ in reports.withLock { $0 += 1 } })
         let input = PromptInput(conversationId: rootConversationID, agent: agent)
         var texts: [String?] = []
         for item in agent.sections { texts.append(try await item.render(input, .background)) }
@@ -162,8 +164,10 @@ private enum RegistryTestError: Error { case wrapper, section }
         try registry.install(Extension(name: "b", hooks: [hook("pi.tool", handlers: CustomHooks(id: 2))]))
         let defaults = resolveAgent(snapshot: registry.snapshot())
         #expect(agentHooks(defaults, taskName: "pi.tool", as: CustomHooks.self).map(\.id) == [1, 2])
+        #expect(agentHooks(defaults, taskName: "pi.tool").map(\.extension) == ["a", "b"])
         let reverse = resolveAgent(state: .init(extensions: .exact(["b", "a"])), snapshot: registry.snapshot())
         #expect(agentHooks(reverse, taskName: "pi.tool", as: CustomHooks.self).map(\.id) == [2, 1])
+        #expect(agentHooks(reverse, taskName: "pi.tool").map(\.extension) == ["b", "a"])
         let onlyB = resolveAgent(state: .init(extensions: .exact(["b"])), snapshot: registry.snapshot())
         #expect(agentHooks(onlyB, taskName: "pi.generation").isEmpty)
         #expect(defaults.model == nil); #expect(defaults.thinkingLevel == .off); #expect(defaults.cwd == nil)
