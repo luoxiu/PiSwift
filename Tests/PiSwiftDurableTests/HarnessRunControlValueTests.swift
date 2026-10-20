@@ -8,14 +8,16 @@ import PiSwiftDurableTesting
 @Suite struct HarnessRunControlValueTests {
     @Test func documentPoliciesMatchIdleAndRunningStates() throws {
         let info = CheckpointInfo(deltasSinceBase: 1)
-        #expect(try InboxDoc.definition.checkpointWhen?(["items": []], [], info) == true)
-        #expect(try InboxDoc.definition.checkpointWhen?(["items": [[:]]], [], info) == false)
-        #expect(try UsageDoc.definition.checkpointWhen?(["models": [:], "tools": [:]], [], info) == true)
-        #expect(try ProviderDoc.definition.checkpointWhen?(["sessionId": "id"], [], info) == true)
-        #expect(try LiveDoc.definition.checkpointWhen?([:], [], info) == true)
-        #expect(try LiveDoc.definition.checkpointWhen?(["generation": [:]], [], info) == false)
-        #expect(try LiveDoc.definition.checkpointWhen?(["tools": [["status": "pending"]]], [], info) == true)
-        #expect(try LiveDoc.definition.checkpointWhen?(["tools": [["status": "running"]]], [], info) == false)
+        #expect(try InboxDoc.definition.checkpointWhen(["items": []], [], info) == true)
+        #expect(try InboxDoc.definition.checkpointWhen(["items": [[:]]], [], info) == false)
+        #expect(try UsageDoc.definition.checkpointWhen(["models": [:], "tools": [:]], [], info) == true)
+        #expect(try ProviderDoc.definition.checkpointWhen(["sessionId": "id"], [], info) == true)
+        #expect(try LiveDoc.definition.checkpointWhen([:], [], info) == true)
+        #expect(try LiveDoc.definition.checkpointWhen(["generation": [:]], [], info) == false)
+        #expect(try LiveDoc.definition.checkpointWhen(["tools": [["status": "pending"]]], [], info) == true)
+        #expect(try LiveDoc.definition.checkpointWhen(["tools": [["status": "running"]]], [], info) == false)
+        // Upstream 5c1736f82: the nested call documents retire with their task, so they keep only deltas.
+        #expect(try NestedCallDoc.definition.checkpointWhen([:], [], CheckpointInfo(deltasSinceBase: 1000)) == false)
         for definition in [LiveDoc.definition, InboxDoc.definition, UsageDoc.definition, ProviderDoc.definition] {
             #expect(definition.version == 1)
             if case .conversation(let history, let fork, _) = definition.semantics {

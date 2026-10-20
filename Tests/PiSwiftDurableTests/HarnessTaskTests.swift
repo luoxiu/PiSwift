@@ -113,7 +113,7 @@ func harnessOpen(_ tasks: [AnyTaskDefinition], storage: any DurableStorage = Mem
         let retained = Mutex<TaskRuntime?>(nil)
         let values = SessionTestLog<JSONValue>()
         let childID = Mutex<TaskID?>(nil)
-        let progress = try TaskDocToken<JSONObject>(kind: "test.memo-progress", version: 1, initial: { ["lines": .array([])] })
+        let progress = try TaskDocToken<JSONObject>(kind: "test.memo-progress", version: 1, initial: { ["lines": .array([])] }, checkpointWhen: { _, _, _ in false })
         let child = harnessOneStep("test.memo-child") { _, runtime, context in
             try await runtime.commit({ _, _ in .terminal(outcome: .completed(result: .number(0))) }, context: context)
         }

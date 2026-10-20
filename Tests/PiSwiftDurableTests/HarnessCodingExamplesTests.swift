@@ -62,7 +62,7 @@ private func codingSystemText(_ messages: [Message]) -> String {
         let directory = try toolTestDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         try Data("app.listen(3000);\n".utf8).write(to: directory.appendingPathComponent("server.ts"))
-        let token = try RewindableConversationDocToken<CodingExamplePlan>(kind: "app.plan", version: 1, fork: .asOf, initial: { .init() })
+        let token = try RewindableConversationDocToken<CodingExamplePlan>(kind: "app.plan", version: 1, fork: .asOf, initial: { .init() }, checkpointWhen: { _, _, _ in false })
         let submit = try ToolRegistration(name: "submit_plan", description: "Submit the plan as a list of steps.",
             parameters: ["type": "object", "properties": ["steps": ["type": "array", "items": ["type": "string"]]], "required": ["steps"]]) { args, api, context in
                 let steps = (args["steps"]?.arrayValue ?? []).compactMap(\.stringValue)
@@ -133,7 +133,7 @@ private func codingSystemText(_ messages: [Message]) -> String {
     @Test func sandboxPerConversationKeepsFilesSeparate() async throws {
         let aliceDirectory = try toolTestDirectory(), bobDirectory = try toolTestDirectory()
         defer { try? FileManager.default.removeItem(at: aliceDirectory); try? FileManager.default.removeItem(at: bobDirectory) }
-        let token = try ConversationDocToken<CodingExampleSandbox>(kind: "app.sandbox", version: 1, fork: .initial, initial: { .init() })
+        let token = try ConversationDocToken<CodingExampleSandbox>(kind: "app.sandbox", version: 1, fork: .initial, initial: { .init() }, checkpointWhen: { _, _, _ in false })
         let setup = HarnessChatSetup()
         try setup.registry.install(try CodingTools)
         setup.models.setResponses([

@@ -132,7 +132,7 @@ extension HarnessSchedulerRaceTests {
 
     // upstream harness-tasks.test.ts:1222
     @Test func closeSealsBeforeSignalCallbacksAndClosesWatchesBeforeJoining() async throws {
-        let notes = try SessionDocToken<JSONObject>(kind: "test.reentrant-notes", version: 1, initial: { JSONObject() })
+        let notes = try SessionDocToken<JSONObject>(kind: "test.reentrant-notes", version: 1, initial: { JSONObject() }, checkpointWhen: { _, _, _ in false })
         let reference = Mutex<Harness?>(nil), callback = Mutex<Task<Void, any Error>?>(nil)
         let entered = SessionTestGate(), end = Mutex<WatchEnd?>(nil)
         let definition = harnessOneStep("test.reentrant-close") { _, runtime, _ in

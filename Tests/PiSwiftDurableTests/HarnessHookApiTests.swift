@@ -6,7 +6,7 @@ import PiSwiftDurableTesting
 
 @Suite struct HarnessHookApiTests {
     @Test func hookApiSharesRuntimeMemosAndReadsAndEndsWithInvocation() async throws {
-        let token = try SessionDocToken<JSONObject>(kind: "h5.hook-api", version: 1, initial: { ["text": "committed"] })
+        let token = try SessionDocToken<JSONObject>(kind: "h5.hook-api", version: 1, initial: { ["text": "committed"] }, checkpointWhen: { _, _, _ in false })
         let retained = Mutex<HookApi?>(nil)
         let definition = harnessOneStep("h5.hook-api") { _, runtime, context in
             let api = runtime.hookApi

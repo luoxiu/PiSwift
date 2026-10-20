@@ -402,7 +402,7 @@ private func advancedSubagentExtension(_ token: ConversationDocToken<AdvancedSub
 extension UpstreamAdvancedExamplesTests {
     // 23-subagent-background.ts: spawn, report, stop, status, and resume after restart.
     @Test func backgroundSubagent() async throws {
-        let token = try ConversationDocToken<AdvancedSubagents>(kind: "app.subagents", version: 1, fork: .initial, initial: { .init() })
+        let token = try ConversationDocToken<AdvancedSubagents>(kind: "app.subagents", version: 1, fork: .initial, initial: { .init() }, checkpointWhen: { _, _, _ in false })
         let setup = HarnessChatSetup()
         try setup.registry.install(advancedSubagentExtension(token))
         let longAnswer = HarnessUnanswered(), whaleAnswer = HarnessUnanswered()

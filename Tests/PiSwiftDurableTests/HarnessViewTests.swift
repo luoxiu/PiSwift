@@ -186,7 +186,7 @@ private func viewNote(_ conversation: Conversation, _ kind: String, head: EntryI
     }
     @Test func oneCommitCombinesDocumentAndSeveralEntriesAndIgnoresCustomDocuments() async throws {
         let chat = try await openChat(setup: HarnessChatSetup()), recorder = try await ViewTestRecorder(chat.root)
-        let other = try ConversationDocToken<JSONObject>(kind: "app.other", version: 1, fork: .initial, initial: { ["n": 0] })
+        let other = try ConversationDocToken<JSONObject>(kind: "app.other", version: 1, fork: .initial, initial: { ["n": 0] }, checkpointWhen: { _, _, _ in false })
         try await chat.root.commit({ tx in
             _ = try await tx.appendEntry(chat.root.id, value: .init(kind: "a"))
             try await tx.doc(LiveDoc, conversationId: chat.root.id).set("tools", [])

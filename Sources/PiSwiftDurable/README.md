@@ -15,7 +15,10 @@ The package requires macOS 15 or iOS 18. It uses Swift 6 strict concurrency.
 - **Harness** opens a Session and runs durable tasks. All writes use atomic commits.
 - **Conversation** contains immutable transcript entries. Compare handles by `id`.
 - **Document** holds JSON state. A typed token defines scope, history, initial value,
-  version, and fork policy. Use Codable, Sendable value types.
+  version, fork policy, and the required `checkpointWhen` policy: whether an ordinary change is
+  stored as a complete base, bounding replay. There is no default; `{ _, _, _ in false }` keeps
+  ordinary changes as deltas, and a document that never writes a base can grow its replay without
+  bound while it is live. Use Codable, Sendable value types.
 - **Task** runs a state machine with a stored checkpoint. A conversation or task owns it.
   Built-in tasks run generation, tools, and compaction.
 - **Submission** admits input or a write. `wait` returns its stored outcome.

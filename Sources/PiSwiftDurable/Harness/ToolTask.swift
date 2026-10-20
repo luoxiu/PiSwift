@@ -167,7 +167,9 @@ public struct NestedCallState: Sendable, Equatable, Codable {
 /// terminal commit adds its result. One document per call, so no commit rewrites the others. Retires with the caller.
 /// Upstream's seed is `null`; acquire a member with `seed: .null`.
 public let NestedCallDoc = try! TaskDocFamilyToken<NestedCallState, JSONValue>(
-    kind: "pi.tool.nested-call", version: 1, initial: { _ in NestedCallState() })
+    kind: "pi.tool.nested-call", version: 1, initial: { _ in NestedCallState() },
+    // The document retires with its task.
+    checkpointWhen: { _, _, _ in false })
 
 /// Built-in tool task: resolves the called tool among its phase agent's tools, validates, runs `beforeTool`, records
 /// intent, executes, runs `afterTool`, and settles the result, all in one `call` handler so nothing separates resolution

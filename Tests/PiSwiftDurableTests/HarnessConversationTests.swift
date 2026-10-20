@@ -6,7 +6,7 @@ import PiSwiftDurableTesting
 @testable import PiSwiftDurable
 
 private func harnessNote() throws -> RewindableConversationDocToken<JSONObject> {
-    try RewindableConversationDocToken(kind: "h5.note", version: 1, fork: .asOf, initial: { ["text": ""] })
+    try RewindableConversationDocToken(kind: "h5.note", version: 1, fork: .asOf, initial: { ["text": ""] }, checkpointWhen: { _, _, _ in false })
 }
 private func harnessAppend(_ conversation: Conversation, _ text: String) async throws -> EntryRecord {
     try await conversation.commit({ tx in try await tx.appendEntry(conversation.id, value: EntryDraft(kind: "message", data: .string(text))) }, context: .background)

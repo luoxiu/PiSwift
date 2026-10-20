@@ -10,7 +10,7 @@ import PiSwiftDurableTesting
         let clock = TestClock()
         let conversationID = Mutex<ConversationID?>(nil)
         let child = harnessHoldingTask(clock: clock)
-        let taskDoc = try TaskDocToken<JSONObject>(kind: "test.held-notes", version: 1, initial: { ["text": "notes"] })
+        let taskDoc = try TaskDocToken<JSONObject>(kind: "test.held-notes", version: 1, initial: { ["text": "notes"] }, checkpointWhen: { _, _, _ in false })
         let parent = harnessOneStep("test.hold-conversation") { _, runtime, context in
             try await runtime.commit({ tx, _ in
                 let conversation = try await tx.createConversation(ownership: .task(taskId: runtime.taskId)).id

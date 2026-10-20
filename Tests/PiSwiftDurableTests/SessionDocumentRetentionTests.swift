@@ -16,20 +16,20 @@ private struct RetentionVersioned: Codable, Sendable, Equatable { var count: Int
 private enum RetentionFailure: Error { case checkpoint }
 
 private let CounterDoc = try! ConversationDocToken<RetentionCounter>(kind: "test.retention.counter", version: 1, fork: .initial,
-    initial: { RetentionCounter(count: 0) })
+    initial: { RetentionCounter(count: 0) }, checkpointWhen: { _, _, _ in false })
 private let RewindableDoc = try! RewindableConversationDocToken<RetentionCounter>(kind: "test.retention.rewindable", version: 1,
-    fork: .asOf, initial: { RetentionCounter(count: 0) })
+    fork: .asOf, initial: { RetentionCounter(count: 0) }, checkpointWhen: { _, _, _ in false })
 /// A third-party conversation family: one member per event.
 private let EventDoc = try! ConversationDocFamilyToken<RetentionEvent, Int>(kind: "test.retention.event", version: 1, fork: .initial,
-    initial: { RetentionEvent(seq: $0) })
+    initial: { RetentionEvent(seq: $0) }, checkpointWhen: { _, _, _ in false })
 private let SessionCounterDoc = try! SessionDocToken<RetentionCounter>(kind: "test.retention.session-counter", version: 1,
-    initial: { RetentionCounter(count: 0) })
+    initial: { RetentionCounter(count: 0) }, checkpointWhen: { _, _, _ in false })
 /// A session document whose checkpoint predicate throws, so the commit that changes it fails while it settles.
 private let Failing = try! SessionDocToken<RetentionCounter>(kind: "test.retention.failing", version: 1,
     initial: { RetentionCounter(count: 0) }, checkpointWhen: { _, _, _ in throw RetentionFailure.checkpoint })
 /// A conversation document any Harness test can read.
 private let TestDoc = try! ConversationDocToken<RetentionCounter>(kind: "test.retention.harness", version: 1, fork: .initial,
-    initial: { RetentionCounter(count: 0) })
+    initial: { RetentionCounter(count: 0) }, checkpointWhen: { _, _, _ in false })
 
 /// A controllable millisecond clock.
 private final class RetentionClock: Sendable {
@@ -355,14 +355,14 @@ private func untilEvicted(_ session: Session) async throws {
 
     // :390
     @Test("migrates a document again after its eviction") func migratesAgain() async throws {
-        let v1 = try SessionDocToken<RetentionCounter>(kind: "test.retention.migrating", version: 1, initial: { RetentionCounter(count: 1) })
+        let v1 = try SessionDocToken<RetentionCounter>(kind: "test.retention.migrating", version: 1, initial: { RetentionCounter(count: 1) }, checkpointWhen: { _, _, _ in false })
         let migrations = SessionTestLog<Int>()
         let v2 = try SessionDocToken<RetentionMigrated>(kind: "test.retention.migrating", version: 2,
             initial: { RetentionMigrated(count: 0, migrated: true) },
             migrate: { value, _ in
                 migrations.append(1)
                 return ["count": value["count"] ?? 0, "migrated": true]
-            })
+            }, checkpointWhen: { _, _, _ in false })
         let session = open(0).session
         try await session.commit({ tx in _ = try await tx.doc(v1) }, context: .background)
         try await settleLine(session)
@@ -475,10 +475,10 @@ private func untilEvicted(_ session: Session) async throws {
 
     // :540
     @Test("keeps a reloaded newer version cached while an observer of the older one is attached") func olderObserverPins() async throws {
-        let v1 = try SessionDocToken<RetentionCounter>(kind: "test.retention.versioned", version: 1, initial: { RetentionCounter(count: 3) })
+        let v1 = try SessionDocToken<RetentionCounter>(kind: "test.retention.versioned", version: 1, initial: { RetentionCounter(count: 3) }, checkpointWhen: { _, _, _ in false })
         let v2 = try SessionDocToken<RetentionVersioned>(kind: "test.retention.versioned", version: 2,
             initial: { RetentionVersioned(count: 0, v2: true) },
-            migrate: { value, _ in ["count": value["count"] ?? 0, "v2": true] })
+            migrate: { value, _ in ["count": value["count"] ?? 0, "v2": true] }, checkpointWhen: { _, _, _ in false })
         let opened = open(0), session = opened.session
         try await session.commit({ tx in _ = try await tx.doc(v1) }, context: .background)
         let state = try #require(try await session.documentState(v1, context: .background))

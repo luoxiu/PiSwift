@@ -9,7 +9,7 @@ private enum SessionKernelFailure: Error, Equatable { case storage, callback }
     /// Upstream session-documents: "fails the Session after a Storage failure and publishes nothing".
     @Test func SessionFailsAfterStorageFailure() async throws {
         let harness = try await openTestSession()
-        let token = try SessionDocToken<JSONObject>(kind: "poison", version: 1, initial: { ["count": 0] })
+        let token = try SessionDocToken<JSONObject>(kind: "poison", version: 1, initial: { ["count": 0] }, checkpointWhen: { _, _, _ in false })
         try await harness.session.commit({ tx in _ = try await tx.doc(token) }, context: .background)
         let before = try await harness.session.snapshot(token, context: .background)
         let published = harness.publications.count
@@ -57,7 +57,7 @@ private enum SessionKernelFailure: Error, Equatable { case storage, callback }
 
     @Test func SessionPublicationIsSynchronousAndCarriesContext() async throws {
         let harness = try await openTestSession()
-        let token = try SessionDocToken<JSONObject>(kind: "publication", version: 1, initial: { ["count": 0] })
+        let token = try SessionDocToken<JSONObject>(kind: "publication", version: 1, initial: { ["count": 0] }, checkpointWhen: { _, _, _ in false })
         let marker = ChordContextKey<Int>("Session test")
         let context = ChordContext.background.withValue(42, for: marker)
         let values = SessionTestLog<Int>()
@@ -200,7 +200,7 @@ private enum SessionKernelFailure: Error, Equatable { case storage, callback }
 extension SessionKernelTests {
     @Test func SessionCallbackFailureRevokesDraftAndRollsBack() async throws {
         let harness = try await openTestSession()
-        let token = try SessionDocToken<JSONObject>(kind: "callback.rollback", version: 1, initial: { ["count": 0] })
+        let token = try SessionDocToken<JSONObject>(kind: "callback.rollback", version: 1, initial: { ["count": 0] }, checkpointWhen: { _, _, _ in false })
         try await harness.session.commit({ tx in
             _ = try await tx.doc(token)
         }, context: .background)
@@ -303,7 +303,7 @@ private struct SessionCreationHooks: SessionHooks {
 
 extension SessionKernelTests {
     @Test func SessionConversationCreatedHookStagesDocumentsAtomically() async throws {
-        let token = try ConversationDocToken<JSONObject>(kind: "hook.created", version: 1, fork: .initial, initial: { ["created": false] })
+        let token = try ConversationDocToken<JSONObject>(kind: "hook.created", version: 1, fork: .initial, initial: { ["created": false] }, checkpointWhen: { _, _, _ in false })
         for fail in [false, true] {
             let calls = SessionTestLog<ConversationID>()
             let storage = ControlledStorage()
@@ -353,7 +353,7 @@ extension SessionKernelTests {
         let storage = ControlledStorage()
         let session = try await Session.open(storage: storage, hooks: hooks, context: .background)
         hooks.session.withLock { $0 = session }
-        let token = try SessionDocToken<JSONObject>(kind: "hook.cleanup", version: 1, initial: { ["value": 0] })
+        let token = try SessionDocToken<JSONObject>(kind: "hook.cleanup", version: 1, initial: { ["value": 0] }, checkpointWhen: { _, _, _ in false })
         try await session.commit({ tx in _ = try await tx.doc(token) }, context: .background)
         try await session.close(context: .background)
         #expect(hooks.calls.values == ["unloaded"])
