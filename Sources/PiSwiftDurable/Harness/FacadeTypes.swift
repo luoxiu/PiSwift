@@ -137,14 +137,17 @@ public struct HarnessOptions: Sendable {
     /// The Harness clock, epoch milliseconds; nil means the system time. Sleeping tasks store deadlines on it, so every
     /// process that opens the same storage must use the same clock.
     public var now: (@Sendable () -> Int64)?
-    /// Arms every timer the Harness uses: pacing progress commits, freeing idle memory (`background`), and, without
-    /// `onWake`, resuming sleeping tasks; and the timers of `TaskRuntime.setTimer()`. Nil means a task that sleeps
-    /// (upstream `setTimeout`). Tests can pass fake timers; a host can keep timers off a process that should be suspended.
+    /// Arms the timers of the Session, the scheduler, and its tasks: pacing progress commits, freeing idle memory
+    /// (`background`), and, without `onWake`, resuming sleeping tasks; and the timers of `TaskRuntime.setTimer()`. The
+    /// local environment and file watcher keep their own timers. Nil means a task that sleeps (upstream `setTimeout`).
+    /// Tests can pass fake timers; a host can keep timers off a process that should be suspended.
     public var setTimer: SetTimer?
     /// Wakes the process for sleeping tasks instead of a `setTimer` timer. Without it, while scheduling runs, a timer
     /// resumes sleeping tasks when they are due. With it, the Harness arms no timer for them: it calls `onWake` after open
     /// and whenever `Harness.wake()` changes, and the host arms its own wakeup and calls `resume()` when it fires. Called
-    /// off the Session line; it may call `wake()` and `resume()`, and must not block. A throw is reported and ignored.
+    /// off the Session line, after the commit that changed the value, so a host arms a recovery wakeup before calls that
+    /// can start work. It may call `wake()` and `resume()`, and must not block. A throw is reported, and the value is
+    /// offered again at the next change.
     public var onWake: (@Sendable (Wake) throws -> Void)?
     /// Runs inside the transaction that creates a conversation.
     public var conversationCreated: (@Sendable (Transaction, ConversationRecord) async throws -> Void)?

@@ -98,7 +98,8 @@ public actor Progress {
     }
     private func fired(_ id: Int) {
         guard timer?.id == id else { return }
-        timer = nil; flush()
+        // Checks the clock again: a timer that fires early waits for the rest.
+        timer = nil; schedule()
     }
     private func flush() {
         guard !stopped, dirty else { return }

@@ -168,15 +168,21 @@ private final class OutputTestClock: ProgressClock, Sendable {
         let second = Task { try await progress.markAndWait() }
         try #require(await outputEventuallyAsync { clock.timers.count == 1 })
         #expect(clock.timers.map(\.delayMs) == [60])
-        clock.set(1_100)
+        // A timer that fires early commits nothing and waits for the rest.
+        clock.set(1_080)
         clock.timers[0].callback()
+        try #require(await outputEventuallyAsync { clock.timers.count == 2 })
+        #expect(commits.withLock { $0 } == [1_000])
+        #expect(clock.timers.map(\.delayMs) == [60, 20])
+        clock.set(1_100)
+        clock.timers[1].callback()
         try await second.value
         #expect(commits.withLock { $0 } == [1_000, 1_100])
         try #require(await outputEventuallyAsync { await !progress.hasCommitInFlight })
         await progress.mark()
-        #expect(clock.timers.map(\.delayMs) == [60, 100])
+        #expect(clock.timers.map(\.delayMs) == [60, 20, 100])
         _ = await progress.stop()
-        #expect(clock.timers[1].disarmed)
+        #expect(clock.timers[2].disarmed)
     }
     @Test("rejects the waiters of a failed commit and reports its error") func failedProgress() async {
         let errors = Mutex<[String]>([])

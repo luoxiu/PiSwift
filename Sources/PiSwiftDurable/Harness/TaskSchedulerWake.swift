@@ -75,13 +75,12 @@ extension TaskScheduler {
                 armTimer(state.withLock { $0.enabled } ? wake.at : nil)
                 continue
             }
-            let changed = state.withLock { state -> Bool in
-                if state.lastWake == wake { return false }
-                state.lastWake = wake
-                return true
-            }
-            guard changed else { continue }
-            do { try onWake(wake) } catch { report(error) }
+            if state.withLock({ $0.lastWake == wake }) { continue }
+            do {
+                try onWake(wake)
+                // Only a delivered wake counts: after a throw, the next change or kick offers it again.
+                state.withLock { $0.lastWake = wake }
+            } catch { report(error) }
         }
     }
 

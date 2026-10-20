@@ -507,6 +507,10 @@ internal final class TaskScheduler: Sendable {
                 }
                 if !pending.isEmpty { abandoned = pending; return }
                 try await loadScopes()
+                // Every pass picks up sleeps whose time has come: a pass started by any change may be the first to run after
+                // a deadline, and the wake it schedules no longer keeps a timer for a due sleep.
+                let passStart = now()
+                state.withLock { $0.wakeDue(now: passStart) }
                 let snapshot = registry.snapshot()
                 for taskId in state.withLock({ $0.ordered($0.runnable) }) {
                     let now = now()
@@ -514,7 +518,8 @@ internal final class TaskScheduler: Sendable {
                         guard let record = state.live[taskId], record.state.status != "completing", state.invocations[taskId] == nil,
                               // It returns once what it waits for ends, its record changes, or the work below it ends.
                               state.waitingOn(record, first: true).isEmpty,
-                              // It returns when its time comes: `wakeDue(now:)` from the timer or `resume()`.
+                              // It returns at the first pass after its time comes, which the timer, `resume()`, or any
+                              // change starts.
                               !record.notDue(now) else { state.runnable.remove(taskId); return nil }
                         return record
                     }

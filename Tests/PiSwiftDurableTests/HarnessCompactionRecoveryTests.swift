@@ -124,9 +124,22 @@ private func compactionStoredCheckpoint(_ chat: CompactionChat, _ id: TaskID) as
         chat.setup.updateSettings { $0.retry = .init(enabled: true, maxRetries: 2, baseDelayMs: 60_000) }
         chat.script.appendSummary([.message(compactionFailure("overloaded"))])
         let id = try await chat.root.compact(context: .background), first = chat
-        try await eventually { try await compactionLive(first).compactions?.first?.retry != nil }
-        let checkpoint = try await compactionStoredCheckpoint(chat, id)
-        #expect(checkpoint["phase"] == .string("retry") && checkpoint["attempt"] == .number(1))
+        try await eventually { try await first.harness.getTask(id: id, context: .background)?.state.status == "sleeping" }
+        let until: Int64 = 1000 + 60_000
+        guard case .sleeping(let checkpoint, until, _)? = try await chat.harness.getTask(id: id, context: .background)?.state else {
+            Issue.record("The retry must sleep until \(until)"); return
+        }
+        #expect(checkpoint["phase"] == .string("retry") && checkpoint["attempt"] == .number(1) && checkpoint["until"] == .number(Double(until)))
+        try await chat.harness.close(context: .background)
+        // Earlier versions slept inside a running `retry` phase: reopened before its time, it sleeps again.
+        let database = try AppleSqliteDatabase(path: path.path)
+        try database.run("UPDATE tasks SET status = 'running', record = json_set(json_remove(record, '$.state.until'), '$.state.status', 'running') WHERE id = ?",
+                         [.integer(id.rawValue)])
+        try database.close()
+        chat = try await compactionReopen(chat, path: path)
+        let reopened = chat
+        try await eventually { try await reopened.harness.getTask(id: id, context: .background)?.state.status == "sleeping" }
+        #expect(chat.script.summaryRequests.count == 1)
         try await chat.harness.close(context: .background)
         clock.advance(by: 120_000)
         chat.script.appendSummary([.message(chatAssistant("SUMMARY"))])

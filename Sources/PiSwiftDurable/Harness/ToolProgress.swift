@@ -65,11 +65,19 @@ private actor ToolProgressWriter {
         return bytes
     }
 }
-/// The Harness clock and timers for progress pacing.
-private struct RuntimeProgressClock: ProgressClock {
+/// The Harness clock and timers for progress pacing. After the invocation ends nothing more commits, and the clock
+/// answers with the last time it read.
+private final class RuntimeProgressClock: ProgressClock {
     let runtime: TaskRuntime
-    // After the invocation ends nothing more commits; the clock only has to answer.
-    func now() -> Int64 { (try? runtime.now()) ?? Int64(Date().timeIntervalSince1970 * 1000) }
+    private let last = Mutex<Int64>(0)
+    init(runtime: TaskRuntime) { self.runtime = runtime }
+    func now() -> Int64 {
+        last.withLock { last in
+            // The invocation ended: keep the last time read.
+            if let now = try? runtime.now() { last = now }
+            return last
+        }
+    }
     func setTimer(_ callback: @escaping @Sendable () -> Void, delayMs: Int64) -> @Sendable () -> Void {
         runtime.setTimer(callback, delayMs: delayMs)
     }

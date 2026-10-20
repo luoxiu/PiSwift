@@ -124,6 +124,7 @@ import PiSwiftDurableTesting
             guard wake.active else { return wake.at }
             return min(now + 60_000, wake.at ?? .max)
         }
+        // A throw is reported, and the wake is offered again at the next change.
         let options = HarnessOptions(models: models, registry: registry,
             onWake: { wake in alarm.arm(at: alarmTime(wake, now: clock())) })
         let harness = try await Harness.open(storage: SqliteStorage.open(path: path),
@@ -132,7 +133,8 @@ import PiSwiftDurableTesting
         // When the alarm fires: resume due sleeps and work a lost process left, then arm again.
         try harness.resume()
         alarm.arm(at: alarmTime(try harness.wake(), now: clock()))
-        // Before admitting work: an early alarm is harmless, a missing one strands the work.
+        // Arm before any call that can start work (submit, compact, abortTask, abort, a registry change):
+        // `onWake` runs after the commit. An early alarm is harmless, a missing one strands the work.
         alarm.arm(at: alarmTime(Wake(active: true, at: try harness.wake().at), now: clock()))
         let root = try await harness.root(context: context)
         _ = try await root.submit(.input(content: .text("Hello")), context: context)

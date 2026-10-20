@@ -128,12 +128,12 @@ private func runGeneration(_ checkpoint: GenerationCheckpoint, _ runtime: TaskRu
         }, context: context)
     // After the sleep until `pollAt`; a run before it (an early wake, or a record of an earlier version) sleeps again.
     case .poll:
+        let pollAt = try required(checkpoint.pollAt, "pollAt")
+        if pollAt > (try runtime.now()) { return try await runtime.sleepUntil(pollAt, checkpoint: checkpoint, context: context) }
         let ref = try required(checkpoint.model, "model")
         guard let model = runtime.models.getModel(provider: ref.provider, modelId: ref.modelId) else {
             return try await failGeneration(runtime, ref: ref, context: context)
         }
-        let pollAt = try required(checkpoint.pollAt, "pollAt")
-        if pollAt > (try runtime.now()) { return try await runtime.sleepUntil(pollAt, checkpoint: checkpoint, context: context) }
         let bridge = ContextCancellationBridge(context: context.withAbortSignal(runtime.signal))
         defer { withExtendedLifetime(bridge) {} }
         let message = await runtime.models.fetchDeferred(model: model, handle: try required(checkpoint.handle, "handle").handle,

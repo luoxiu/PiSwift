@@ -56,6 +56,34 @@ private func napped(_ until: Int64, slept: Int64) throws -> TaskState {
     .sleeping(checkpoint: try JSONValue(encoding: NapState(phase: .after, slept: slept)), until: until)
 }
 
+/// A host `setTimer` that records the timers that pace work and declines background ones.
+private final class FakeTimers: Sendable {
+    final class Timer: Sendable {
+        let delayMs: Int64
+        let callback: @Sendable () -> Void
+        private let state = Mutex(false)
+        init(delayMs: Int64, callback: @escaping @Sendable () -> Void) { self.delayMs = delayMs; self.callback = callback }
+        var disarmed: Bool { state.withLock { $0 } }
+        func disarm() { state.withLock { $0 = true } }
+    }
+    private let state = Mutex<[Timer]>([])
+    var armed: [Timer] { state.withLock { $0 } }
+    func live() -> [Timer] { armed.filter { !$0.disarmed } }
+    var setTimer: SetTimer {
+        { [self] callback, delayMs, options in
+            if options.background { return nil }
+            let timer = Timer(delayMs: delayMs, callback: callback)
+            state.withLock { $0.append(timer) }
+            return { timer.disarm() }
+        }
+    }
+}
+private final class Flag: Sendable {
+    private let state: Mutex<Bool>
+    init(_ value: Bool) { state = Mutex(value) }
+    var value: Bool { get { state.withLock { $0 } } set { state.withLock { $0 = newValue } } }
+}
+
 @Suite struct HarnessSleepTests {
     @Test func sleepsWithoutAnInvocationAndResumesAtItsCheckpointOnceDue() async throws {
         let clock = TestClock(now: 1_000), wakes = SessionTestLog<Wake>(), runs = SessionTestLog<Int>()
@@ -138,78 +166,151 @@ private func napped(_ until: Int64, slept: Int64) throws -> TaskState {
         try await harness.close(context: .background)
     }
 
-    @Test func resumesADueSleepWithATimerWhenThereIsNoOnWake() async throws {
-        let nap = napTask(30)
-        let harness = try await openTasks(tasks: [AnyTaskDefinition(nap)]).harness
-        let id = try await startNap(harness, nap)
-        let started = ContinuousClock.now
-        // Only this call: the timer wakes the task.
-        try harness.resume()
-        let receipt = try await harness.waitForTask(id: id, context: .background)
-        #expect(receipt.outcome.status == "completed")
-        #expect(ContinuousClock.now - started >= .milliseconds(25))
-        try await harness.close(context: .background)
-    }
-
-    @Test func armsItsTimersThroughSetTimerASleepsInTheForegroundADeclinedBackgroundOneIsNotNeeded() async throws {
-        struct Armed: Sendable { let delayMs: Int64; let background: Bool; let callback: @Sendable () -> Void }
-        let clock = TestClock(now: 1_000), armed = SessionTestLog<Armed>()
+    @Test func resumesADueSleepWithItsTimerWithoutOnWakeWithBackgroundTimersDeclined() async throws {
+        let clock = TestClock(now: 1_000), timers = FakeTimers()
         let nap = napTask(500)
-        let setTimer: SetTimer = { callback, delayMs, options in
-            armed.append(Armed(delayMs: delayMs, background: options.background, callback: callback))
-            // Declines background timers, as a host that must hibernate would.
-            if options.background { return nil }
-            return {}
-        }
-        let harness = try await openTasks(tasks: [AnyTaskDefinition(nap)], now: clock.nowFunction, setTimer: setTimer).harness
+        let harness = try await openTasks(tasks: [AnyTaskDefinition(nap)], now: clock.nowFunction, setTimer: timers.setTimer).harness
         let id = try await startNap(harness, nap)
         try harness.resume()
-        try await eventually { armed.values.contains { !$0.background && $0.delayMs == 500 } }
+        try await eventually { timers.live().contains { $0.delayMs == 500 } }
         #expect(try await stateOf(harness, id)?.status == "sleeping")
         clock.advance(by: 500)
-        try #require(armed.values.first { !$0.background && $0.delayMs == 500 }).callback()
-        #expect(try await harness.waitForTask(id: id, context: .background).outcome == .completed(result: 1_500))
+        try #require(timers.live().first { $0.delayMs == 500 }).callback()
+        // Polled: `waitForTask()` would call `resume()`, which wakes due sleeps itself.
+        try await eventually { try await stateOf(harness, id)?.status == "terminal" }
+        #expect(try await stateOf(harness, id)?.outcome == .completed(result: 1_500))
         try await harness.close(context: .background)
     }
 
-    @Test func disarmsAnInvocationsTimersWhenItEnds() async throws {
-        let disarmed = SessionTestLog<Int>(), fired = SessionTestLog<String>(), armed = SessionTestLog<Int64>()
+    @Test func runsADueSleepAtAnySchedulingPassBeforeItsTimerFires() async throws {
+        let clock = TestClock(now: 1_000), timers = FakeTimers()
+        let nap = napTask(500)
+        let opened = try await openTasks(tasks: [AnyTaskDefinition(nap)], now: clock.nowFunction, setTimer: timers.setTimer)
+        let harness = opened.harness
+        let id = try await startNap(harness, nap)
+        try harness.resume()
+        try await eventually { try await stateOf(harness, id)?.status == "sleeping" }
+        // Swift: passes run on other threads; wait until one dropped the sleeping task from the candidates, as upstream's
+        // microtasks have by now.
+        try await eventually { harness.tasks.state.withLock { !$0.runnable.contains(id) && $0.invocations[id] == nil } }
+        // The deadline passes, and an unrelated change starts a pass before the timer fires.
+        clock.advance(by: 500)
+        try opened.registry.install(Extension(name: "unrelated"))
+        // Polled: `waitForTask()` would call `resume()`, which wakes due sleeps itself.
+        try await eventually { try await stateOf(harness, id)?.status == "terminal" }
+        #expect(try await stateOf(harness, id)?.outcome == .completed(result: 1_500))
+        try await harness.close(context: .background)
+    }
+
+    @Test func disarmsTheSleepTimerWhenTheSleepIsAbortedAndWhenTheHarnessCloses() async throws {
+        let clock = TestClock(now: 1_000), timers = FakeTimers()
+        let short = napTask(500)
+        let harness = try await openTasks(tasks: [AnyTaskDefinition(short)], now: clock.nowFunction, setTimer: timers.setTimer).harness
+        let aborted = try await startNap(harness, short)
+        try harness.resume()
+        try await eventually { timers.live().contains { $0.delayMs == 500 } }
+        _ = try await harness.abortTask(id: aborted, context: .background)
+        _ = try await harness.waitForTask(id: aborted, context: .background)
+        try await eventually { timers.live().isEmpty }
+        let kept = try await startNap(harness, short)
+        try await eventually { try await stateOf(harness, kept)?.status == "sleeping" }
+        try await eventually { !timers.live().isEmpty }
+        #expect(timers.live().map(\.delayMs) == [500])
+        try await harness.close(context: .background)
+        #expect(timers.live().isEmpty)
+    }
+
+    @Test func disarmsAnInvocationsTimersWhenItEndsAndALateFireRunsNothing() async throws {
+        let fired = SessionTestLog<String>()
         let timed = harnessOneStep("test.timed") { _, runtime, context in
             _ = runtime.setTimer({ fired.append("late") }, delayMs: 60_000)
             try await runtime.commit({ _, _ in try completed(0) }, context: context)
         }
-        let setTimer: SetTimer = { _, delayMs, _ in
-            armed.append(delayMs)
-            let id = armed.count - 1
-            if delayMs == 60_000 { return { disarmed.append(id) } }
-            return {}
-        }
-        let harness = try await openTasks(tasks: [AnyTaskDefinition(timed)], setTimer: setTimer).harness
+        let timers = FakeTimers()
+        let harness = try await openTasks(tasks: [AnyTaskDefinition(timed)], setTimer: timers.setTimer).harness
         let root = try await harness.root(context: .background)
         let id = try await harnessStart(root, timed)
         try harness.resume()
         _ = try await harness.waitForTask(id: id, context: .background)
-        try await eventually { disarmed.count == 1 }
+        let timer = try #require(timers.armed.first { $0.delayMs == 60_000 })
+        try await eventually { timer.disarmed }
+        // A host timer that fires anyway: the ended invocation's callback does not run.
+        timer.callback()
         #expect(fired.values.isEmpty)
         try await harness.close(context: .background)
     }
 
-    // Swift: on the test clock, not real time. A pass that runs more than 10 ms after the sleep commit, as one can under
-    // parallel load, would find the real-time sleep due and run it.
-    @Test func keepsNoTimerWithOnWake() async throws {
-        let clock = TestClock(now: 1_000)
-        let nap = napTask(10)
-        let harness = try await openTasks(tasks: [AnyTaskDefinition(nap)], now: clock.nowFunction, onWake: { _ in }).harness
+    @Test func armsNoTimerForSleepsWithOnWake() async throws {
+        let clock = TestClock(now: 1_000), timers = FakeTimers()
+        let nap = napTask(500)
+        let harness = try await openTasks(tasks: [AnyTaskDefinition(nap)], now: clock.nowFunction, onWake: { _ in },
+                                          setTimer: timers.setTimer).harness
         let id = try await startNap(harness, nap)
         try harness.resume()
         try await eventually { try await stateOf(harness, id)?.status == "sleeping" }
-        try await Task.sleep(for: .milliseconds(60))
-        #expect(try await stateOf(harness, id)?.status == "sleeping")
-        clock.advance(by: 10)
+        try await settle()
+        #expect(timers.armed.isEmpty)
+        clock.advance(by: 500)
         #expect(try harness.wake() == Wake(active: true))
         try harness.resume()
         #expect(try await harness.waitForTask(id: id, context: .background).outcome.status == "completed")
         try await harness.close(context: .background)
+    }
+
+    // Swift: naps of 300 ms, not 10. Under parallel load the wake could be computed after a 10 ms sleep is already due,
+    // and a due sleep runs at the next pass without any timer, so nothing would be declined.
+    @Test func armsAForegroundTimerTheHostDeclinesWithTheDefaultTimerReportingItOnce() async throws {
+        let nap = napTask(300)
+        let opened = try await openTasks(tasks: [AnyTaskDefinition(nap)], setTimer: { _, _, _ in nil })
+        let harness = opened.harness
+        let first = try await startNap(harness, nap)
+        let second = try await startNap(harness, nap)
+        try harness.resume()
+        #expect(try await harness.waitForTask(id: first, context: .background).outcome.status == "completed")
+        #expect(try await harness.waitForTask(id: second, context: .background).outcome.status == "completed")
+        #expect(opened.reports.values.map { String(describing: $0) } == [
+            "HarnessOptions.setTimer declined a timer that paces work; using setTimeout",
+        ])
+        try await harness.close(context: .background)
+    }
+
+    @Test func countsNeitherAWaitOnASleepingTaskNorAnOutcomeHeldOverOneAsActive() async throws {
+        struct ParentInput: Codable, Sendable { let hold: Bool }
+        struct ParentState: TaskCheckpoint {
+            enum Phase: String, Codable, Sendable { case start, joined }
+            var phase: Phase = .start
+            var child: TaskID?
+        }
+        let clock = TestClock(now: 1_000)
+        let child = napTask(500)
+        let parent = TaskDefinition<ParentInput, ParentState, JSONValue, NoTaskHooks>(name: "test.parent", version: 1,
+            initial: { _ in ParentState() }, phase: { task, runtime, context in
+                switch task.checkpoint.phase {
+                case .start:
+                    try await runtime.commit({ tx, _ in
+                        let id = try await tx.createTask(child, input: .null, options: .init(ownership: .task(taskId: task.id)))
+                        let joined = try JSONValue(encoding: ParentState(phase: .joined, child: id))
+                        // Held: completes next, holding its outcome over the sleeping child. Otherwise waits for it.
+                        return task.input.hold ? .running(checkpoint: joined) : .waiting(checkpoint: joined, on: [id], policy: .allSettled)
+                    }, context: context)
+                case .joined:
+                    try await runtime.commit({ _, _ in .terminal(outcome: .completed(result: .null)) }, context: context)
+                }
+            }, abort: { _, _, _ in })
+        for hold in [false, true] {
+            let harness = try await openTasks(tasks: [AnyTaskDefinition(parent), AnyTaskDefinition(child)], now: clock.nowFunction,
+                                              onWake: { _ in }).harness
+            let root = try await harness.root(context: .background)
+            let id = try await root.commit({ tx in
+                try await tx.createTask(parent, input: ParentInput(hold: hold), options: .init(ownership: .conversation()))
+            }, context: .background)
+            try harness.resume()
+            let parked = hold ? "completing" : "waiting"
+            try await eventually { try await stateOf(harness, id)?.status == parked }
+            // Swift: the parent's invocation ends on another thread after its state is stored, so wait for the whole value.
+            try await eventually { try harness.wake() == Wake(active: false, at: 1_500) }
+            try await harness.close(context: .background)
+        }
     }
 
     @Test func runsTheAbortHandlerOfASleepingTaskWithoutWaitingForItsTime() async throws {
@@ -270,26 +371,30 @@ private func napped(_ until: Int64, slept: Int64) throws -> TaskState {
         try await harness.close(context: .background)
     }
 
-    @Test func reportsAThrowingOnWakeAndKeepsCallingItForLaterChanges() async throws {
+    @Test func reportsAThrowingOnWakeAndOffersTheSameWakeAgainAtTheNextPass() async throws {
         struct AlarmFailed: Error {}
-        let clock = TestClock(now: 1_000), wakes = SessionTestLog<Wake>()
+        let clock = TestClock(now: 1_000), wakes = SessionTestLog<Wake>(), failing = Flag(true)
         let nap = napTask(1_000)
         let opened = try await openTasks(tasks: [AnyTaskDefinition(nap)], now: clock.nowFunction, onWake: { wake in
             wakes.append(wake)
-            if wake.at != nil { throw AlarmFailed() }
+            if failing.value && wake.at != nil { throw AlarmFailed() }
         })
         let harness = opened.harness
         let id = try await startNap(harness, nap)
         try harness.resume()
-        try await eventually { try await stateOf(harness, id)?.status == "sleeping" }
-        try await settle()
-        #expect(opened.reports.count > 0)
-        #expect(opened.reports.values.allSatisfy { $0 is AlarmFailed })
+        try await eventually { wakes.values.contains { $0.at == 2_000 && !$0.active } }
+        // Swift: the report follows the throw on the delivering task.
+        try await eventually { opened.reports.values.contains { $0 is AlarmFailed } }
+        // The host recovers; an unrelated change offers the same, undelivered wake again.
+        failing.value = false
+        let offered = wakes.count
+        try opened.registry.install(Extension(name: "unrelated"))
+        try await eventually { wakes.count > offered }
+        #expect(wakes.values.last == Wake(active: false, at: 2_000))
         clock.advance(by: 1_000)
         try harness.resume()
         _ = try await harness.waitForTask(id: id, context: .background)
-        try await settle()
-        #expect(wakes.values.last == Wake(active: false))
+        try await eventually { wakes.values.last == Wake(active: false) }
         try await harness.close(context: .background)
     }
 }

@@ -164,11 +164,14 @@ after the wait goes in the next phase, and what it needs goes in the checkpoint.
 `.sleeping(checkpoint:until:)` returned from `runtime.commit()` is the same sleep, committed together
 with other writes. Retry backoffs and deferred-response polls of the built-in tasks sleep the same way.
 
-Every timer the Harness uses goes through `HarnessOptions.setTimer` (default: a task that
-sleeps), and every time through `now` (default the system time); pass both to run a Harness on a
-fake clock, as tests do with PiSwiftDurableTesting's `TestClock`. Sleep deadlines are stored on `now`,
-so every process that opens one storage must use the same clock. While scheduling runs, a timer resumes
-sleeping tasks when they are due. A Swift task keeps no process alive: the host keeps it running.
+The timers of the Session, the scheduler, and its tasks go through `HarnessOptions.setTimer` (default:
+a task that sleeps), and their times through `now` (default the system time); pass both to run a Harness
+on a fake clock, as tests do with PiSwiftDurableTesting's `TestClock`. The local environment and file
+watcher keep their own timers. Sleep deadlines are stored on `now`, so every process that opens one
+storage must use the same clock. While scheduling runs, a timer resumes sleeping tasks when they are due.
+A Swift task keeps no process alive: the host keeps it running. A timer must not fire before its delay
+and may fire late. A foreground timer the host throws on or declines is armed with the default timer
+instead, and the first failure is reported.
 
 A host whose process can be suspended or ended wakes it itself. With `onWake`, the Harness arms no timer
 for sleeps; it tells the host what `harness.wake()` says whenever that changes: `active` while some task
@@ -181,6 +184,7 @@ request, and arms a recovery heartbeat while work runs, never later than the ear
     guard wake.active else { return wake.at }
     return min(now + 60_000, wake.at ?? .max)
 }
+// A throw is reported, and the wake is offered again at the next change.
 let options = HarnessOptions(models: models, registry: registry,
     onWake: { wake in alarm.arm(at: alarmTime(wake, now: clock())) })
 let harness = try await Harness.open(storage: SqliteStorage.open(path: path),
@@ -189,7 +193,8 @@ try harness.resume()
 // When the alarm fires: resume due sleeps and work a lost process left, then arm again.
 try harness.resume()
 alarm.arm(at: alarmTime(try harness.wake(), now: clock()))
-// Before admitting work: an early alarm is harmless, a missing one strands the work.
+// Arm before any call that can start work (submit, compact, abortTask, abort, a registry change):
+// `onWake` runs after the commit. An early alarm is harmless, a missing one strands the work.
 alarm.arm(at: alarmTime(Wake(active: true, at: try harness.wake().at), now: clock()))
 let root = try await harness.root(context: context)
 _ = try await root.submit(.input(content: .text("Hello")), context: context)
@@ -583,7 +588,8 @@ until a compaction produces a summary. The event snapshot carries it as
   `PI_DURABLE_DOCUMENT_RETENTION_MS` replaces the default for the test suite's second run.
 - `SetTimer` gets `TimerOptions` and may throw; `onWake` may throw. The default timer is a task that
   sleeps: a Swift task keeps no process alive, so it never declines a background timer, where
-  upstream's `setTimeout` default unreferences one, or declines it where it cannot. The Session and the
+  upstream's `setTimeout` default unreferences one, or declines it where it cannot. A foreground timer the
+  host declines falls back to it, and the report keeps upstream's text, which names `setTimeout`. The Session and the
   scheduler may call `setTimer` while they hold an internal lock, so a host's must return without calling
   back into the Harness or firing first. `HarnessOptions` has `now` and `setTimer` in place of the earlier
   Swift `clock`. A sleep's `until` is an `Int64` of milliseconds, so the only time `sleepUntil` can reject
