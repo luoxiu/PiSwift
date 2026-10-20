@@ -47,7 +47,10 @@ func summaryPrompt(messages: [Message], instructions: String?) -> String {
     return "<conversation>\n\(serializeConversation(messages))\n</conversation>\n\n\(summarizationPrompt)\(focus)"
 }
 
-/// Read the transcript as text. Do not include system messages.
+/// Read the transcript as text. Do not include system messages. Thinking is omitted too: providers return summaries of
+/// the real reasoning, and replayed thinking is often not part of the live context (a block that does not match its
+/// request is dropped), so including it can make the request larger than the context it summarizes. Visible text,
+/// tool calls, and tool results record what happened.
 public func serializeConversation(_ messages: [Message]) -> String {
     var parts: [String] = []
     for message in messages {
@@ -60,9 +63,6 @@ public func serializeConversation(_ messages: [Message]) -> String {
             }
             if !text.isEmpty { parts.append("[User]: \(text)") }
         case .assistant(let assistant):
-            let thinking = assistant.content.compactMap { block -> String? in
-                if case .thinking(let value) = block { return value.thinking }; return nil
-            }
             let text = assistant.content.compactMap { block -> String? in
                 if case .text(let value) = block { return value.text }; return nil
             }
@@ -73,7 +73,6 @@ public func serializeConversation(_ messages: [Message]) -> String {
                 let arguments = pairs.map { "\($0.key)=\($0.value)" }.joined(separator: ", ")
                 return "\(call.name)(\(arguments))"
             }
-            if !thinking.isEmpty { parts.append("[Assistant thinking]: \(thinking.joined(separator: "\n"))") }
             if !text.isEmpty { parts.append("[Assistant]: \(text.joined(separator: "\n"))") }
             if !calls.isEmpty { parts.append("[Assistant tool calls]: \(calls.joined(separator: "; "))") }
         case .toolResult(let result):

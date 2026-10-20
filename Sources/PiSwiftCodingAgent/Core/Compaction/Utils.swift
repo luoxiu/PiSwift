@@ -68,6 +68,11 @@ public func formatFileOperations(readFiles: [String], modifiedFiles: [String]) -
     return "\n\n" + sections.joined(separator: "\n\n")
 }
 
+/// Serializes messages to text for summarization, so the summarizer reads a transcript instead of continuing it.
+/// Thinking is omitted. Providers return summaries of the real reasoning, and replayed thinking is often not part of
+/// the model's live context: for example, a block that does not match its request is dropped. Including it can make
+/// the summarization request larger than the context it summarizes. Visible text, tool calls, and tool results record
+/// what happened.
 public func serializeConversation(_ messages: [Message]) -> String {
     var parts: [String] = []
 
@@ -88,23 +93,19 @@ public func serializeConversation(_ messages: [Message]) -> String {
             }
         case .assistant(let assistant):
             var textParts: [String] = []
-            var thinkingParts: [String] = []
             var toolCalls: [String] = []
             for block in assistant.content {
                 switch block {
                 case .text(let text):
                     textParts.append(text.text)
-                case .thinking(let thinking):
-                    thinkingParts.append(thinking.thinking)
+                case .thinking:
+                    break
                 case .toolCall(let call):
                     let args = call.arguments.map { "\($0.key)=\(String(describing: $0.value.value))" }.joined(separator: ", ")
                     toolCalls.append("\(call.name)(\(args))")
                 case .image:
                     break
                 }
-            }
-            if !thinkingParts.isEmpty {
-                parts.append("[Assistant thinking]: \(thinkingParts.joined(separator: "\n"))")
             }
             if !textParts.isEmpty {
                 parts.append("[Assistant]: \(textParts.joined(separator: "\n"))")
