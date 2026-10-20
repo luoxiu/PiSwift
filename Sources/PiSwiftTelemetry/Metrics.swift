@@ -1,4 +1,4 @@
-// Ports upstream `packages/telemetry/src/metrics.ts` at 48909d987.
+// Ports upstream `packages/telemetry/src/metrics.ts` at d9025a5f5.
 // Upstream infers exact names, kinds, and attributes from schema data. Swift cannot, so only the data
 // and the runtime behavior of `createTypedMetrics` are ported.
 
@@ -22,7 +22,7 @@ public struct HistogramOptions: Sendable, Hashable {
     public var description: String?
     /// The unit of its values.
     public var unit: String?
-    /// Bucket hints: finite and strictly increasing. Backends own aggregation and may translate them.
+    /// Bucket hints; callers supply finite, strictly increasing values. Backends own aggregation and may translate them.
     public var boundaries: [Double]?
 
     /// Creates histogram options.
@@ -33,19 +33,19 @@ public struct HistogramOptions: Sendable, Hashable {
     }
 }
 
-/// A monotonic counter. It accepts non-negative finite increments.
+/// A monotonic counter. Callers supply non-negative finite increments.
 public protocol TelemetryCounter: Sendable {
     /// Adds `value`.
     func add(_ value: Double, attributes: SpanAttributes?)
 }
 
-/// A counter that also decreases. It accepts finite signed values.
+/// A counter that also decreases. Callers supply finite signed values.
 public protocol TelemetryUpDownCounter: Sendable {
     /// Adds `value`, which may be negative.
     func add(_ value: Double, attributes: SpanAttributes?)
 }
 
-/// A distribution of finite signed values.
+/// A distribution of signed values. Callers supply finite ones.
 public protocol TelemetryHistogram: Sendable {
     /// Records `value`. `context` optionally correlates the measurement with a span, as an exemplar.
     func record(_ value: Double, attributes: SpanAttributes?, context: (any TelemetryContext)?)
@@ -66,8 +66,9 @@ extension TelemetryHistogram {
     public func record(_ value: Double, attributes: SpanAttributes? = nil) { record(value, attributes: attributes, context: nil) }
 }
 
-/// Optional adapter capability. Factories and recording methods are synchronous, passive, and do not throw;
-/// an invalid measurement or invalid boundaries are ignored.
+/// Optional adapter capability with synchronous factories and recording methods.
+/// Typed inputs are trusted; callers supply finite measurements and nonnegative counter increments.
+/// Malformed input behavior is unspecified.
 public protocol TelemetryMetrics: AnyObject, Sendable {
     /// Returns a counter named `name`.
     func counter(_ name: String, options: InstrumentOptions?) -> any TelemetryCounter

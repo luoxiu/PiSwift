@@ -1,4 +1,4 @@
-// Ports upstream `packages/telemetry/src/memory.ts` at 2ec55d808.
+// Ports upstream `packages/telemetry/src/memory.ts` at d9025a5f5.
 
 import Foundation
 import Synchronization
@@ -143,9 +143,22 @@ private func carrier(of context: any TelemetryContext) -> TelemetryCarrier? {
     (context as? any InMemoryCarrierContext)?.carrier
 }
 
+/// `<scope>:<span>`, the globally unique ID of a carrier's span.
+private func carrierId(_ carrier: TelemetryCarrier) -> String {
+    "\(carrier["pi-memory-scope"] ?? "undefined"):\(carrier["pi-memory-span"] ?? "undefined")"
+}
+
 private struct MutableRecordedTelemetrySpan {
     var span: RecordedTelemetrySpan
     var explicitStatus = false
+    /// Wall-clock start, in milliseconds.
+    var startedMs: Double
+    /// The monotonic clock at the start.
+    var clock: Double
+    /// Wall-clock end: the start plus the monotonic duration.
+    var endedMs: Double?
+    /// Each event's offset from the start, in the order of `span.events`.
+    var eventTimes: [Double] = []
 }
 
 /// Where a new span belongs: the parent's carrier, its local ID if this recorder owns it, and, for a parent span (not
@@ -156,9 +169,14 @@ private struct InMemoryParent {
     let span: Int?
 }
 
+private struct InMemoryMeasurement {
+    let intervalMs: Double
+    let measurement: RecordedTelemetryMeasurement
+}
+
 private struct InMemoryTelemetryState {
     var spans: [MutableRecordedTelemetrySpan] = []
-    var measurements: [RecordedTelemetryMeasurement] = []
+    var measurements: [InMemoryMeasurement] = []
     var nextSpanId = 1
     var nextEndSequence = 1
 }
@@ -166,39 +184,52 @@ private struct InMemoryTelemetryState {
 /// The recording state that a context and all of its spans share.
 private final class InMemoryTelemetryRecorder: Sendable {
     let scope = UUID().uuidString.lowercased()
+    let clock: TelemetryClock
     let state = Mutex(InMemoryTelemetryState())
 
-    /// Appends a span, or returns nil when its parent span is settled. Span IDs are positions plus one.
+    init(clock: TelemetryClock) { self.clock = clock }
+
+    /// Appends a span, or returns nil when its parent span is settled. Span IDs are positions plus one. A span's trace
+    /// is its parent's, or its own ID for a root.
     func createSpan(parent: InMemoryParent?, options: SpanOptions) -> (id: Int, carrier: TelemetryCarrier)? {
         let attributes = copyAttributes(options.attributes)
         let links = (options.links ?? []).compactMap(copyLink)
+        let startedMs = clock.now()
+        let started = clock.monotonic()
         return state.withLock { state in
             if let parent = parent?.span, state.spans[parent - 1].span.settled { return nil }
             let id = state.nextSpanId
             state.nextSpanId += 1
-            let context = ["pi-memory-scope": scope, "pi-memory-span": String(id)]
+            let context = [
+                "pi-memory-scope": scope,
+                "pi-memory-span": String(id),
+                "pi-memory-trace": parent?.context["pi-memory-trace"] ?? "\(scope):\(id)",
+            ]
             state.spans.append(MutableRecordedTelemetrySpan(span: RecordedTelemetrySpan(
                 id: id, parentId: parent?.localId, context: context, parentContext: parent?.context, links: links,
-                name: options.name, attributes: attributes, settled: false)))
+                name: options.name, attributes: attributes, settled: false), startedMs: startedMs, clock: started))
             return (id, context)
         }
     }
 
     func settle(_ id: Int, error: (any Error)?) {
         guard let error else {
-            state.withLock { state in Self.settle(&state, id, status: nil) }
+            let ended = clock.monotonic()
+            state.withLock { state in Self.settle(&state, id, status: nil, ended: ended) }
             return
         }
         let explicit = state.withLock { state in state.spans[id - 1].explicitStatus }
         // The error's own description code runs outside the lock.
         let status = explicit ? nil : automaticErrorStatus(error)
-        state.withLock { state in Self.settle(&state, id, status: status) }
+        let ended = clock.monotonic()
+        state.withLock { state in Self.settle(&state, id, status: status, ended: ended) }
     }
 
-    private static func settle(_ state: inout InMemoryTelemetryState, _ id: Int, status: SpanStatus?) {
+    private static func settle(_ state: inout InMemoryTelemetryState, _ id: Int, status: SpanStatus?, ended: Double) {
         guard !state.spans[id - 1].span.settled else { return }
         if let status, !state.spans[id - 1].explicitStatus { state.spans[id - 1].span.status = status }
         state.spans[id - 1].span.settled = true
+        state.spans[id - 1].endedMs = state.spans[id - 1].startedMs + ended - state.spans[id - 1].clock
         state.spans[id - 1].span.endSequence = state.nextEndSequence
         state.nextEndSequence += 1
     }
@@ -259,7 +290,11 @@ private final class InMemoryTelemetrySpan: TelemetrySpan, InMemoryCarrierContext
 
     func addEvent(_ name: String, attributes: SpanAttributes?) {
         let event = RecordedTelemetryEvent(name: name, attributes: copyAttributes(attributes))
-        recorder.record(id) { $0.span.events.append(event) }
+        let time = recorder.clock.monotonic()
+        recorder.record(id) { span in
+            span.span.events.append(event)
+            span.eventTimes.append(time - span.clock)
+        }
     }
 
     func setAttributes(_ attributes: SpanAttributes) {
@@ -342,7 +377,7 @@ nonisolated(nonsending) private func startInMemorySpan<T, E: Error>(
     }
 }
 
-/// The instrument metadata, or nil for an instrument whose boundaries are invalid, which records nothing.
+/// An instrument's metadata.
 private struct InMemoryInstrumentMetadata: Sendable {
     let kind: RecordedTelemetryMeasurement.Kind
     let name: String
@@ -353,9 +388,9 @@ private struct InMemoryInstrumentMetadata: Sendable {
 
 private final class InMemoryInstrument: TelemetryCounter, TelemetryUpDownCounter, TelemetryHistogram {
     let recorder: InMemoryTelemetryRecorder
-    let metadata: InMemoryInstrumentMetadata?
+    let metadata: InMemoryInstrumentMetadata
 
-    init(_ recorder: InMemoryTelemetryRecorder, _ metadata: InMemoryInstrumentMetadata?) {
+    init(_ recorder: InMemoryTelemetryRecorder, _ metadata: InMemoryInstrumentMetadata) {
         self.recorder = recorder
         self.metadata = metadata
     }
@@ -365,49 +400,41 @@ private final class InMemoryInstrument: TelemetryCounter, TelemetryUpDownCounter
     }
 
     func record(_ value: Double, attributes: SpanAttributes?, context: (any TelemetryContext)?) {
-        guard let metadata, value.isFinite, metadata.kind != .counter || value >= 0 else { return }
         let measurement = RecordedTelemetryMeasurement(
             kind: metadata.kind, name: metadata.name, description: metadata.description, unit: metadata.unit,
             boundaries: metadata.boundaries, value: value, attributes: copyAttributes(attributes),
             context: context.flatMap(carrier(of:)))
-        recorder.state.withLock { $0.measurements.append(measurement) }
+        let intervalMs = (recorder.clock.now() / 10_000).rounded(.down) * 10_000
+        recorder.state.withLock { $0.measurements.append(InMemoryMeasurement(intervalMs: intervalMs, measurement: measurement)) }
     }
 }
 
-/// A UUID in `crypto.randomUUID()`'s lowercase form.
-private func isMemoryScope(_ value: String) -> Bool {
-    let characters = Array(value.utf8)
-    guard characters.count == 36 else { return false }
-    for (index, character) in characters.enumerated() {
-        if [8, 13, 18, 23].contains(index) {
-            if character != UInt8(ascii: "-") { return false }
-        } else if !(UInt8(ascii: "0")...UInt8(ascii: "9")).contains(character)
-                    && !(UInt8(ascii: "a")...UInt8(ascii: "f")).contains(character) {
-            return false
-        }
-    }
-    return true
+/// `JSON.stringify([startedMs, traceId])`, the in-memory store's cursor.
+private func traceCursor(_ startedMs: Double, _ traceId: String) -> String {
+    "[\(javaScriptNumber(startedMs)),\(javaScriptQuoted(traceId))]"
 }
 
-/// A positive decimal integer without leading zeros that a JavaScript number holds exactly.
-private func memorySpanId(_ value: String) -> Int? {
-    let characters = Array(value.utf8)
-    guard let first = characters.first, first != UInt8(ascii: "0"),
-          characters.allSatisfy({ (UInt8(ascii: "0")...UInt8(ascii: "9")).contains($0) }),
-          let id = Int(value), id <= 9_007_199_254_740_991 else { return nil }
-    return id
+/// Reads a cursor `traceCursor` wrote. Upstream's `JSON.parse` throws on text that is not JSON.
+private func parseTraceCursor(_ cursor: String) throws -> (startedMs: Double, traceId: String) {
+    let invalid = DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "Invalid trace cursor \(cursor)"))
+    guard let value = try? JSONSerialization.jsonObject(with: Data(cursor.utf8)) as? [Any], value.count == 2,
+          let startedMs = (value[0] as? NSNumber)?.doubleValue, let traceId = value[1] as? String else { throw invalid }
+    return (startedMs, traceId)
 }
 
 /// Backend-neutral reference implementation that records spans and measurements in process memory.
 /// Create a fresh instance to isolate tests or independent recording scopes.
 ///
-/// It is also the adapter's propagation and metrics. Storage is unbounded and process-local. A thrown error
+/// It is also the adapter's propagation, metrics, and store. Storage is unbounded and process-local. A thrown error
 /// records its type name and description as the automatic error status, unless the callback set a status.
-public final class InMemoryTelemetryContext: TelemetryContext, TelemetryPropagation, TelemetryMetrics {
-    fileprivate let recorder = InMemoryTelemetryRecorder()
+public final class InMemoryTelemetryContext: TelemetryContext, TelemetryPropagation, TelemetryMetrics, TelemetryStore {
+    fileprivate let recorder: InMemoryTelemetryRecorder
 
     /// Creates an empty recorder.
-    public init() {}
+    public convenience init() { self.init(clock: .system) }
+
+    /// Creates an empty recorder that reads `clock`.
+    package init(clock: TelemetryClock) { recorder = InMemoryTelemetryRecorder(clock: clock) }
 
     /// This context: it implements the metrics itself, and its spans and extracted parents carry it.
     public var metrics: (any TelemetryMetrics)? { self }
@@ -426,14 +453,14 @@ public final class InMemoryTelemetryContext: TelemetryContext, TelemetryPropagat
         carrier(of: context)
     }
 
-    /// Returns a parent for an in-memory carrier, from this recorder or another one. An absent or unrecognized
-    /// carrier falls back to this recorder's root.
+    /// Returns a parent for an in-memory carrier, from this recorder or another one. A carrier without the scope, the
+    /// span, and the trace falls back to this recorder's root. The three are opaque strings: nothing checks their
+    /// format, and only a span of this recorder's scope gets a local parent ID.
     public func extract(_ carrier: TelemetryCarrier?) -> any TelemetryContext {
         guard let carrier, let scope = carrier["pi-memory-scope"], let span = carrier["pi-memory-span"],
-              isMemoryScope(scope), let id = memorySpanId(span) else { return self }
-        let context = ["pi-memory-scope": scope, "pi-memory-span": span]
-        let local = scope == recorder.scope && recorder.state.withLock { id <= $0.spans.count }
-        return InMemoryExtractedParent(owner: self, carrier: context, localId: local ? id : nil)
+              let traceId = carrier["pi-memory-trace"] else { return self }
+        let context = ["pi-memory-scope": scope, "pi-memory-span": span, "pi-memory-trace": traceId]
+        return InMemoryExtractedParent(owner: self, carrier: context, localId: scope == recorder.scope ? Int(span) : nil)
     }
 
     public func counter(_ name: String, options: InstrumentOptions?) -> any TelemetryCounter {
@@ -450,22 +477,104 @@ public final class InMemoryTelemetryContext: TelemetryContext, TelemetryPropagat
 
     private func instrument(_ kind: RecordedTelemetryMeasurement.Kind, _ name: String, description: String?, unit: String?,
                             boundaries: [Double]?) -> InMemoryInstrument {
-        if let boundaries, boundaries.indices.contains(where: {
-            !boundaries[$0].isFinite || ($0 > 0 && boundaries[$0] <= boundaries[$0 - 1])
-        }) {
-            return InMemoryInstrument(recorder, nil)
-        }
-        return InMemoryInstrument(recorder, InMemoryInstrumentMetadata(
+        InMemoryInstrument(recorder, InMemoryInstrumentMetadata(
             kind: kind, name: name, description: description, unit: unit, boundaries: boundaries))
+    }
+
+    /// The settled spans, by start time and then span ID.
+    private func storedSpans() -> [StoredSpan] {
+        let spans = recorder.state.withLock { state in state.spans.filter(\.span.settled) }
+        return spans.map { span in
+            StoredSpan(
+                id: carrierId(span.span.context),
+                traceId: span.span.context["pi-memory-trace"]!,
+                parentId: span.span.parentContext.map(carrierId),
+                name: span.span.name,
+                startedMs: span.startedMs,
+                endedMs: span.endedMs!,
+                attributes: span.span.attributes,
+                events: zip(span.span.events, span.eventTimes).map { event, time in
+                    StoredSpan.Event(name: event.name, timeMs: time, attributes: event.attributes)
+                },
+                links: span.span.links.map { link in
+                    StoredSpan.Link(traceId: link.context["pi-memory-trace"] ?? "undefined", spanId: carrierId(link.context),
+                                    attributes: link.attributes)
+                },
+                status: span.span.status)
+        }.sorted { a, b in a.startedMs < b.startedMs || (a.startedMs == b.startedMs && javaScriptPrecedes(a.id, b.id)) }
+    }
+
+    public func getTrace(_ traceId: String) async throws -> StoredTrace? {
+        let spans = storedSpans().filter { $0.traceId == traceId }
+        return spans.isEmpty ? nil : StoredTrace(traceId: traceId, spans: spans)
+    }
+
+    public func findTraces(_ query: TraceQuery) async throws -> StoredTracePage {
+        let limit = query.limit ?? 20
+        let after = try query.cursor.map(parseTraceCursor)
+        var grouped: [StoredTrace] = []
+        var positions: [String: Int] = [:]
+        for span in storedSpans() {
+            if let position = positions[span.traceId] {
+                grouped[position].spans.append(span)
+            } else {
+                positions[span.traceId] = grouped.count
+                grouped.append(StoredTrace(traceId: span.traceId, spans: [span]))
+            }
+        }
+        let matches = grouped.filter { trace in
+            let first = trace.spans[0]
+            return (query.name == nil || first.name == query.name)
+                && (query.startMin.map { first.startedMs >= $0 } ?? true)
+                && (query.startMax.map { first.startedMs <= $0 } ?? true)
+                && (after.map { first.startedMs < $0.startedMs
+                    || (first.startedMs == $0.startedMs && javaScriptPrecedes($0.traceId, trace.traceId)) } ?? true)
+                && (!query.errors || trace.spans.contains { if case .error = $0.status { true } else { false } })
+                && (query.attributes.map { attributes in
+                    trace.spans.contains { span in attributes.allSatisfy { $0.value.matches(span.attributes[$0.key]) } }
+                } ?? true)
+        }.sorted { a, b in
+            a.spans[0].startedMs > b.spans[0].startedMs
+                || (a.spans[0].startedMs == b.spans[0].startedMs && javaScriptPrecedes(a.traceId, b.traceId))
+        }
+        let traces = Array(matches.prefix(max(limit, 0)))
+        guard matches.count > limit, let last = traces.last else { return StoredTracePage(traces: traces) }
+        return StoredTracePage(traces: traces, cursor: traceCursor(last.spans[0].startedMs, last.traceId))
+    }
+
+    /// Reads raw measurements as count-one rows, without changing `getMetrics()` snapshots.
+    public func findMetrics(_ query: MetricQuery) async throws -> [StoredMetric] {
+        recorder.state.withLock { $0.measurements }.filter { entry in
+            entry.measurement.name == query.name
+                && (query.startMin.map { entry.intervalMs >= $0 } ?? true)
+                && (query.startMax.map { entry.intervalMs <= $0 } ?? true)
+                && (query.attributes ?? [:]).allSatisfy { $0.value.matches(entry.measurement.attributes[$0.key]) }
+        }.map { entry in
+            let measurement = entry.measurement
+            return StoredMetric(
+                intervalMs: entry.intervalMs, name: measurement.name, kind: TelemetryMetricKind(measurement.kind),
+                unit: measurement.unit, attributes: measurement.attributes, count: 1, sum: measurement.value,
+                min: measurement.value, max: measurement.value)
+        }
     }
 
     /// Returns the measurements in recording order, without aggregation.
     public func getMetrics() -> [RecordedTelemetryMeasurement] {
-        recorder.state.withLock { $0.measurements }
+        recorder.state.withLock { $0.measurements.map(\.measurement) }
     }
 
     /// Returns snapshots in span-start order.
     public func getSpans() -> [RecordedTelemetrySpan] {
         recorder.state.withLock { state in state.spans.map(\.span) }
+    }
+}
+
+private extension TelemetryMetricKind {
+    init(_ kind: RecordedTelemetryMeasurement.Kind) {
+        switch kind {
+        case .counter: self = .counter
+        case .upDownCounter: self = .upDownCounter
+        case .histogram: self = .histogram
+        }
     }
 }

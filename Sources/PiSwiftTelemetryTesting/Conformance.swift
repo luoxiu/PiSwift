@@ -1,4 +1,4 @@
-// Ports upstream `packages/telemetry/src/testing/conformance.ts` at 2ec55d808.
+// Ports upstream `packages/telemetry/src/testing/conformance.ts` at d9025a5f5.
 
 import Foundation
 import PiSwiftTelemetry
@@ -194,8 +194,7 @@ public func createTelemetryAdapterConformance(
             try strictEqual(measurements[3].context, try findSpan(try await fixture.getSpans(), "measured").context)
         },
 
-        // Swift: upstream also passes Proxy attributes and options that throw on read. Swift values cannot.
-        createCase(factory, "metrics", "copies inputs and suppresses invalid measurements atomically") { fixture in
+        createCase(factory, "metrics", "copies instrument metadata and measurement attributes") { fixture in
             guard let metrics = fixture.metrics else { return }
             guard let getMetrics = fixture.getMetrics else {
                 throw TelemetryConformanceFailure("Metrics fixtures require a normalized measurement reader")
@@ -208,9 +207,6 @@ public func createTelemetryAdapterConformance(
             var attributes: SpanAttributes = ["tags": .stringArray(["original"])]
             histogram.record(-1, attributes: attributes)
             attributes["tags"] = .stringArray(["original", "changed"])
-            let counter = metrics.counter("invalid")
-            for value in [Double.nan, .infinity, -.infinity, -1] { counter.add(value) }
-            metrics.histogram("bad-boundaries", options: HistogramOptions(boundaries: [2, 1])).record(1)
             let measurements = try await getMetrics()
             try strictEqual(measurements.count, 1)
             try strictEqual(measurements.first?.attributes, ["tags": .stringArray(["original"])])
@@ -242,8 +238,7 @@ public func createTelemetryAdapterConformance(
             ])
         },
 
-        // Swift: upstream also adds links and link attributes that throw on read, which Swift values cannot.
-        createCase(factory, "links", "suppresses malformed links atomically and ignores settled sources") { fixture in
+        createCase(factory, "links", "ignores links added after source settlement") { fixture in
             var source: (any TelemetrySpan)?
             await fixture.context.startSpan(SpanOptions(name: "link-source")) { span in source = span }
             guard let sourceSpan = source else { throw TelemetryConformanceFailure("Expected source span") }
@@ -267,15 +262,13 @@ public func createTelemetryAdapterConformance(
             try strictEqual(try findSpan(spans, "receiver").parentContext, try findSpan(spans, "sender").context)
         },
 
-        // Swift: upstream also extracts a carrier that throws on read, which a Swift dictionary cannot.
-        createCase(factory, "propagation", "unknown and unreadable carriers produce recorded roots") { fixture in
+        createCase(factory, "propagation", "absent and unknown carriers produce recorded roots") { fixture in
             guard let propagation = fixture.propagation else { return }
             try strictEqual(propagation.inject(noopTelemetryContext), nil)
             let carriers: [TelemetryCarrier?] = [nil, [:], ["unknown": "format"]]
             for (index, carrier) in carriers.enumerated() {
-                var result = 0
-                await propagation.extract(carrier).startSpan(SpanOptions(name: "fallback-\(index)")) { _ in result = 42 }
-                try strictEqual(result, 42)
+                let context = propagation.extract(carrier)
+                try strictEqual(await context.startSpan(SpanOptions(name: "fallback-\(index)")) { _ in 42 }, 42)
             }
             for span in try await fixture.getSpans() { try strictEqual(span.parentContext, nil) }
         },
@@ -324,6 +317,7 @@ public func createTelemetryAdapterConformance(
             try strictEqual(try findSpan(try await fixture.getSpans(), "success").settled, true)
         },
 
+        // Swift: upstream also rejects with `undefined`, which a Swift error cannot be.
         createCase(factory, "callback lifecycle", "preserves synchronous and asynchronous rejection values") { fixture in
             let syncError = ConformanceError("sync")
             try await rejectsWithSameValue(syncError) {

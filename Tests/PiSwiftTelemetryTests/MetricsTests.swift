@@ -1,6 +1,6 @@
-// Ports upstream `packages/telemetry/test/metrics.test.ts` at 48909d987.
+// Ports upstream `packages/telemetry/test/metrics.test.ts` at d9025a5f5.
 // Upstream's compile-time checks (`expectTypeOf`, `@ts-expect-error`) test TypeScript inference, which
-// Swift does not have. Its Proxy options and attributes that throw on read have no Swift counterpart.
+// Swift does not have.
 
 import Foundation
 import Testing
@@ -91,23 +91,7 @@ struct MetricsTests {
         #expect(fresh.context == telemetry.getSpans().first?.context)
     }
 
-    @Test func ignoresMalformedMetadataNonfiniteValuesAndUnreadableAttributes() {
-        let telemetry = InMemoryTelemetryContext()
-        for boundaries: [Double] in [[1, 1], [2, 1], [.nan], [.infinity]] {
-            telemetry.histogram("bad", options: HistogramOptions(boundaries: boundaries)).record(1)
-        }
-        for value in [Double.nan, .infinity, -.infinity] {
-            telemetry.counter("bad").add(value)
-            telemetry.upDownCounter("bad").add(value)
-            telemetry.histogram("bad").record(value)
-        }
-        telemetry.counter("bad").add(-1)
-        #expect(telemetry.getMetrics().isEmpty)
-        telemetry.histogram("valid").record(-1, attributes: [:], context: noopTelemetryContext)
-        #expect(telemetry.getMetrics().first?.context == nil)
-    }
-
-    @Test func sharesFrozenNoopInstrumentsWithoutInspectingArguments() {
+    @Test func sharesFrozenNoopInstruments() {
         let options = HistogramOptions(unit: "By")
         let counter = noopTelemetryMetrics.counter("bytes", options: InstrumentOptions(unit: options.unit))
         let active = noopTelemetryMetrics.upDownCounter("active", options: InstrumentOptions(unit: options.unit))
@@ -116,9 +100,9 @@ struct MetricsTests {
         #expect(sameObject(counter, noopTelemetryMetrics.counter("other")))
         #expect(sameObject(active, noopTelemetryMetrics.upDownCounter("other")))
         #expect(sameObject(histogram, noopTelemetryMetrics.histogram("other")))
-        counter.add(1, attributes: ["secret": "value"])
-        active.add(-1, attributes: ["secret": "value"])
-        histogram.record(1, attributes: ["secret": "value"], context: noopTelemetryContext)
+        counter.add(1, attributes: ["direction": "out"])
+        active.add(-1, attributes: ["direction": "out"])
+        histogram.record(1, attributes: ["direction": "out"], context: noopTelemetryContext)
     }
 
     // Swift addition: metric definitions are hand-coded, so the kinds, the boundaries, and the low-only cardinality

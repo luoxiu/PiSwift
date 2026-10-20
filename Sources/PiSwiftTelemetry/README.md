@@ -6,10 +6,10 @@ PiSwiftTelemetry ports `@earendil-works/pi-telemetry`
 ([`packages/telemetry`](https://github.com/earendil-works/pi/tree/482c1381a/packages/telemetry))
 at upstream `482c1381a`, the parent of `48909d987`. Upstream's sources, tests, and README there are
 unchanged since `35f5c265d` (v0.84.0). Later upstream commits that `FLEET_FORK.md` lists as ported
-come on top: propagation, links, and metrics (`48909d987`), and capabilities on every context
-(`2ec55d808`). Upstream's telemetry store and trace renderer (`d9025a5f5`) are not ported yet. It has
-no dependencies. The package
-requires macOS 15 or iOS 18.
+come on top: propagation, links, and metrics (`48909d987`), capabilities on every context
+(`2ec55d808`), and the telemetry store and trace renderer (`d9025a5f5`). It has no dependencies.
+PiSwiftChord's SQLite recorder (upstream's `@earendil-works/chord/telemetry-sqlite`) builds on it. The
+package requires macOS 15 or iOS 18.
 
 It provides:
 
@@ -18,6 +18,7 @@ It provides:
 - opaque cross-process propagation and span links;
 - counters, up-down counters, histograms, and typed metric schemas;
 - the reference `InMemoryTelemetryContext`;
+- `TelemetryStore` for settled traces and metrics, and `renderTrace` for plain-text span trees;
 - serializable schema definitions and a typed span starter;
 - adapter conformance cases in `PiSwiftTelemetryTesting`, upstream's `/testing` subpath.
 
@@ -35,8 +36,8 @@ explicitly.
 - **Status**: the outcome, `ok` or `error`. An error can carry a name and a message.
 - **Context**: where new work belongs in the tree. A span is the context of its children.
 
-A span is diagnostic data, not business state. Recording it must not change whether the work runs,
-succeeds, fails, or is persisted.
+A span is diagnostic data, not business state. An adapter translates these generic concepts into the
+corresponding concepts of OpenTelemetry, Sentry, logs, or another backend.
 
 ## Core Context API
 
@@ -76,7 +77,9 @@ let result = try await telemetry.startSpan(SpanOptions(name: "example.save")) { 
 
 ## Adapter Contract
 
-An adapter must:
+An adapter implements `TelemetryContext` and bridges the generic API to its backend. Typed inputs are
+trusted; malformed inputs have unspecified behavior. Adapters need not validate inputs or suppress adapter
+or backend failures. The callback and recording contract is that an adapter must:
 
 - run the callback once, in the caller's task, before `startSpan` returns. Mark `startSpan`
   `nonisolated(nonsending)`, so the callback also runs on the caller's executor;
@@ -87,7 +90,7 @@ An adapter must:
 - treat a return as `ok` and a throw as `error`, unless the callback set a status;
 - let the last `setStatus` call win;
 - merge `setAttributes` calls: a later value replaces an earlier one, and a nil value is ignored;
-- keep recording methods synchronous and passive, and handle backend failures itself;
+- keep recording methods synchronous;
 - ignore calls after the span settled, and run the callback of a child of a settled span without
   recording it.
 
@@ -125,10 +128,10 @@ try await caller.startSpan(SpanOptions(name: "rpc.client")) { span in
 ```
 
 Injection returns a detached carrier, or nil for roots, no-op contexts, and contexts the adapter does
-not support. Extraction returns a parent the receiver owns. An absent, invalid, or unknown carrier
-falls back to the adapter's root, so incoming work is still recorded. Both methods are synchronous,
-passive, and do not throw. Trace metadata is untrusted diagnostics, never authorization. Transport
-boundaries own carrier size limits.
+not support. Extraction returns a parent the receiver owns. An absent or unknown carrier falls back to
+the adapter's root. Extraction checks only that the carrier has its required keys; the identifiers are
+opaque and need no format validation. Both methods are synchronous. Trace metadata is diagnostics, never
+authorization. Transport boundaries own carrier size limits.
 
 A link relates work without changing its parent. Pass `SpanOptions.links` when the target is known at
 creation, or call `span.addLink()` once the span has started:
@@ -148,7 +151,7 @@ ignores `addLink()`. Links append in order and copy their attributes; a link to 
 unsupported context is ignored. The typed span starter's callback span has `addLink()` too; initial
 links need the plain `startSpan()`.
 
-`noopTelemetryPropagation` never inspects its arguments: injection returns nil, extraction returns
+`noopTelemetryPropagation` ignores its arguments: injection returns nil, extraction returns
 `noopTelemetryContext`.
 
 ## Metrics
@@ -173,14 +176,16 @@ duration.record(elapsedMs, attributes: ["method": "read"], context: currentSpan)
 ```
 
 Factories take an instrument name and optional `InstrumentOptions` (`description`, `unit`).
-`HistogramOptions` adds `boundaries`: finite, strictly increasing bucket hints. Backends own
-aggregation and may translate the hints. Counters accept non-negative finite increments; up-down
-counters and histograms accept finite signed values. A histogram's `record(_:attributes:context:)`
-can correlate a measurement with a span, an exemplar. A counter's `add` has no context.
+`HistogramOptions` adds `boundaries`: callers supply finite, strictly increasing bucket hints. Backends
+own aggregation and may translate the hints. Callers are responsible for finite measurements and
+non-negative counter increments; up-down counters and histograms may use signed values. A histogram's
+`record(_:attributes:context:)` can correlate a measurement with a span, an exemplar. A counter's `add`
+has no context.
 
-Factories and recording methods are synchronous, passive, and do not throw. An invalid measurement
-or invalid boundaries are ignored. `noopTelemetryMetrics` returns shared instruments and inspects
-nothing. Record only values the code already has; do not compute extra data for telemetry.
+Factories and recording methods are synchronous and trust typed inputs. Adapters need not validate
+measurement values, metadata, attributes, or boundaries; malformed inputs have unspecified behavior.
+`noopTelemetryMetrics` returns shared instruments that discard measurements. Record only values the
+code already has; do not compute extra data for telemetry.
 
 Use only low-cardinality attributes: bounded values such as a direction or a method, not request IDs,
 user IDs, prompts, or arbitrary paths. The attribute bag stays open; the instrumentation owns this
@@ -212,14 +217,14 @@ compile time; nothing checks them in Swift, and nothing checks attributes at run
 `InMemoryTelemetryContext.getMetrics()` returns `RecordedTelemetryMeasurement` snapshots in recording
 order: `kind`, `name`, `description`, `unit`, `boundaries`, `value`, `attributes`, and the exemplar's
 carrier as `context`, or nil. It is a log of measurements, not aggregated counters or buckets; storage
-is unbounded and records no timestamps.
+is unbounded. Measurement times are kept privately for store queries, not exposed in these snapshots.
 
 ## No-op Context
 
 `noopTelemetryContext`, the shared inert span, is the default when telemetry is optional. It runs
 callbacks in the caller's task and returns their values and errors. It passes itself, also to
 nested spans. Its `metrics` and `propagation` are `noopTelemetryMetrics` and `noopTelemetryPropagation`.
-It does not inspect or retain names, attributes, events, or statuses.
+It ignores names, attributes, links, events, and statuses.
 
 ## In-Memory Reference Adapter
 
@@ -237,14 +242,83 @@ print(telemetry.getSpans())
 `getSpans()` returns snapshots in span-start order. Each `RecordedTelemetrySpan` has an ID from 1,
 the local parent ID, the carriers of the span (`context`) and of its parent (`parentContext`), the
 links in order, the merged attributes, the events in order, the status, whether it settled, and its
-place in end order. It records no timestamps. A remote parent has a nil `parentId` and a
+place in end order. These snapshots expose no timestamps. A remote parent has a nil `parentId` and a
 `parentContext`; a root has neither. A `RecordedTelemetryLink` holds the target's carrier and the
 link attributes.
 
 The adapter implements `TelemetryPropagation` with a small carrier of its own: a unique recorder
-scope and the span ID. The carrier survives JSON and works across processes without a shared
-registry. Its keys are an implementation detail, not a wire format for other adapters. Storage is
-unbounded. Create a fresh instance for each test or recording scope.
+scope, the span ID, and the inherited trace ID. The carrier survives JSON and works across processes
+without a shared registry. Its keys are an implementation detail, not a wire format for other adapters.
+Storage is unbounded. Create a fresh instance for each test or recording scope.
+
+## Stored Telemetry
+
+`TelemetryStore` separates querying from recording. `InMemoryTelemetryContext` and PiSwiftChord's
+SQLite recorder implement it:
+
+- `findTraces(_:)` returns complete locally stored traces, newest trace start first. `TraceQuery`
+  filters on the earliest stored span's `name`, the inclusive `startMin` and `startMax` of its start,
+  `errors: true`, and scalar `attributes`. All requested attributes must match one span, anywhere in the
+  trace. Pages hold 20 traces by default; pass the returned opaque `cursor` with the same filters to
+  continue. Equal start times are ordered by trace ID.
+- `getTrace(_:)` returns a trace, or nil.
+- `findMetrics(_:)` takes a `MetricQuery` (`name`, `startMin`, `startMax`, `attributes`) and returns
+  `StoredMetric` rows with count, sum, minimum, and maximum. The time bounds are inclusive interval
+  starts. The in-memory adapter maps each raw measurement to a count-one row in its ten-second interval;
+  SQLite aggregates measurements per series and interval.
+
+Only settled spans are returned. A trace ID is the root's globally unique span ID
+(`<recorder UUID>:<counter>`) and propagates with the parent identity. Stores return the spans they
+have: a remote or expired parent can be absent, and a child can appear before its parent settles.
+Pages are not a snapshot across requests; late settlements and retention can change a trace's earliest
+stored span. SQLite reads committed rows without flushing first.
+
+A `StoredSpan` has epoch-millisecond `startedMs` and `endedMs`, event offsets in `timeMs`, and links that
+carry both the target's `traceId` and `spanId`. The duration comes from a monotonic clock; wall clocks
+of different processes may disagree. Merge spans from several stores by trace ID; parent relationships,
+not timestamp containment, define the tree.
+
+`renderTrace` prints stored spans:
+
+```swift
+let page = try await telemetry.findTraces(TraceQuery(errors: true, limit: 10))
+for trace in page.traces { print(renderTrace(trace.spans)) }
+```
+
+It deduplicates IDs, treats absent parents as roots, and prints attributes, durations, statuses, event
+offsets, and cross-trace links. It never follows links or queries a store.
+
+### SQLite telemetry
+
+PiSwiftChord's `createSqliteTelemetry(path:options:)` records into a SQLite file and reads it back:
+
+```swift
+let telemetry = try await createSqliteTelemetry(path: databasePath)
+try await telemetry.startSpan(SpanOptions(name: "app.request")) { span in
+    span.addEvent("request.accepted")
+    try await span.startSpan(SpanOptions(name: "app.read")) { _ in try await readAccount("123") }
+}
+try await telemetry.flush()
+let traces = try await telemetry.findTraces(TraceQuery(name: "app.request", limit: 10)).traces
+for trace in traces { print(renderTrace(trace.spans)) }
+try await telemetry.close()
+```
+
+Recording performs no SQL. A one-second timer flushes settled spans and completed ten-second metric
+intervals in one transaction, with the retention cleanup. Metrics keep count, sum, minimum, and maximum
+per name, kind, unit, and attribute series, not raw samples, buckets, or exemplars. `close()` stops
+recording and drains partial metric intervals without waiting for business callbacks. Late span
+completions are ignored.
+
+`SqliteTelemetryOptions.retentionMs` defaults to seven days. `maxQueuedSpans` defaults to 10,000 and
+counts settled spans awaiting commit, including a batch in flight. The same limit bounds pending metric
+interval/series pairs on its own. Overflow increments `droppedSpans` or `droppedMeasurements`; the limits
+bound counts, not bytes or active spans. A write failure stops recording for good: `flush()` and
+`close()` throw the original error without retrying.
+
+The recorder implements `TelemetryStore`: `findTraces`, `getTrace`, and `findMetrics` read committed
+rows, also after `close()`. Its tables are `telemetry_spans`, `telemetry_metrics`, and
+`telemetry_schema`, in upstream's schema, so a file is readable by upstream's adapter too.
 
 ## Adapter Conformance
 
@@ -268,10 +342,10 @@ func telemetryAdapterConformance(_ testCase: TelemetryAdapterConformanceCase) as
 
 The cases cover the capabilities on roots, child spans, extracted parents, and inert spans, the
 callback contract, and links. A fixture that supplies `propagation` also gets the
-JSON round trip, multiple adapter hops, and the fallback for unknown carriers; one that supplies
-`metrics` and `getMetrics` gets ordered measurements, exemplars, input copying, and the suppression of
-invalid measurements and boundaries. A failed check throws `TelemetryConformanceFailure` with its file
-and line.
+JSON round trip, multiple adapter hops, and the root fallback for absent or unknown carriers; one that
+supplies `metrics` and `getMetrics` gets ordered measurements, exemplars, and input copying. The cases
+do not test malformed inputs or require suppressing adapter or backend failures. A failed check throws
+`TelemetryConformanceFailure` with its file and line.
 
 ## Typed Schemas
 
@@ -335,8 +409,8 @@ pi-owned `pi.ai.*` and `pi.durable.*` names, which an adapter may translate to b
 
 Telemetry is diagnostics, not durable application state. Do not persist a context, a span, or a
 backend trace object in records, messages, snapshots, or deferred handles. An injected
-`TelemetryCarrier` may cross a transport or be stored as optional diagnostic correlation data. It is
-best effort: an adapter change may lose the correlation, but must not prevent work. Attribute values are scalars and arrays. Keep
+`TelemetryCarrier` may cross a transport or be stored as optional diagnostic correlation data. Changing
+adapters may lose the correlation; carriers are not application state. Attribute values are scalars and arrays. Keep
 prompts, completions, tool arguments and output, file contents, provider payloads, headers,
 credentials, and free-form error details out of attributes unless a schema and data policy allow them.
 
@@ -354,10 +428,7 @@ credentials, and free-form error details out of attributes unless a schema and d
   from several threads. A thrown error's automatic status records the error's type name and its
   `errorDescription`, or its description. Every Swift error has these; upstream records a name and
   message only for `Error` objects.
-- Swift values cannot throw on read, so upstream's unreadable-payload paths have no counterpart:
-  the two "passivity" cases, "ignores failed attribute calls atomically", the unreadable and
-  `undefined` rejections in the rejection case, the no-op "does not inspect" test, and the unreadable
-  links, carriers, options, and attributes in the links, propagation, and metrics cases.
+- A Swift error cannot be `undefined`, so the conformance rejection case has no `undefined` rejection.
 - Schemas are Codable structs. `TelemetryAttributeKind` replaces the union discriminated by `type`.
   Without intersection types, start and event attribute definitions repeat the attribute fields and
   add `required`. TypeScript's schema inference has no counterpart: the starter takes `String` names
@@ -374,8 +445,29 @@ credentials, and free-form error details out of attributes unless a schema and d
   name check are compile-time only.
 - The in-memory spans and extracted parents carry their own carriers, where upstream keeps them in a
   module-level WeakMap. Any in-memory recorder injects another one's spans, as upstream. Its scope is a
-  lowercase UUID, as `crypto.randomUUID()` gives, and extraction checks it and the span ID by hand
-  against upstream's two regular expressions and its safe-integer bound.
+  lowercase UUID, as `crypto.randomUUID()` gives. A span ID of this scope that is not an integer gets no
+  local parent ID, where upstream records `NaN`.
+- `TelemetryStore` is a `Sendable` protocol with `async throws` methods, for upstream's promises, and
+  `findTraces()` without a query is an extension. A page is a `StoredTracePage`, for upstream's
+  `{ traces, cursor? }`; events and links are `StoredSpan.Event` and `StoredSpan.Link`. Query attributes
+  are `ScalarAttributeValue`s. `TraceQuery.errors` is a `Bool`, for upstream's `errors?: true`. A cursor
+  that is not one fails the query with a `DecodingError`, where upstream's `JSON.parse` throws.
+- `renderTrace` is part of this module, not a separate entry. It prints attributes in key order, where
+  upstream keeps the object's insertion order, which a Swift dictionary does not have.
+- The adapters read `Date`, `ContinuousClock`, and a sleeping task for upstream's `Date.now()`,
+  `performance.now()`, and `setInterval`. Package-access initializers take a `TelemetryClock`, which
+  this package's tests replace, where upstream's tests replace the globals.
+- PiSwiftChord's `createSqliteTelemetry(path:options:)` opens its own file (WAL, as `SqliteStorage`
+  does), where upstream's `createSqliteTelemetry(db, options)` takes a database the caller owns: the
+  SQLite driver has package access (see the PiSwiftDurable README). `close()` leaves the connection
+  open, so reads keep working; it closes when the recorder is released. Its `metrics` and
+  `propagation` are the optional `TelemetryContext` members, never nil. The flushes and reads run on an
+  actor that owns the connection. JSON columns write attribute keys sorted (array indexes first, as
+  JavaScript orders object keys), which the metric series key needs to match upstream's and span
+  columns use too, where upstream writes span attributes in insertion order. Reading rows back, a
+  `null` attribute (a non-finite number upstream wrote) and values outside the attribute types are
+  dropped, and an empty array reads as a string array. The Durable Object store conformance run has no
+  counterpart.
 - `TelemetryAdapterFixture` is a struct of closures. `dispose` replaces `AsyncDisposable`: it runs after
   every case, and when both the case and `dispose` fail, the case's error is thrown.
 - `metrics` and `propagation` are protocol requirements with default implementations that return nil,

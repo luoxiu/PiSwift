@@ -195,13 +195,13 @@ let package = Package(
         ),
         .testTarget(
             name: "PiSwiftChordTests",
-            dependencies: ["PiSwiftChord", "PiSwiftTelemetry"],
+            dependencies: ["PiSwiftChord", "PiSwiftTelemetry", "PiSwiftTelemetryTesting", "TelemetryTestSupport"],
             resources: [.copy("Fixtures")],
             swiftSettings: strictConcurrencySettings
         ),
         .testTarget(
             name: "PiSwiftTelemetryTests",
-            dependencies: ["PiSwiftTelemetry", "PiSwiftTelemetryTesting"],
+            dependencies: ["PiSwiftTelemetry", "PiSwiftTelemetryTesting", "TelemetryTestSupport"],
             swiftSettings: strictConcurrencySettings
         ),
         .testTarget(
@@ -266,6 +266,13 @@ let package = Package(
         .target(
             name: "TestEnvironmentSupport",
             path: "Tests/Support",
+            swiftSettings: strictConcurrencySettings
+        ),
+        // Upstream `packages/telemetry/test/store-conformance.ts`, which the telemetry and Chord tests share.
+        .target(
+            name: "TelemetryTestSupport",
+            dependencies: ["PiSwiftTelemetry", "PiSwiftTelemetryTesting"],
+            path: "Tests/TelemetryTestSupport",
             swiftSettings: strictConcurrencySettings
         ),
     ],

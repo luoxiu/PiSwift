@@ -1,5 +1,5 @@
-// Ports the contract half of upstream `packages/telemetry/src/index.ts` at 2ec55d808.
-// The schema half is in `TelemetrySchema.swift`, metrics are in `Metrics.swift`.
+// Ports the contract half of upstream `packages/telemetry/src/index.ts` at d9025a5f5.
+// The schema half is in `TelemetrySchema.swift`, the store half in `TelemetryStore.swift`, metrics are in `Metrics.swift`.
 
 /// An attribute value: a string, number, or boolean, or an array of one of them.
 public enum AttributeValue: Sendable, Hashable {
@@ -37,14 +37,13 @@ public typealias SpanAttributes = [String: AttributeValue?]
 /// Opaque, JSON-serializable propagation data. The adapter owns its format.
 public typealias TelemetryCarrier = [String: String]
 
-/// Optional transport capability, implemented by the application's telemetry adapter.
-/// Both methods are synchronous, passive, and do not throw.
+/// Optional transport capability, implemented by the application's telemetry adapter. Both methods are synchronous.
 public protocol TelemetryPropagation: AnyObject, Sendable {
     /// Returns a detached carrier for a context the adapter knows, or nil for roots, no-op contexts, and
     /// contexts it does not support.
     func inject(_ context: any TelemetryContext) -> TelemetryCarrier?
-    /// Returns a parent owned by this adapter. An absent, invalid, or unknown carrier gives the adapter's root,
-    /// so incoming work is still recorded.
+    /// Returns a parent owned by this adapter. Absent or unknown carriers use the root; recognized identifiers are
+    /// opaque strings.
     func extract(_ carrier: TelemetryCarrier?) -> any TelemetryContext
 }
 
@@ -105,7 +104,8 @@ public enum SpanStatus: Sendable, Hashable {
     }
 }
 
-/// Starts callback-managed child spans.
+/// Starts callback-managed child spans. The adapter contract is for trusted typed inputs; malformed input behavior is
+/// unspecified.
 ///
 /// An adapter runs `body` once, in the caller's task, before `startSpan` returns. It keeps the span
 /// open until `body` returns or throws, and returns the same value or throws the same error.
@@ -130,7 +130,7 @@ extension TelemetryContext {
 }
 
 /// Records attributes, events, and status. A span is also the parent context of its child spans.
-/// Recording methods are synchronous and passive. Calls after settlement have no effect.
+/// Recording methods are synchronous. Calls after settlement have no effect.
 public protocol TelemetrySpan: TelemetryContext {
     /// Appends a link. A settled span ignores it; so does a link to a root, no-op, or unsupported context.
     func addLink(_ link: SpanLink)

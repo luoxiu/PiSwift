@@ -1,7 +1,6 @@
-// Ports upstream `packages/telemetry/test/telemetry.test.ts` at 2ec55d808.
+// Ports upstream `packages/telemetry/test/telemetry.test.ts` at d9025a5f5.
 // Upstream's compile-time checks (`expectTypeOf`, `@ts-expect-error`) test TypeScript inference,
-// which Swift does not have. The "does not inspect or retain telemetry payloads" case passes
-// Proxy values that throw on read, which Swift values cannot be.
+// which Swift does not have.
 
 import Foundation
 import Testing
@@ -183,5 +182,16 @@ struct NoopTelemetryContextTests {
             }
         }
         #expect((asyncResult as? Thrown) === asyncError)
+    }
+
+    @Test func ignoresTypedRecordingPayloads() async {
+        let result = await noopTelemetryContext.startSpan(SpanOptions(name: "operation", attributes: ["kind": "test"])) { span in
+            span.addEvent("event", attributes: ["count": 1])
+            span.setAttributes(["complete": true])
+            span.setStatus(.error(name: "Expected", message: "test"))
+            span.addLink(SpanLink(context: span))
+            return 42
+        }
+        #expect(result == 42)
     }
 }

@@ -1,5 +1,4 @@
-// Ports upstream `packages/telemetry/test/propagation.test.ts` at 48909d987.
-// Upstream's Proxy carriers and links that throw on read have no Swift counterpart.
+// Ports upstream `packages/telemetry/test/propagation.test.ts` at d9025a5f5.
 
 import Foundation
 import Synchronization
@@ -142,53 +141,63 @@ struct PropagationTests {
         ])
     }
 
-    @Test func rejectsMalformedMemoryCarriersAndNeverInspectsNoopPayloads() async {
+    @Test func usesTheRootForAbsentAndUnknownCarriers() async {
         let telemetry = InMemoryTelemetryContext()
-        #expect(telemetry.extract(["pi-memory-scope": "bad", "pi-memory-span": "1"]) === telemetry)
+        let carriers: [TelemetryCarrier?] = [nil, [:], ["unknown": "format"]]
+        for carrier in carriers {
+            #expect(telemetry.extract(carrier) === telemetry)
+        }
         #expect(noopTelemetryPropagation.inject(noopTelemetryContext) == nil)
-        #expect(noopTelemetryPropagation.extract(["bad": "value"]) === noopTelemetryContext)
+        #expect(noopTelemetryPropagation.extract(["unknown": "format"]) === noopTelemetryContext)
         await noopTelemetryContext.startSpan(SpanOptions(name: "noop")) { span in
             span.addLink(SpanLink(context: span))
         }
     }
 
-    // Swift addition: the scope and span checks are hand-written for upstream's two regular expressions and its
-    // safe-integer check, so each boundary is tried; a well-formed carrier keeps only its two keys.
-    @Test func checksEachPartOfAMemoryCarrier() async throws {
+    @Test func treatsRecognizedCarrierIdentifiersAsOpaqueStrings() async {
         let telemetry = InMemoryTelemetryContext()
-        let scope = "0123abcd-4567-89ef-0123-456789abcdef"
-        let rejected: [TelemetryCarrier] = [
-            ["pi-memory-span": "1"],
-            ["pi-memory-scope": scope],
-            ["pi-memory-scope": scope.uppercased(), "pi-memory-span": "1"],
-            ["pi-memory-scope": String(scope.dropLast()), "pi-memory-span": "1"],
-            ["pi-memory-scope": scope.replacingOccurrences(of: "-", with: "0"), "pi-memory-span": "1"],
-            ["pi-memory-scope": scope, "pi-memory-span": "0"],
-            ["pi-memory-scope": scope, "pi-memory-span": "01"],
-            ["pi-memory-scope": scope, "pi-memory-span": "-1"],
-            ["pi-memory-scope": scope, "pi-memory-span": "1.5"],
-            ["pi-memory-scope": scope, "pi-memory-span": "9007199254740992"],
-            ["pi-memory-scope": scope, "pi-memory-span": "99999999999999999999"],
+        let carrier = [
+            "pi-memory-scope": "external-recorder",
+            "pi-memory-span": "external-span",
+            "pi-memory-trace": "external-trace",
         ]
-        for carrier in rejected { #expect(telemetry.extract(carrier) === telemetry, "\(carrier)") }
-        let accepted = telemetry.extract(["pi-memory-scope": scope, "pi-memory-span": "9007199254740991", "extra": "x"])
-        #expect(accepted !== telemetry)
-        #expect(telemetry.inject(accepted) == ["pi-memory-scope": scope, "pi-memory-span": "9007199254740991"])
-        await accepted.startSpan(SpanOptions(name: "child")) { _ in }
-        #expect(telemetry.getSpans().first?.parentId == nil)
-        // A carrier of this recorder's own span gives a local parent ID.
+        await telemetry.extract(carrier).startSpan(SpanOptions(name: "receiver")) { _ in }
+        #expect(telemetry.getSpans().first?.parentContext == carrier)
+    }
+
+    // Swift addition: a carrier missing any of its three keys gives the root and extra keys are dropped; only a span of
+    // this recorder's scope gets a local parent ID, even where another recorder has a span with the same number; and a
+    // child inherits its parent's trace, local or remote.
+    @Test func keepsTheThreeKeysAndGivesLocalParentIdsOnlyInItsOwnScope() async throws {
+        let telemetry = InMemoryTelemetryContext()
+        let complete = ["pi-memory-scope": "s", "pi-memory-span": "1", "pi-memory-trace": "t"]
+        for key in complete.keys {
+            var incomplete = complete
+            incomplete[key] = nil
+            #expect(telemetry.extract(incomplete) === telemetry, "\(incomplete)")
+        }
+        var extra = complete
+        extra["extra"] = "x"
+        #expect(telemetry.inject(telemetry.extract(extra)) == complete)
+        await telemetry.extract(extra).startSpan(SpanOptions(name: "remote-trace")) { _ in }
         var own: TelemetryCarrier?
         await telemetry.startSpan(SpanOptions(name: "own")) { span in own = telemetry.inject(span) }
         await telemetry.extract(own).startSpan(SpanOptions(name: "local")) { _ in }
-        // Another recorder's span 1 is remote here, though this recorder has a span 1 too.
         let foreign = InMemoryTelemetryContext()
         var other: TelemetryCarrier?
         await foreign.startSpan(SpanOptions(name: "foreign")) { span in other = foreign.inject(span) }
         #expect(other?["pi-memory-span"] == "1")
         await telemetry.extract(other).startSpan(SpanOptions(name: "remote")) { _ in }
         let spans = telemetry.getSpans()
-        #expect(spans.first { $0.name == "local" }?.parentId == spans.first { $0.name == "own" }?.id)
+        let ownSpan = try #require(spans.first { $0.name == "own" })
+        let scope = try #require(ownSpan.context["pi-memory-scope"])
+        #expect(ownSpan.context["pi-memory-trace"] == "\(scope):\(ownSpan.id)")
+        #expect(spans.first { $0.name == "remote-trace" }?.context["pi-memory-trace"] == "t")
+        #expect(spans.first { $0.name == "remote-trace" }?.parentId == nil)
+        #expect(spans.first { $0.name == "local" }?.parentId == ownSpan.id)
+        #expect(spans.first { $0.name == "local" }?.context["pi-memory-trace"] == ownSpan.context["pi-memory-trace"])
         #expect(spans.first { $0.name == "remote" }?.parentId == nil)
         #expect(spans.first { $0.name == "remote" }?.parentContext == other)
+        #expect(spans.first { $0.name == "remote" }?.context["pi-memory-trace"] == other?["pi-memory-trace"])
     }
 }

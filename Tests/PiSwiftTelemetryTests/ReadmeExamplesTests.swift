@@ -1,5 +1,5 @@
 // Runs the Swift code blocks of `Sources/PiSwiftTelemetry/README.md`. The `TelemetryPropagation` block is the
-// declaration in `Telemetry.swift`.
+// declaration in `Telemetry.swift`; the SQLite telemetry block runs in PiSwiftChordTests (`SqliteTelemetryReadmeTests`).
 
 import Foundation
 import Testing
@@ -48,9 +48,11 @@ func telemetryAdapterConformance(_ testCase: TelemetryAdapterConformanceCase) as
 }
 // README: end
 
-/// The in-memory carrier of span `id`: the recorder's scope, which every span of `spans` shares, and the span ID.
-func memoryCarrier(_ spans: [RecordedTelemetrySpan], _ id: Int) -> TelemetryCarrier {
-    ["pi-memory-scope": spans.first?.context["pi-memory-scope"] ?? "", "pi-memory-span": String(id)]
+/// The in-memory carrier of span `id`: the recorder's scope, which every span of `spans` shares, the span ID, and the
+/// trace, which is the ID of the trace's `root` span (the span itself by default).
+func memoryCarrier(_ spans: [RecordedTelemetrySpan], _ id: Int, root: Int? = nil) -> TelemetryCarrier {
+    let scope = spans.first?.context["pi-memory-scope"] ?? ""
+    return ["pi-memory-scope": scope, "pi-memory-span": String(id), "pi-memory-trace": "\(scope):\(root ?? id)"]
 }
 
 @Suite("PiSwiftTelemetryTests.README examples")
@@ -230,10 +232,30 @@ struct ReadmeExamplesTests {
                 events: [RecordedTelemetryEvent(name: "example.cache", attributes: ["example.cache.hit": true])],
                 settled: true, endSequence: 2),
             RecordedTelemetrySpan(
-                id: 2, parentId: 1, context: memoryCarrier(spans, 2), parentContext: memoryCarrier(spans, 1),
+                id: 2, parentId: 1, context: memoryCarrier(spans, 2, root: 1), parentContext: memoryCarrier(spans, 1),
                 name: "example.read",
                 attributes: ["example.resource": "project", "example.item_count": 1],
                 settled: true, endSequence: 1),
         ])
+    }
+
+    @Test func storedTelemetry() async throws {
+        let telemetry = InMemoryTelemetryContext()
+        await #expect(throws: (any Error).self) {
+            try await telemetry.startSpan(SpanOptions(name: "failed")) { span in
+                try await span.startSpan(SpanOptions(name: "child")) { _ in throw CancellationError() }
+            }
+        }
+        await telemetry.startSpan(SpanOptions(name: "succeeded")) { _ in }
+        var printed: [String] = []
+        func print(_ text: String) { printed.append(text) }
+        // README: stored-telemetry
+        let page = try await telemetry.findTraces(TraceQuery(errors: true, limit: 10))
+        for trace in page.traces { print(renderTrace(trace.spans)) }
+        // README: end
+        #expect(printed.count == 1)
+        #expect(printed.first?.hasPrefix("failed (") == true)
+        #expect(printed.first?.contains("\n  child (") == true)
+        #expect(printed.first?.contains("error CancellationError: CancellationError()") == true)
     }
 }
