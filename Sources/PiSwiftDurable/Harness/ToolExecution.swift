@@ -166,10 +166,19 @@ private func finalToolResult(_ runtime: TaskRuntime, _ input: ToolTaskInput, _ c
             try runtime.report(ToolStructuredOutputError(message: broken))
         }
     }
-    // Without a schema, or for an error result without structured output, programs get the output itself, so they get
-    // the error's text; the model reads only `output`, so model-issued calls skip it.
-    let schemaValue = tool.structuredOutputSchema != nil && !(final.isError == true && final.structuredOutput == nil)
-    if nested && !schemaValue { final.structuredOutput = try nestedOutputValue(bounded.content) }
+    // Programs get the tool's own value: without a schema, its output. The model reads only `output`, so model-issued
+    // calls skip both.
+    if nested && tool.structuredOutputSchema == nil { final.structuredOutput = try nestedOutputValue(bounded.content) }
+    // A schema tool's error result without structured output has its text only in the output, which programs never
+    // get: it becomes an error diagnostic, as a thrown error's message does, unless one says what went wrong already.
+    if nested, tool.structuredOutputSchema != nil, final.isError == true, final.structuredOutput == nil,
+       !((final.diagnostics ?? []) + harness).contains(where: { $0.severity == .error }) {
+        let text = bounded.content.compactMap { block -> String? in
+            if case .text(let text) = block { return text.text }
+            return nil
+        }.joined(separator: "\n")
+        if !text.isEmpty { harness.append(ToolDiagnostic(severity: .error, message: text, code: "tool_error")) }
+    }
     final.output = bounded.content; final.diagnostics = (final.diagnostics ?? []) + harness
     return final
 }
