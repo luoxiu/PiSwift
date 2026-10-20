@@ -169,9 +169,10 @@ a task that sleeps), and their times through `now` (default the system time); pa
 on a fake clock, as tests do with PiSwiftDurableTesting's `TestClock`. The local environment and file
 watcher keep their own timers. Sleep deadlines are stored on `now`, so every process that opens one
 storage must use the same clock. While scheduling runs, a timer resumes sleeping tasks when they are due.
-A Swift task keeps no process alive: the host keeps it running. A timer must not fire before its delay
-and may fire late. A foreground timer the host throws on or declines is armed with the default timer
-instead, and the first failure is reported.
+A Swift task keeps no process alive: the host keeps it running. A timer should not fire early and may
+fire late; every caller checks its clock again when it fires. The default waits out a delay beyond what
+`setTimeout` supports in steps. A foreground timer the host throws on or declines is armed with the
+default timer instead, and the first failure is reported.
 
 A host whose process can be suspended or ended wakes it itself. With `onWake`, the Harness arms no timer
 for sleeps; it tells the host what `harness.wake()` says whenever that changes: `active` while some task
@@ -189,10 +190,12 @@ let options = HarnessOptions(models: models, registry: registry,
     onWake: { wake in alarm.arm(at: alarmTime(wake, now: clock())) })
 let harness = try await Harness.open(storage: SqliteStorage.open(path: path),
     options: options, context: context)
-try harness.resume()
-// When the alarm fires: resume due sleeps and work a lost process left, then arm again.
-try harness.resume()
+// Armed before `resume()` runs anything, as for any call that can start work.
 alarm.arm(at: alarmTime(try harness.wake(), now: clock()))
+try harness.resume() // work a lost process left, and due sleeps
+// When the alarm fires:
+alarm.arm(at: alarmTime(Wake(active: true, at: try harness.wake().at), now: clock()))
+try harness.resume() // due sleeps and work a lost process left
 // Arm before any call that can start work (submit, compact, abortTask, abort, a registry change):
 // `onWake` runs after the commit. An early alarm is harmless, a missing one strands the work.
 alarm.arm(at: alarmTime(Wake(active: true, at: try harness.wake().at), now: clock()))

@@ -9,10 +9,11 @@ public struct TimerOptions: Sendable, Equatable {
     public init(background: Bool) { self.background = background }
 }
 
-/// A host timer, given as `HarnessOptions.setTimer`: call `callback` once, no sooner than `delayMs` from now, and return
-/// a function that disarms it. `background` timers only free memory, and a host may decline one by returning nil, for
+/// A host timer, given as `HarnessOptions.setTimer`: call `callback` once, about `delayMs` from now, and return a
+/// function that disarms it. `background` timers only free memory, and a host may decline one by returning nil, for
 /// example where a pending timer keeps the process from hibernating; the Harness then frees that memory at later
-/// commits. Other timers pace or resume work: one the host throws on or declines is armed with the default timer.
+/// commits. Other timers pace or resume work: one the host throws on or declines is armed with the default timer. A
+/// timer should not fire early; callers check their clock again when it fires.
 ///
 /// Swift: the Session and the scheduler may hold an internal lock while they arm or disarm a timer, so the function must
 /// return without calling back into the Session or Harness, and must not call `callback` before it returns.
@@ -22,8 +23,8 @@ public typealias SetTimer = @Sendable (_ callback: @escaping @Sendable () -> Voi
 /// Longest delay `setTimeout` supports; a longer one is waited for in several steps.
 private let maxTimerDelay: Int64 = 2_147_483_647
 
-/// The default `HarnessOptions.setTimer`, upstream `setTimeout`: a task that sleeps, never firing early, also for delays
-/// beyond `setTimeout`'s limit, then calls `callback` unless it was disarmed. A Swift task never keeps the process alive,
+/// The default `HarnessOptions.setTimer`, upstream `setTimeout`: a task that sleeps, waiting out delays beyond
+/// `setTimeout`'s limit in steps, then calls `callback` unless it was disarmed. A Swift task never keeps the process alive,
 /// so a background timer is never declined (upstream unreferences it, and declines it in Cloudflare Workers and where
 /// timers cannot be unreferenced).
 internal let nativeTimer: SetTimer = { callback, delayMs, _ in

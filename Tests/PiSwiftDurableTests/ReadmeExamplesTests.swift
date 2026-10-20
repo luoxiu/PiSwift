@@ -129,10 +129,12 @@ import PiSwiftDurableTesting
             onWake: { wake in alarm.arm(at: alarmTime(wake, now: clock())) })
         let harness = try await Harness.open(storage: SqliteStorage.open(path: path),
             options: options, context: context)
-        try harness.resume()
-        // When the alarm fires: resume due sleeps and work a lost process left, then arm again.
-        try harness.resume()
+        // Armed before `resume()` runs anything, as for any call that can start work.
         alarm.arm(at: alarmTime(try harness.wake(), now: clock()))
+        try harness.resume() // work a lost process left, and due sleeps
+        // When the alarm fires:
+        alarm.arm(at: alarmTime(Wake(active: true, at: try harness.wake().at), now: clock()))
+        try harness.resume() // due sleeps and work a lost process left
         // Arm before any call that can start work (submit, compact, abortTask, abort, a registry change):
         // `onWake` runs after the commit. An early alarm is harmless, a missing one strands the work.
         alarm.arm(at: alarmTime(Wake(active: true, at: try harness.wake().at), now: clock()))
