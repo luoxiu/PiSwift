@@ -10,7 +10,7 @@ private struct ReportCheckpoint: TaskCheckpoint, Equatable {
     enum Phase: String, Codable, Sendable { case run, done }
     var phase: Phase = .run
 }
-private typealias ReportTask = TaskDefinition<JSONValue, ReportCheckpoint, JSONValue, NoTaskHooks>
+private typealias ReportTestTask = TaskDefinition<JSONValue, ReportCheckpoint, JSONValue, NoTaskHooks>
 
 private struct Report: Equatable {
     let message: String
@@ -36,7 +36,7 @@ private func reportsOf(_ reports: HarnessReports) -> [Report] {
 
 @Suite struct HarnessReportsTests {
     @Test func sayWhichTaskReportedAFailureOrFaulted() async throws {
-        let faulty = ReportTask(name: "test.faulty", version: 1, initial: { _ in ReportCheckpoint() }, phase: { _, runtime, _ in
+        let faulty = ReportTestTask(name: "test.faulty", version: 1, initial: { _ in ReportCheckpoint() }, phase: { _, runtime, _ in
             try runtime.report(TestFailure("noted"))
             throw TestFailure("broken")
         }, abort: { _, _, _ in })
@@ -48,19 +48,18 @@ private func reportsOf(_ reports: HarnessReports) -> [Report] {
         #expect(try await harness.waitForTask(id: id, context: .background).outcome.status == "faulted")
         try await eventually { reports.count == 2 }
         // The task's own failures name the extension that installed it.
-        let task = ReportInfo(source: .task, taskId: id, taskKind: "test.faulty", conversationId: root.id, extension: "test")
+        let task = ReportTask(id: id, kind: "test.faulty", conversationId: root.id)
         #expect(reportsOf(reports) == [
-            Report(message: "noted", info: task),
-            Report(message: "broken", info: ReportInfo(source: .task, taskId: id, taskKind: "test.faulty", conversationId: root.id,
-                                                       extension: "test", faulted: true)),
+            Report(message: "noted", info: .taskError(task: task, extension: "test")),
+            Report(message: "broken", info: .taskFaulted(task: task, extension: "test", reason: .threw)),
         ])
         try await harness.close(context: .background)
     }
 
     @Test func nameTheExtensionWhoseDefinitionRanAlsoAfterAnotherOneReplacedIt() async throws {
         let gate = SessionTestGate(), started = SessionTestGate()
-        func definition(_ name: String) -> ReportTask {
-            ReportTask(name: "test.replaced", version: 1, initial: { _ in ReportCheckpoint() }, phase: { _, _, _ in
+        func definition(_ name: String) -> ReportTestTask {
+            ReportTestTask(name: "test.replaced", version: 1, initial: { _ in ReportCheckpoint() }, phase: { _, _, _ in
                 started.release()
                 await gate.wait()
                 throw TestFailure("broken in \(name)")
@@ -79,10 +78,12 @@ private func reportsOf(_ reports: HarnessReports) -> [Report] {
         try registry.install(Extension(name: "new-extension", tasks: [AnyTaskDefinition(definition("new"))]))
         gate.release()
         _ = try await harness.waitForTask(id: id, context: .background)
-        try await eventually { reports.infos.contains { $0.faulted == true } }
-        let faulted = reportsOf(reports).first { $0.info.faulted == true }
+        let isFaulted: @Sendable (ReportInfo) -> Bool = { $0.type == "task_faulted" }
+        try await eventually { reports.infos.contains(where: isFaulted) }
+        let faulted = reportsOf(reports).first { isFaulted($0.info) }
         #expect(faulted?.message == "broken in old")
-        #expect(faulted?.info.extension == "old-extension")
+        guard case .taskFaulted(_, let extensionName, _)? = faulted?.info else { Issue.record("A fault must be reported"); return }
+        #expect(extensionName == "old-extension")
         try await harness.close(context: .background)
     }
 
@@ -99,17 +100,20 @@ private func reportsOf(_ reports: HarnessReports) -> [Report] {
                                           context: .background)
         _ = try await root.submit(.input(content: .text("hi")), context: .background).wait(context: .background)
         let infoOf = { (message: String) in reportsOf(reports).first { $0.message == message }?.info }
-        let env = try #require(infoOf("env"))
-        #expect(env.source == .host && env.taskKind == "pi.generation" && env.conversationId == root.id)
-        let failedSection = try #require(infoOf("section"))
-        #expect(failedSection.source == .extension && failedSection.extension == "sections" && failedSection.taskKind == "pi.generation")
-        let failedHook = try #require(infoOf("hook"))
-        #expect(failedHook.source == .extension && failedHook.extension == "hooks" && failedHook.taskKind == "pi.generation")
+        let generation = { (task: ReportTask?) in task?.kind == "pi.generation" && task?.conversationId == root.id }
+        guard case .hostError(let callback, let envTask)? = infoOf("env") else { Issue.record("env must be a host error"); return }
+        #expect(callback == .env && generation(envTask))
+        guard case .extensionError(let sectionName, let sectionTask, _)? = infoOf("section") else {
+            Issue.record("section must be an extension error"); return
+        }
+        #expect(sectionName == "sections" && generation(sectionTask))
+        guard case .extensionError(let hookName, let hookTask, _)? = infoOf("hook") else { Issue.record("hook must be an extension error"); return }
+        #expect(hookName == "hooks" && generation(hookTask))
         try await harness.close(context: .background)
     }
 
     @Test func tellExtensionListenerWakeAndTimerFailuresFromAFailedSession() async throws {
-        let sleeper = ReportTask(name: "test.sleeper", version: 1, initial: { _ in ReportCheckpoint() }, phase: { task, runtime, context in
+        let sleeper = ReportTestTask(name: "test.sleeper", version: 1, initial: { _ in ReportCheckpoint() }, phase: { task, runtime, context in
             switch task.checkpoint.phase {
             case .run:
                 // The host's setTimer throws: reported, and armed with the default timer instead.
@@ -137,14 +141,14 @@ private func reportsOf(_ reports: HarnessReports) -> [Report] {
             return messages.contains("alarm") && messages.contains("no timers")
         }
         let infoOf = { (message: String) in reportsOf(reports).first { $0.message == message }?.info }
-        #expect(infoOf("Wrapper renamed echo to renamed") == ReportInfo(source: .extension, conversationId: root.id, extension: "wraps"))
-        #expect(infoOf("listener") == ReportInfo(source: .listener))
-        #expect(infoOf("alarm") == ReportInfo(source: .wake))
-        #expect(infoOf("no timers") == ReportInfo(source: .timer))
+        #expect(infoOf("Wrapper renamed echo to renamed") == .extensionError(extension: "wraps", task: nil, conversationId: root.id))
+        #expect(infoOf("listener") == .listenerError)
+        #expect(infoOf("alarm") == .hostError(callback: .onWake, task: nil))
+        #expect(infoOf("no timers") == .hostError(callback: .setTimer, task: nil))
 
         await storage.failNextCommit(TestFailure("disk gone"))
         _ = try? await root.commit({ tx in try await tx.createConversation(ownership: .ownerless()) }, context: .background)
         _ = await harness.closed
-        #expect(infoOf("disk gone") == ReportInfo(source: .session))
+        #expect(infoOf("disk gone") == .sessionFailed)
     }
 }

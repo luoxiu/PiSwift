@@ -77,7 +77,7 @@ public final class Session: Sendable {
         let guarded = GuardedStorage(storage)
         self.guarded = guarded; self.storage = guarded; self.now = now; self.hooks = hooks
         self.documentRetentionSetting = documentRetention
-        timers = hostTimers(setTimer, report: { [hooks] error in hooks.report(error, info: ReportInfo(source: .timer)) })
+        timers = hostTimers(setTimer, report: { [hooks] error in hooks.report(error, info: .hostError(callback: .setTimer, task: nil)) })
         guarded.onFailure { [weak self] error in self?.failed(error) }
     }
     /// Creates a session over the supplied storage without reading persisted records. `now` is the wall clock for task
@@ -112,7 +112,7 @@ public final class Session: Sendable {
         // Seal first, so a report handler that calls back finds the Session failed. Closing runs the close listeners
         // synchronously; a failing backend close is the caller's to see, and here nobody waits.
         beginClose(cleanup: .background)
-        report(error, info: ReportInfo(source: .session))
+        report(error, info: .sessionFailed)
     }
     /// Internal: the Session's failure, and errors of listeners, which never fail what ran them; `info` defaults to a
     /// listener. A plain Session drops them.
@@ -289,7 +289,7 @@ public final class Session: Sendable {
                 do { try await self.storage.close(context: cleanup) }
                 catch {
                     // A Storage that cannot close is a failed one; an earlier failure stays the cause.
-                    if self.guarded.recordFailure(error) { self.report(error, info: ReportInfo(source: .session)) }
+                    if self.guarded.recordFailure(error) { self.report(error, info: .sessionFailed) }
                     throw error
                 }
             }

@@ -202,7 +202,8 @@ internal final class TaskScheduler: Sendable {
         for record in parked {
             let restarts = (record.restarts ?? 0) + 1
             let error = SessionError.message("Task \(record.id.rawValue) (\(record.kind)) was cut off \(restarts) times without progress; it is parked until retryTask()")
-            report(error, taskInfo(taskId: record.id, kind: record.kind, conversationId: record.conversationId, blocked: .restartLimit))
+            let about = aboutTask(record)
+            report(error, .taskParked(task: about.task, extension: about.extension))
         }
         state.withLock { $0.cascadePending = true }
         scheduleReconcile()
@@ -607,8 +608,8 @@ internal final class TaskScheduler: Sendable {
                             // Blocked now without a commit: the graph and the host's wake must hear it.
                             notifyBlocked()
                             scheduleWake()
-                            report(error, taskInfo(taskId: record.id, kind: record.kind, conversationId: record.conversationId,
-                                                   extension: .some(installerOf(snapshot, definition))))
+                            let about = aboutTask(record, extension: .some(installerOf(snapshot, definition)))
+                            report(error, .migrationFailed(task: about.task, extension: about.extension))
                             resolution = ("migration_failed", error, false)
                         }
                     }
@@ -636,8 +637,8 @@ internal final class TaskScheduler: Sendable {
             throw error
         }
         for (record, message) in faulted {
-            report(SessionError.message(message), taskInfo(taskId: record.id, kind: record.kind, conversationId: record.conversationId,
-                                                           faulted: true, blocked: .restartLimit))
+            let about = aboutTask(record)
+            report(SessionError.message(message), .taskFaulted(task: about.task, extension: about.extension, reason: .restartLimit))
         }
         // Marked, or already marked or gone: done with them. Reserve again, now seeing the marks.
         if !abandoned.isEmpty {
@@ -693,7 +694,7 @@ internal final class TaskScheduler: Sendable {
                 }
             }, context: context)
             // Reported once the fault is durable: a host may count it, for example toward a breaker.
-            if let fault { report(fault, taskInfo(invocation, faulted: true)) }
+            if let fault { report(fault, .taskFaulted(task: reportTask(invocation), extension: invocation.extension, reason: .threw)) }
             return continued
         } catch {
             // The step writes the scheduler's own decision, a fault or a terminal record; a throw there would otherwise
@@ -740,9 +741,9 @@ internal final class TaskScheduler: Sendable {
                         return true
                     }
                     if shouldReport {
-                        report(TaskHandoverError(taskId: current.id, kind: current.kind, cause: next == nil ? .missingTask : .incompatibleTask),
-                               taskInfo(taskId: current.id, kind: current.kind, conversationId: current.conversationId,
-                                        extension: .some(invocation.extension)))
+                        let about = aboutTask(current, extension: .some(invocation.extension))
+                        report(SessionError.message("Task \(current.id.rawValue) keeps running under its old \(current.kind) definition"),
+                               .taskOutdated(task: about.task, extension: about.extension, reason: next == nil ? .missingTask : .incompatibleTask))
                     }
                 }
                 return .proceed

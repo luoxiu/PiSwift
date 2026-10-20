@@ -216,30 +216,38 @@ reset cut off (`TaskRecord.restarts`); a close is not counted, as it writes the 
 checkpoint, a wait, a sleep, an outcome) starts the count over; the same checkpoint committed again, memos,
 and document writes do not. Once the count reaches `settings.restartLimit` (default 5; `.infinity` never
 parks), the task is parked: `inspect()` and the task graph show it as blocked with reason `restartLimit`,
-`wake()` does not count it as active, and `onReport` gets it once, at the open that parks it. Every task
+`wake()` does not count it as active, and `onReport` gets it once as `.taskParked`, at the open that parks it. Every task
 running when a process dies is counted, not only the one that killed it, so a long stream next to the culprit
 can be parked too: show parked tasks and offer `harness.retryTask(id:context:)`, which removes the count and
 runs one again, and does nothing for a task that is not parked. A parked run keeps its conversation busy.
 `abortTask()` starts the count over and still runs the abort handler; an abort handler cut off that many times
-is not run again, and the task ends `faulted` with detail `{ reason: "restart_limit" }`.
+is not run again, and the task ends `faulted` with detail `{ reason: "restart_limit" }`, reported as `.taskFaulted`
+with reason `.restartLimit`.
 
-**Reports.** `onReport(error, info)` says where a failure came from; `info.source` is one of:
+**Reports.** `onReport(error, info)` says what happened; `info` (`ReportInfo`) is one of:
 
-- `.session`: the error that failed the Harness (a Storage error, often a platform reset, or the Session's own
-  bookkeeping);
-- `.task`: a task's phase that faulted (`faulted: true`), a task's `runtime.report()`, a failed migration, or a
-  task parked or faulted by the restart limit (`blocked: .restartLimit`), with `taskId`, `taskKind`, and
-  `conversationId`;
-- `.extension`: hooks, wrappers, system prompt sections, and a tool's invalid structured output;
-- `.listener`; `.host` for the environment builder and model provider calls such as cancelling a deferred
-  response; `.timer` for `setTimer`; and `.wake` for `onWake`.
+- `.sessionFailed`: the error that failed the Harness (a Storage error, often a platform reset, or the Session's
+  own bookkeeping);
+- `.taskFaulted`: a task ended `faulted`, because its phase threw (reason `.threw`) or its abort handler was cut
+  off `restartLimit` times (reason `.restartLimit`);
+- `.taskParked`: the restart limit parked a task;
+- `.migrationFailed`: a task's migration threw, and the task is blocked;
+- `.taskOutdated`: a running task keeps its old definition, which is missing (`.missingTask`) or cannot take the
+  task (`.incompatibleTask`);
+- `.taskError`: a task's own `runtime.report()`, or a failure running it;
+- `.extensionError`: hooks, wrappers, system prompt sections, and a tool's invalid structured output, with the
+  task that ran them, or for a wrapper outside a task the conversation whose agent was resolved;
+- `.hostError`: a host callback, by its `HarnessOptions` name (`HostCallback`): `env`, `models` for provider calls
+  such as cancelling a deferred response, `setTimer`, or `onWake`, with the task that called it, if one did;
+- `.listenerError`: a commit, close, watch, view, or document listener.
 
-`info.extension` names the extension whose code failed, when known. A `.task` report names the extension that
-installed the definition the task ran, as of its reservation; built-in tasks have none. An `.extension` report
-names the hook's or the wrapper's extension, or the last selected extension that provides or wraps the section or
-tool. A task's `runtime.report(error, from:)` says whose code failed: its own (default), `.extension(name)`, or
-`.host`. A host acts on reports outside the scheduler, for example counting faults of one task kind toward a
-breaker.
+Every task report carries `task` (`ReportTask`: its ID, kind, and conversation). `extension` names the extension
+whose code failed, when known. A task report names the extension that installed the definition the task ran, as of
+its reservation; built-in tasks have none. An `.extensionError` names the hook's or the wrapper's extension, or the
+last selected extension that provides or wraps the section or tool. A task's `runtime.report(error, from:)` is a
+`.taskError`, or with `from` (`.extension(name)` or `.host(callback)`) an `.extensionError` or `.hostError` with that
+task. A host acts on reports outside the scheduler, for example counting `.taskFaulted` reports of one task kind
+toward a breaker.
 
 **Queued inputs after a failed run.** A run that fails with a model error (`model_error` or `no_model`) leaves
 the inputs queued behind it waiting until the next input arrives. `settings.afterFailedRun` changes that, in
@@ -672,11 +680,13 @@ until a compaction produces a summary. The event snapshot carries it as
   intersects the types. The resolved `CompactionPolicy` in `Settings` carries `modelOverrides` too, and the policy
   resolved for one model has none.
 - `onReport` takes `(error, ReportInfo)`, so a closure written for one argument becomes `{ error, _ in }`,
-  where upstream's JavaScript still calls one. `ReportInfo.faulted` is a `Bool?` set to `true`.
+  where upstream's JavaScript still calls one. `ReportInfo` is an enum with associated values for upstream's union
+  tagged by `type`, which `ReportInfo.type` returns; `ReportFrom` is an enum (`.extension(name)`, `.host(callback)`),
+  and `runtime.report(_:from:)` without it is the task's own. A report's error is a plain message error, as
+  upstream's: the reasons are in the info (`TaskFaultReason`, `TaskOutdatedReason`). `HostCallback` lists
+  `now`, `settings`, and `registry` too, which Swift never reports, as those callbacks cannot throw.
   `TaskBlockedReason` serves both `inspect()` and `TaskGraphNode.blocked`. `restartLimit` is a `Double`, so
-  `.infinity` never parks; a fraction rounds down. Errors carry no `cause`, so a parked task's report says so in
-  its text and its info; `ReportInfo.blocked` is a `TaskBlockedReason?` set to `.restartLimit`. `ReportFrom` is an
-  enum (`.task`, `.extension(name)`, `.host`). `agentHooks(_:taskName:)` returns `(extension:hook:)` pairs, where
+  `.infinity` never parks; a fraction rounds down. `agentHooks(_:taskName:)` returns `(extension:hook:)` pairs, where
   upstream returns `{ extension, handlers }`.
 - This library has no CLI or TUI code. PowerShell and Windows process support are outside scope.
 

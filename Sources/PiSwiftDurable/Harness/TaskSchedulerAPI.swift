@@ -87,31 +87,26 @@ extension TaskScheduler {
         guard let restarts else { return false }
         return !abortRequested && Double(restarts) >= restartLimit()
     }
-    /// The report info of a task's failure, with the extension that installed its definition: the code that failed is
-    /// that extension's. Built-in tasks have none. `extension`: the installer of the definition whose code ran (an
-    /// invocation's); nil: the current one's.
-    func taskInfo(taskId: TaskID, kind: String, conversationId: ConversationID, extension known: String?? = nil,
-                  faulted: Bool? = nil, blocked: TaskBlockedReason? = nil) -> ReportInfo {
+    /// What a report about a task's own code says of it: the task, and the extension that installed its definition.
+    /// Built-in tasks have none. `extension`: the installer of the definition whose code ran (an invocation's); nil: the
+    /// current one's.
+    func aboutTask(_ record: TaskRecord, extension known: String?? = nil) -> (task: ReportTask, extension: String?) {
         let installer: String?
         if let known { installer = known }
-        else { let snapshot = registry.snapshot(); installer = installerOf(snapshot, snapshot.task(name: kind)) }
-        return ReportInfo(source: .task, taskId: taskId, taskKind: kind, conversationId: conversationId,
-                          extension: installer, faulted: faulted, blocked: blocked)
+        else { let snapshot = registry.snapshot(); installer = installerOf(snapshot, snapshot.task(name: record.kind)) }
+        return (ReportTask(id: record.id, kind: record.kind, conversationId: record.conversationId), installer)
     }
-    func taskInfo(_ invocation: TaskInvocation, faulted: Bool? = nil) -> ReportInfo {
-        taskInfo(taskId: invocation.taskId, kind: invocation.kind, conversationId: invocation.conversationId,
-                 extension: .some(invocation.extension), faulted: faulted)
+    func aboutTask(_ invocation: TaskInvocation) -> (task: ReportTask, extension: String?) {
+        (reportTask(invocation), invocation.extension)
     }
     /// The info of a report a task's runtime makes: the task's own failure names the task's extension; any other names
     /// whose code failed, if anyone's.
-    func reportInfo(_ invocation: TaskInvocation, from: ReportFrom) -> ReportInfo {
+    func reportInfo(_ invocation: TaskInvocation, from: ReportFrom?) -> ReportInfo {
+        let task = reportTask(invocation)
         switch from {
-        case .task: taskInfo(invocation)
-        case .extension(let name):
-            ReportInfo(source: .extension, taskId: invocation.taskId, taskKind: invocation.kind,
-                       conversationId: invocation.conversationId, extension: name)
-        case .host:
-            ReportInfo(source: .host, taskId: invocation.taskId, taskKind: invocation.kind, conversationId: invocation.conversationId)
+        case nil: return .taskError(task: task, extension: invocation.extension)
+        case .extension(let name)?: return .extensionError(extension: name, task: task, conversationId: nil)
+        case .host(let callback)?: return .hostError(callback: callback, task: task)
         }
     }
     func waitForTask(id: TaskID, context: ChordContext) async throws -> SettledTask {
@@ -317,4 +312,9 @@ internal struct BlockedSubject: Sendable, Equatable {
 internal func installerOf(_ snapshot: RegistrySnapshot, _ task: AnyTaskDefinition?) -> String? {
     guard let task else { return nil }
     return snapshot.installed().last { $0.tasks.contains { $0.identity == task.identity } }?.name
+}
+
+/// The task an invocation runs, as a report names it.
+internal func reportTask(_ invocation: TaskInvocation) -> ReportTask {
+    ReportTask(id: invocation.taskId, kind: invocation.kind, conversationId: invocation.conversationId)
 }

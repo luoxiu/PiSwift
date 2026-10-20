@@ -181,7 +181,7 @@ private func prepareGeneration(_ checkpoint: GenerationCheckpoint, _ runtime: Ta
     let shown = replaySections(view.messages)
     var env: (any ExecutionEnv)?
     do { env = try await runtime.env(context: context) }
-    catch { if context.abortSignal?.aborted == true { throw error }; try runtime.report(error, from: .host) }
+    catch { if context.abortSignal?.aborted == true { throw error }; try runtime.report(error, from: .host(.env)) }
     let input = PromptInput(conversationId: runtime.conversationId, agent: agent, env: env,
                             shown: Dictionary(uniqueKeysWithValues: shown.compactMap { key, value in value.stringValue.map { (key, $0) } }),
                             read: runtime.hookApi.read)
@@ -298,7 +298,7 @@ private func abortGeneration(_ checkpoint: GenerationCheckpoint, _ runtime: Task
             let bridge = ContextCancellationBridge(context: context.withAbortSignal(runtime.signal))
             defer { withExtendedLifetime(bridge) {} }
             try await runtime.models.cancelDeferred(model: model, handle: handle.handle, options: DeferredCancelOptions(signal: bridge.token))
-        } catch { try runtime.report(error, from: .host) }
+        } catch { try runtime.report(error, from: .host(.models)) }
     }
     let unstarted = checkpoint.phase == .tools ? try await generationCalls(runtime: runtime, assistant: required(checkpoint.assistant, "assistant"), callIds: checkpoint.pending ?? [], context: context) : []
     try await runtime.commit({ tx, _ in

@@ -63,12 +63,12 @@ public final class Harness: Sendable {
             let settings: @Sendable () -> Settings = { options.settings?.resolve() ?? resolveSettings() }
             let reference = Mutex(WeakHarness())
             let scheduler = TaskScheduler(session: session, registry: options.registry, models: options.currentModels,
-                now: now, onWake: options.onWake, timers: hostTimers(options.setTimer, report: { report($0, ReportInfo(source: .timer)) }),
+                now: now, onWake: options.onWake, timers: hostTimers(options.setTimer, report: { report($0, .hostError(callback: .setTimer, task: nil)) }),
                 settings: settings,
                 agent: { id, snapshot, callContext in
                     let state = try await session.snapshot(AgentDoc, conversationId: id, context: callContext)
                     return resolveAgent(state: state, snapshot: snapshot, settings: settings(),
-                                        report: { report($0, ReportInfo(source: .extension, conversationId: id, extension: $1)) })
+                                        report: { report($0, .extensionError(extension: $1, task: nil, conversationId: id)) })
                 }, env: { id, callContext in
                     guard let build = options.env else { return nil }
                     let cwd = try await session.snapshot(AgentDoc, conversationId: id, context: callContext)?.cwd
@@ -238,7 +238,7 @@ public final class Harness: Sendable {
         let value = try await session.snapshot(AgentDoc, conversationId: id, context: context)
         let report = options.onReport ?? { _, _ in }
         return resolveAgent(state: value, snapshot: options.registry.snapshot(), settings: options.settings?.resolve() ?? resolveSettings(),
-                            report: { report($0, ReportInfo(source: .extension, conversationId: id, extension: $1)) })
+                            report: { report($0, .extensionError(extension: $1, task: nil, conversationId: id)) })
     }
 }
 /// The harness cannot use the supplied registry to load its built-in tasks.

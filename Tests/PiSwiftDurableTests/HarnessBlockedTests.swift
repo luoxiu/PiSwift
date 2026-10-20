@@ -240,8 +240,9 @@ private func blockedState(_ harness: Harness, _ id: TaskID) async throws -> Task
         }
         let harness = opened.harness
         #expect(try await harness.getTask(id: id, context: .background)?.restarts == 3)
-        #expect(opened.reports.infos == [ReportInfo(source: .task, taskId: id, taskKind: "test.crash-loop", conversationId: root.id,
-                                                    extension: "loop", blocked: .restartLimit)])
+        #expect(opened.reports.infos == [
+            .taskParked(task: ReportTask(id: id, kind: "test.crash-loop", conversationId: root.id), extension: "loop"),
+        ])
         #expect(opened.reports.values.map { String(describing: $0) }
             == ["Task \(id.rawValue) (test.crash-loop) was cut off 3 times without progress; it is parked until retryTask()"])
         #expect(try await blockedState(harness, id) == .restartLimit)
@@ -343,8 +344,9 @@ private func blockedState(_ harness: Harness, _ id: TaskID) async throws -> Task
         #expect(aborts.withLock { $0 } == 1)
         let reports = opened.reports
         try await eventually { reports.count > 0 }
-        #expect(reports.infos == [ReportInfo(source: .task, taskId: id, taskKind: "test.stuck-abort", conversationId: root.id,
-                                             extension: "stuck", faulted: true, blocked: .restartLimit)])
+        #expect(reports.infos == [
+            .taskFaulted(task: ReportTask(id: id, kind: "test.stuck-abort", conversationId: root.id), extension: "stuck", reason: .restartLimit),
+        ])
         #expect(reports.values.map { String(describing: $0) }
             == ["Abort handler of task \(id.rawValue) (test.stuck-abort) was cut off 1 times"])
         try await opened.harness.close(context: .background)

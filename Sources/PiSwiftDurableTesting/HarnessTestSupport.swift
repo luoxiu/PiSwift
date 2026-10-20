@@ -14,7 +14,7 @@ public final class HarnessReports: Sendable {
     /// The number of values currently recorded.
     public var count: Int { state.withLock { $0.count } }
     /// Records one error report for later test inspection; `info` defaults to a listener's.
-    public func append(_ error: any Error, info: ReportInfo = ReportInfo(source: .listener)) {
+    public func append(_ error: any Error, info: ReportInfo = .listenerError) {
         state.withLock { $0.append((error, info)) }
     }
 }

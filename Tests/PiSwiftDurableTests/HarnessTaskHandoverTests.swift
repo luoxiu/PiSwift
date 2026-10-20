@@ -72,7 +72,10 @@ private func startHandover(_ root: Conversation, _ definition: HandoverTask) asy
         #expect(log.values == ["old:a start", "old:a end", "old:b start", "old:b end", "old:c"])
         #expect(opened.reports.count == 2)
         #expect(opened.reports.values.allSatisfy { String(describing: $0).contains("keeps running under its old") })
-        #expect(opened.reports.values.compactMap { ($0 as? TaskHandoverError)?.cause.rawValue } == ["missing_task", "incompatible_task"])
+        #expect(opened.reports.infos.map { info -> String in
+            guard case .taskOutdated(let task, _, let reason) = info, task.id == id else { return info.type }
+            return reason.rawValue
+        } == ["missing_task", "incompatible_task"])
         try await harness.close(context: .background)
     }
 
@@ -182,6 +185,10 @@ private func startHandover(_ root: Conversation, _ definition: HandoverTask) asy
             #expect(opened.reports.count == 0)
         } else {
             try await harnessEventually { opened.reports.count == 1 }
+            guard case .migrationFailed(let failed, _)? = opened.reports.infos.first else {
+                Issue.record("The failed migration must be reported as migrationFailed"); return
+            }
+            #expect(failed.id == id)
             let item = try #require(try await harness.inspect(context: .background).tasks.first)
             guard case .blocked(let reason, _) = item.state else {
                 Issue.record("Failed handover migration was not blocked")

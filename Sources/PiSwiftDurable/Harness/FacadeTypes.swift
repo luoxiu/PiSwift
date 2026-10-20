@@ -156,8 +156,8 @@ public struct HarnessOptions: Sendable {
     /// Runs inside the transaction that creates a conversation.
     public var conversationCreated: (@Sendable (Transaction, ConversationRecord) async throws -> Void)?
     /// Receives failures that do not fail the calling operation, such as a throwing hook or listener, a task that faulted,
-    /// and the error that fails the Session, once. `info` says where it came from: a host can tell a failed Session
-    /// (`source: .session`, often a platform reset) from a faulted task (`source: .task`, `faulted`).
+    /// and the error that fails the Session, once. `info` says what happened: a host can tell a failed Session
+    /// (`.sessionFailed`, often a platform reset) from a faulted task (`.taskFaulted`) or a parked one (`.taskParked`).
     public var onReport: (@Sendable (any Error, ReportInfo) -> Void)?
     /// Supplies host model, registry, clock, timer, settings, and environment services.
     public init(models: any DurableModels, registry: any RegistryReader,
@@ -180,25 +180,4 @@ public struct HarnessOptions: Sendable {
         self.now = now; self.setTimer = setTimer; self.onWake = onWake
         self.conversationCreated = conversationCreated; self.onReport = onReport
     }
-}
-
-/// A replacement that cannot take the current invocation. The old definition continues.
-public struct TaskHandoverError: Error, Sendable, CustomStringConvertible {
-    /// The reason an installed task definition cannot replace a running definition.
-    public enum Cause: String, Sendable {
-        /// No installed definition matches the saved task kind.
-        case missingTask = "missing_task"
-        /// The replacement task definition cannot run the current record.
-        case incompatibleTask = "incompatible_task"
-    }
-    /// The ID of the task bound to this value or invocation.
-    public let taskId: TaskID
-    /// The stored record or document kind.
-    public let kind: String
-    /// The reason the running task could not adopt its new definition.
-    public let cause: Cause
-    /// Records the running task whose replacement definition could not take over.
-    public init(taskId: TaskID, kind: String, cause: Cause) { self.taskId = taskId; self.kind = kind; self.cause = cause }
-    /// Text that describes this value or error to the caller.
-    public var description: String { "Task \(taskId.rawValue) keeps running under its old \(kind) definition" }
 }

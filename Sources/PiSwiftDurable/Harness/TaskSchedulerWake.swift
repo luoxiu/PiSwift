@@ -84,7 +84,7 @@ extension TaskScheduler {
                 try onWake(wake)
                 // Only a delivered wake counts: after a throw, the next change or kick offers it again.
                 state.withLock { $0.lastWake = wake }
-            } catch { report(error, ReportInfo(source: .wake)) }
+            } catch { report(error, .hostError(callback: .onWake, task: nil)) }
         }
     }
 
