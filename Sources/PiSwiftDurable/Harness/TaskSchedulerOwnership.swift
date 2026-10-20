@@ -233,8 +233,6 @@ extension TaskScheduler.State {
         if case .waiting(_, let on, _, _)? = previous?.state { for task in on { deleteFrom(&waiters, task, id) } }
         if record.state.status == "terminal" {
             let node = TaskNode(record)
-            // Only a known task is counted in its owner's `knownChildren`; `forget` uncounts it.
-            if live[id] == nil && settled[id] == nil { countChild(node, 1) }
             live.removeValue(forKey: id); order.removeValue(forKey: id)
             intent.remove(id); runnable.remove(id); finalizeChecks.remove(id)
             settled[id] = node
@@ -243,14 +241,13 @@ extension TaskScheduler.State {
             release(node)
             for waiter in waiters[id] ?? [] { runnable.insert(waiter) }
             relist(.task(id))
-            forget(id)
+            dropIfUnneeded(.task(id))
             return
         }
         live[id] = record
         if previous == nil {
             order[id] = nextOrder; nextOrder += 1
             if !known(record.parent) { unloaded.insert(id) }
-            countChild(TaskNode(record), 1)
             relist(.task(id))
         }
         if record.cancellationIntent { intent.insert(id) } else { intent.remove(id) }
@@ -266,38 +263,38 @@ extension TaskScheduler.State {
     }
     mutating func setEdge(_ id: ConversationID, _ owner: TaskID?) {
         edges.updateValue(owner, forKey: id)
-        if let owner { conversationOwners.insert(owner) }
-        // The conversation now hangs from its owner, or is a root.
+        // The conversation now hangs from its owner, or is a root; with nothing below it, it waits for the sweep.
         relist(.conversation(id))
+        dropIfUnneeded(.conversation(id))
     }
-    /// Keep a terminal task a chain load read, so walks pass through it; its own chain is not loaded yet.
+    /// Know a terminal task a chain load read, so walks pass through it; its own chain is not loaded yet.
     mutating func settle(_ id: TaskID, _ node: TaskNode) {
-        settled[id] = node; pinned.insert(id); unloaded.insert(id)
-        countChild(node, 1)
+        settled[id] = node; unloaded.insert(id)
         relist(.task(id))
+        dropIfUnneeded(.task(id))
     }
-    /// Count a task that became known in its owner task's `knownChildren`, or one that is forgotten out of it.
-    mutating func countChild(_ node: TaskNode, _ delta: Int) {
-        guard let owner = node.owner else { return }
-        let count = (knownChildren[owner] ?? 0) + delta
-        knownChildren[owner] = count == 0 ? nil : count
+    /// Queue an ended task or a conversation for the sweep when nothing is listed below it.
+    mutating func dropIfUnneeded(_ node: OwnershipUp) {
+        if case .task(let id) = node, live[id] != nil { return }
+        if below[node] != nil { return }
+        dropQueue.insert(node)
     }
-    /// Forget ended task `id` unless walks up still need it: it owns a loaded conversation, a chain load read it, or it
-    /// owns a known task; then its owner, as far up as that changes.
-    mutating func forget(_ id: TaskID) {
-        var at: TaskID? = id
-        while let current = at {
-            guard let node = settled[current], live[current] == nil else { return }
-            if conversationOwners.contains(current) || pinned.contains(current) || knownChildren[current] != nil { return }
-            if below[.task(current)] != nil { return }
-            settled.removeValue(forKey: current); unloaded.remove(current)
-            countChild(node, -1)
-            at = node.owner
+    /// Drop the queued nodes that are still unneeded: not live, nothing listed below. Runs once a publication is fully
+    /// tracked, and as a job of its own on the line, never inside an operation: work a commit creates below a chain its
+    /// own callback loaded keeps that chain. A flat loop: unlisting already queued every node on the way up that lost its
+    /// last listed node.
+    mutating func sweep() {
+        for node in dropQueue where below[node] == nil {
+            switch node {
+            case .conversation(let id): edges.removeValue(forKey: id); roots.remove(id)
+            case .task(let id): if live[id] == nil { settled.removeValue(forKey: id); unloaded.remove(id) }
+            }
         }
+        dropQueue.removeAll()
     }
     /// List `start` under its parent node in `below` while it is a live task or has nodes listed below it, and unlist it
-    /// otherwise; then its parent, as far up as that changes. So `below` holds exactly the tree around live work; an
-    /// ended parent that loses its last listed node may be forgotten (`forget`).
+    /// otherwise; then its parent, as far up as that changes. So `below` holds exactly the tree around live work; a
+    /// parent that loses its last listed node is queued for the sweep.
     mutating func relist(_ start: OwnershipUp) {
         var node = start
         while true {
@@ -324,8 +321,7 @@ extension TaskScheduler.State {
             } else {
                 deleteFrom(&below, parent, node)
                 if below[parent] != nil { return }
-                // An ended task with nothing listed below it any more may be forgotten.
-                if case .task(let id) = parent { forget(id) }
+                dropIfUnneeded(parent)
             }
             node = parent
         }

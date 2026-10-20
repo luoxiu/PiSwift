@@ -46,6 +46,10 @@ internal final class RuntimePhase: Sendable {
 /// owner, a scope. `below` lists the tree downward around live work, so what lies below one node is a walk down from
 /// it: a task's live ordinary owned work, which holds its outcome as `completing` and delays its abort handler, a
 /// scope's tasks, a cascade's reach. No pass visits every live task; the sets in `State` hold each pass's candidates.
+///
+/// The ownership indexes are bounded by live work: an owner edge and an ended task's ownership fields are kept only while
+/// something is listed below them in `below`, so only the chains above live tasks are known, whole. Work that appears
+/// later below a dropped node finds it unknown and loads its chain from storage again.
 internal final class TaskScheduler: Sendable {
     internal let toolServices = ToolServices()
     let session: Session
@@ -68,14 +72,13 @@ internal final class TaskScheduler: Sendable {
         /// When each live task became live; listings and reservation passes follow this order.
         var order: [TaskID: Int] = [:]
         var nextOrder = 0
-        // Owner task of each loaded conversation; an entry with nil owner is a loaded, ownerless conversation.
+        // Owner task of each known conversation; an entry with nil owner is a known, ownerless conversation.
         var edges: [ConversationID: TaskID?] = [:]
-        /// Tasks that own a loaded conversation; their nodes stay in `settled` once terminal, and with them, through
-        /// `knownChildren`, every task above them. Never cleared: about one entry per task on a subagent's chain.
-        var conversationOwners: Set<TaskID> = []
-        /// Ownership fields of terminal tasks that walks pass through: conversation owners, chain loads, owners of known
-        /// tasks, and those with nodes listed below them. `forget` drops the rest.
+        /// Ownership fields of the known terminal tasks, which walks pass through.
         var settled: [TaskID: TaskNode] = [:]
+        /// Ended tasks and conversations found unneeded, dropped by `sweep()` at the end of the commit's publication unless
+        /// needed again by then: a chain load installs nodes before the work below them is listed.
+        var dropQueue: Set<OwnershipUp> = []
         /// The tree downward around live work: each node's child nodes that are live tasks or have nodes listed below
         /// them. A conversation's parent is its owner task; ownerless ones with work are in `roots`.
         var below: [OwnershipUp: Set<OwnershipUp>] = [:]
@@ -90,11 +93,6 @@ internal final class TaskScheduler: Sendable {
         var finalizeChecks: Set<TaskID> = []
         /// Live waiting tasks by each task in their `on`.
         var waiters: [TaskID: Set<TaskID>] = [:]
-        /// Terminal tasks a chain load read; kept in `settled`, so loaded chains stay loaded.
-        var pinned: Set<TaskID> = []
-        /// Per task, how many known tasks (live, or in `settled`) it owns directly. An ended task stays known while any
-        /// does, so the chain above every known task stays loaded.
-        var knownChildren: [TaskID: Int] = [:]
         /// `failFast` waiters the next reconcile checks for a failed task in `on`: at open, when they start waiting, and
         /// when one of their tasks fails.
         var failFastChecks: Set<TaskID> = []
@@ -113,6 +111,7 @@ internal final class TaskScheduler: Sendable {
         /// abort-marks them with reason `restart`, so nothing of them or below them runs a phase again.
         var abandoned: Set<TaskID> = []
         var reconcileScheduled = false
+        var sweepScheduled = false
         var reconciles: [UUID: Task<Void, Never>] = [:]
         var subscriptions: [SessionSubscription] = []
         var unsubscribe: (@Sendable () -> Void)?
@@ -238,6 +237,8 @@ internal final class TaskScheduler: Sendable {
             for change in publication.changes {
                 // A queued input below a cancelled owner is withdrawn, even after its cascade.
                 guard case .submission(let input) = change, input.type == "input", input.status == "queued" else { continue }
+                // Only an owner with cancellation intent withdraws it; a later intent's mark runs the cascade then.
+                if state.intent.isEmpty { continue }
                 let up = OwnershipUp.conversation(input.conversationId)
                 if !state.known(up) || state.belowCancelled(up) { state.cascadePending = true }
             }
@@ -247,6 +248,7 @@ internal final class TaskScheduler: Sendable {
                 else if !record.background && !record.abortRequested && state.belowCancelled(record.parent) { state.cascadePending = true }
             }
             if state.cascadePending { repair = true }
+            state.sweep()
         }
         for invocation in aborts { invocation.controller.abort() }
         for record in settled { taskWaiters.resolve(record.id, value: SettledTask(record: record)) }
@@ -304,6 +306,21 @@ internal final class TaskScheduler: Sendable {
             }
         }
     }
+    /// Sweep in a job of its own on the Session line, after the operation underway: a rejected commit, one with nothing to
+    /// write, and a read publish nothing, so the sweep at the end of `observe` would not run for what they loaded. The
+    /// index methods only queue nodes, as `State` cannot reach the line; a chain load calls this after them.
+    func scheduleSweep() {
+        let schedule = state.withLock { state -> Bool in
+            guard !state.dropQueue.isEmpty, !state.sweepScheduled, !state.closing else { return false }
+            state.sweepScheduled = true; return true
+        }
+        guard schedule else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            // Rejected only once the Session is closing or failed, when nothing is kept anyway.
+            _ = try? await session.readOnLine { state.withLock { state in state.sweepScheduled = false; state.sweep() } }
+        }
+    }
     /// Load the owner edges and task nodes from `start` up to its ownerless root. A known task outside `unloaded` ends the
     /// walk, as its chain is loaded; the `unloaded` tasks passed have a loaded chain afterwards. Loading a node can reveal
     /// a cancelled owner, so it makes the next reconcile derive cascade marks.
@@ -327,7 +344,7 @@ internal final class TaskScheduler: Sendable {
                 case .absent:
                     guard let record = try await storage.task(id, context: context) else { return }
                     node = TaskNode(record)
-                    if record.state.status == "terminal" { state.withLock { $0.settle(id, node) } }
+                    if record.state.status == "terminal" { state.withLock { $0.settle(id, node) }; scheduleSweep() }
                     // A loaded node can reveal a cancelling owner: the next reconcile derives marks again.
                     scheduleReconcile()
                 }
@@ -337,6 +354,7 @@ internal final class TaskScheduler: Sendable {
                 if edge == nil {
                     let owner = try await storage.conversation(id, context: context)?.owner?.taskId
                     state.withLock { $0.setEdge(id, owner) }
+                    scheduleSweep()
                     edge = .some(owner)
                     // A loaded node can reveal a cancelling owner: the next reconcile derives marks again.
                     scheduleReconcile()
@@ -353,11 +371,12 @@ internal final class TaskScheduler: Sendable {
             if state.withLock({ $0.unloaded.contains(id) }) { try await loadChain(.task(id)) }
         }
     }
+    /// Load the owner chains of every conversation with queued inputs, on the Session line; returns them.
     func loadQueuedScopes() async throws -> Set<ConversationID> {
         let submissions = try await scanAll { cursor in
             try await storage.scanSubmissions(.init(status: .queued), limit: 256, cursor: cursor, context: context)
         }
-        let ids = Set(submissions.map(\.conversationId))
+        let ids = Set(submissions.filter { $0.type == "input" }.map(\.conversationId))
         for id in ids { try await loadChain(.conversation(id)) }
         return ids
     }

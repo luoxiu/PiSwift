@@ -137,9 +137,10 @@ private func start(_ held: HeldHarness, in id: ConversationID, _ name: String, s
     }
 
     @Test func keepsTheIndexesOfAChainOfTwentyThousandEndedTasksWithLoops() throws {
-        // Live P owns 20,000 tasks in a chain, the last owning conversation C; they end bottom-up, C empty. Work in C later
-        // is listed through all of them, found below P, freed P when it ends, and unlisted again: each step walks the
-        // whole chain, as a recursion deeper than the call stack would.
+        // Live P owns 20,000 tasks in a chain, the last owning conversation C; they end bottom-up, C empty, and the sweep
+        // drops them. Work in C later loads them again, as a chain load does, is listed through all of them, found below
+        // P, frees P when it ends, is unlisted again, and the sweep drops them again: each step walks the whole chain, as
+        // a recursion deeper than the call stack would.
         var state = TaskScheduler.State()
         let root = try ConversationID(1), child = try ConversationID(2), depth = 20_000
         func record(_ id: Int, owner: Int? = nil, in conversation: ConversationID? = nil, _ state: TaskState) throws -> TaskRecord {
@@ -155,9 +156,17 @@ private func start(_ held: HeldHarness, in id: ConversationID, _ name: String, s
         state.setEdge(child, try TaskID(Int64(links.last!)))
         for id in links.reversed() { state.track(try record(id, owner: id - 1, pending), try record(id, owner: id - 1, ended)) }
         #expect(state.below[.task(p.id)] == nil && state.settled.count == depth)
+        state.sweep()
+        // Only the root's edge stays, as P is live in it.
+        #expect(state.settled.isEmpty && state.edges.count == 1 && state.dropQueue.isEmpty)
         let d = try record(100_000, in: child, pending)
         state.track(nil, d)
-        #expect(state.known(d.parent) && !state.unloaded.contains(d.id))
+        #expect(!state.known(d.parent) && state.unloaded.contains(d.id))
+        // The chain load: C's edge, then each ended link up to P, which is known; the tasks it passed are loaded.
+        state.setEdge(child, try TaskID(Int64(links.last!)))
+        for id in links.reversed() { state.settle(try TaskID(Int64(id)), TaskNode(try record(id, owner: id - 1, ended))) }
+        state.unloaded = []
+        #expect(state.known(d.parent) && state.dropQueue.isEmpty)
         #expect(state.hasOwnedLive(p.id) && !state.idle(root))
         let holding = try record(10, .completing(outcome: .completed(result: .null)))
         state.track(p, holding)
@@ -166,6 +175,8 @@ private func start(_ held: HeldHarness, in id: ConversationID, _ name: String, s
         #expect(state.finalizeChecks == [p.id])
         #expect(!state.hasOwnedLive(p.id) && !state.idle(root) && state.idle(child))
         #expect(state.below[.task(p.id)] == nil && state.below[.conversation(child)] == nil)
+        state.sweep()
+        #expect(state.settled.isEmpty && state.edges.count == 1 && state.dropQueue.isEmpty)
     }
 
     @Test func holdsAnOwnerForWorkACommitCreatesBelowEndedTasksLoadedFromStorage() async throws {
