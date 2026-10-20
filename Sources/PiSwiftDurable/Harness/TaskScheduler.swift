@@ -1,5 +1,6 @@
 import Foundation
 import PiSwiftChord
+import PiSwiftTelemetry
 import Synchronization
 
 internal struct InvocationBinding: Sendable {
@@ -14,20 +15,30 @@ internal final class TaskInvocation: Sendable {
     let conversationId: ConversationID
     let abort: Bool
     let controller = AbortController()
-    let context: ChordContext
     let done = HarnessPromise<Void>()
+    /// The creation-time links of the task, for the spans of its first invocation only.
+    let links: [TelemetryCarrier]?
     struct State: Sendable {
         var ended = false
         var work: Task<Void, Never>?
         var watches: [UUID: @Sendable () -> Void] = [:]
         /// Timers armed through the runtime; disarmed at invocation end.
         var timers: [UUID: @Sendable () -> Void] = [:]
+        /// Context passed to handlers; cancelled by `controller`. During a phase, its telemetry is the phase span.
+        var context: ChordContext
+        /// The task's latest record, kept after it leaves the live index, for the outcome of the phase span.
+        var record: TaskRecord
+        /// The fault the scheduler decided, for the outcome of the phase span.
+        var fault: TaskOutcome?
     }
-    let state = Mutex(State())
+    let state: Mutex<State>
     init(_ record: TaskRecord, abort: Bool, extension: String?, context: ChordContext) {
         taskId = record.id; kind = record.kind; self.extension = `extension`; conversationId = record.conversationId; self.abort = abort
-        self.context = context.withoutAbortSignal().withAbortSignal(controller.signal)
+        links = record.startedAt == nil ? record.links : nil
+        state = Mutex(State(context: context.withoutAbortSignal().withAbortSignal(controller.signal), record: record))
     }
+    /// Context passed to handlers; cancelled by `controller`. During a phase, its telemetry is the phase span.
+    var context: ChordContext { state.withLock { $0.context } }
     func check() throws {
         if state.withLock({ $0.ended }) { throw SessionError.message("Task \(taskId.rawValue) invocation has ended") }
     }
@@ -68,11 +79,16 @@ internal final class TaskScheduler: Sendable {
     let onWake: (@Sendable (Wake) throws -> Void)?
     /// The host's timers (`HarnessOptions.setTimer`).
     let timers: Timers
+    /// `HarnessOptions.telemetry`: the root of phase spans without a stored carrier, and their metrics.
+    let telemetry: any TelemetryContext
+    let activeMetric: any TelemetryUpDownCounter
+    let durationMetric: any TelemetryHistogram
     let settings: @Sendable () -> Settings
     let resolveAgent: @Sendable (ConversationID, RegistrySnapshot, ChordContext) async throws -> Agent
     let env: @Sendable (ConversationID, ChordContext) async throws -> (any ExecutionEnv)?
     let conversation: @Sendable (ConversationID, InvocationBinding, ChordContext) async throws -> ConversationHandle?
-    let report: @Sendable (any Error, ReportInfo) -> Void
+    /// `onReport`, with the context whose span the report belongs to, if any.
+    let report: @Sendable (any Error, ReportInfo, ChordContext?) -> Void
     let context: ChordContext
     let settleOutcome: @Sendable (Transaction, TaskRecord, TaskOutcome) async throws -> Void
     let withdrawInputs: @Sendable (Transaction, ConversationID) async throws -> Void
@@ -145,23 +161,33 @@ internal final class TaskScheduler: Sendable {
         var wakeScheduled = false
         var wakeDirty = false
         var blockedListeners: [UUID: @Sendable () -> Void] = [:]
+        /// Live tasks loaded at open whose first invocation in this process has not started (`resumed` on its span).
+        var resumed: Set<TaskID> = []
     }
     let state = Mutex(State())
     let taskWaiters = Waiters<TaskID, SettledTask>()
     let idleWaiters = Waiters<ConversationID?, Void>()
     init(session: Session, registry: any RegistryReader, models: @escaping @Sendable () -> any DurableModels,
          now: @escaping @Sendable () -> Int64, onWake: (@Sendable (Wake) throws -> Void)?, timers: Timers,
-         settings: @escaping @Sendable () -> Settings,
+         settings: @escaping @Sendable () -> Settings, telemetry: any TelemetryContext = noopTelemetryContext,
          agent: @escaping @Sendable (ConversationID, RegistrySnapshot, ChordContext) async throws -> Agent,
          env: @escaping @Sendable (ConversationID, ChordContext) async throws -> (any ExecutionEnv)?,
          conversation: @escaping @Sendable (ConversationID, InvocationBinding, ChordContext) async throws -> ConversationHandle?,
-         report: @escaping @Sendable (any Error, ReportInfo) -> Void, context: ChordContext,
+         report: @escaping @Sendable (any Error, ReportInfo, ChordContext?) -> Void, context: ChordContext,
          settleOutcome: @escaping @Sendable (Transaction, TaskRecord, TaskOutcome) async throws -> Void = { _, _, _ in },
          withdrawInputs: @escaping @Sendable (Transaction, ConversationID) async throws -> Void = { _, _ in }) {
         self.session = session; storage = session.storage; self.registry = registry; currentModels = models
         self.now = now; self.onWake = onWake; self.timers = timers; self.settings = settings; resolveAgent = agent; self.env = env
         self.conversation = conversation; self.report = report; self.context = context.withoutAbortSignal()
         self.settleOutcome = settleOutcome; self.withdrawInputs = withdrawInputs
+        self.telemetry = telemetry
+        let metrics = createTypedMetrics(telemetry.metrics ?? noopTelemetryMetrics, [durableTelemetrySchema])
+        activeMetric = metrics.upDownCounter("pi.durable.tasks.active")
+        durationMetric = metrics.histogram("pi.durable.phase.duration")
+    }
+    /// Count tasks becoming live (+1) or terminal (-1), outside the scheduler's lock: the instruments are host code.
+    func countActive(_ deltas: [(kind: String, value: Double)]) {
+        for delta in deltas { activeMetric.add(delta.value, attributes: ["task": .string(delta.kind)]) }
     }
     var closing: Bool { state.withLock { $0.closing } }
     func records() -> [TaskRecord] { state.withLock { state in state.ordered(state.live.keys).compactMap { state.live[$0] } } }
@@ -187,10 +213,12 @@ internal final class TaskScheduler: Sendable {
             state.withLock { state in
                 for record in found {
                     state.track(nil, record)
+                    state.resumed.insert(record.id)
                     if record.abandonOnRestart { state.abandoned.insert(record.id) }
                     if case .waiting(_, _, .failFast, _) = record.state { state.failFastChecks.insert(record.id) }
                 }
             }
+            countActive(found.map { ($0.kind, 1) })
             for record in found {
                 if case .running(let checkpoint, _) = record.state {
                     let restarts = (record.restarts ?? 0) + 1
@@ -203,7 +231,7 @@ internal final class TaskScheduler: Sendable {
             let restarts = (record.restarts ?? 0) + 1
             let error = SessionError.message("Task \(record.id.rawValue) (\(record.kind)) was cut off \(restarts) times without progress; it is parked until retryTask()")
             let about = aboutTask(record)
-            report(error, .taskParked(task: about.task, extension: about.extension))
+            report(error, .taskParked(task: about.task, extension: about.extension), nil)
         }
         state.withLock { $0.cascadePending = true }
         scheduleReconcile()
@@ -238,24 +266,29 @@ internal final class TaskScheduler: Sendable {
     }
     /// Close listener: runs synchronously once admission is sealed, before `join()`, or when the Session fails.
     private func seal() {
-        let (timers, unsubscribe) = state.withLock { state in
+        let (timers, unsubscribe, live) = state.withLock { state in
+            // Closing releases the active counts of the tasks this Harness holds.
+            let live = state.closing ? [] : state.live.values.map { (kind: $0.kind, value: -1.0) }
+            state.resumed = []
             state.closing = true; state.contexts = [:]
             let timers = [state.expiry, state.timer].compactMap { $0 }; state.expiry = nil; state.timer = nil
             let unsubscribe = state.unsubscribe; state.unsubscribe = nil
-            return (timers, unsubscribe)
+            return (timers, unsubscribe, live)
         }
+        countActive(live)
         unsubscribe?(); for timer in timers { timer.disarm() }
         taskWaiters.rejectAll(closedError(session)); idleWaiters.rejectAll(closedError(session))
     }
     /// Fail the Session, which reports it, for a throw in one of the scheduler's own commits; ignored once closing.
     /// Close seals the Session before its listeners seal the scheduler, and another thread can commit in between, so
     /// the Session's own closing counts too: a commit refused by close is not a failure.
-    func failSession(_ error: any Error) {
-        if !closing && !session.isClosing { session.fail(error) }
+    func failSession(_ error: any Error, context: ChordContext? = nil) {
+        if !closing && !session.isClosing { session.fail(error, context: context) }
     }
     private func observe(_ publication: CommitPublication) {
         var aborts: [TaskInvocation] = [], settled: [TaskRecord] = []
         var repair = false, changed = false
+        var active: [(kind: String, value: Double)] = [], invoked: [(TaskInvocation, TaskRecord)] = []
         state.withLock { state in
             // Edges first, so the tasks a commit creates in a new conversation hang from it.
             for change in publication.changes {
@@ -267,6 +300,13 @@ internal final class TaskScheduler: Sendable {
                 changed = true
                 let previous = state.live[record.id]
                 if record.failedOutcome && previous?.failedOutcome != true { failed.append(record.id) }
+                if let invocation = state.invocations[record.id] { invoked.append((invocation, record)) }
+                if record.state.status == "terminal" {
+                    if previous != nil && !state.closing { active.append((record.kind, -1)) }
+                    state.resumed.remove(record.id)
+                } else if previous == nil && !state.closing {
+                    active.append((record.kind, 1))
+                }
                 state.track(previous, record)
                 if record.state.status == "terminal" {
                     state.failedMigrations.removeValue(forKey: record.id); state.failFastChecks.remove(record.id)
@@ -311,6 +351,8 @@ internal final class TaskScheduler: Sendable {
             if state.cascadePending { repair = true }
             state.sweep()
         }
+        for (invocation, record) in invoked { invocation.state.withLock { $0.record = record } }
+        countActive(active)
         for invocation in aborts { invocation.controller.abort() }
         for record in settled { taskWaiters.resolve(record.id, value: SettledTask(record: record)) }
         if repair { scheduleReconcile() }
@@ -609,7 +651,7 @@ internal final class TaskScheduler: Sendable {
                             notifyBlocked()
                             scheduleWake()
                             let about = aboutTask(record, extension: .some(installerOf(snapshot, definition)))
-                            report(error, .migrationFailed(task: about.task, extension: about.extension))
+                            report(error, .migrationFailed(task: about.task, extension: about.extension), nil)
                             resolution = ("migration_failed", error, false)
                         }
                     }
@@ -638,7 +680,7 @@ internal final class TaskScheduler: Sendable {
         }
         for (record, message) in faulted {
             let about = aboutTask(record)
-            report(SessionError.message(message), .taskFaulted(task: about.task, extension: about.extension, reason: .restartLimit))
+            report(SessionError.message(message), .taskFaulted(task: about.task, extension: about.extension, reason: .restartLimit), nil)
         }
         // Marked, or already marked or gone: done with them. Reserve again, now seeing the marks.
         if !abandoned.isEmpty {
@@ -680,6 +722,8 @@ internal final class TaskScheduler: Sendable {
     enum Decision { case proceed, end, fault(any Error) }
     private func step(_ invocation: TaskInvocation, decide: (Transaction, TaskRecord) throws -> Decision) async -> TaskRecord? {
         var fault: (any Error)?
+        // The decision commit belongs to the phase: its entry and submission events go to the phase span.
+        let context = invocation.context
         do {
             let continued: TaskRecord? = try await session.commit({ tx in
                 guard let current = current(invocation.taskId), current.state.status == "running", !closing else { end(invocation); return nil }
@@ -689,70 +733,145 @@ internal final class TaskScheduler: Sendable {
                 case .fault(let error):
                     end(invocation)
                     fault = error
-                    try await terminate(tx, record: current, outcome: .faulted(error: .init(message: String(describing: error))))
+                    let outcome = TaskOutcome.faulted(error: .init(message: String(describing: error)))
+                    invocation.state.withLock { $0.fault = outcome }
+                    try await terminate(tx, record: current, outcome: outcome)
                     return nil
                 }
-            }, context: context)
+            }, context: context.withoutAbortSignal())
             // Reported once the fault is durable: a host may count it, for example toward a breaker.
-            if let fault { report(fault, .taskFaulted(task: reportTask(invocation), extension: invocation.extension, reason: .threw)) }
+            if let fault { report(fault, .taskFaulted(task: reportTask(invocation), extension: invocation.extension, reason: .threw), context) }
             return continued
         } catch {
             // The step writes the scheduler's own decision, a fault or a terminal record; a throw there would otherwise
             // leave the task running, to be reserved and run again.
-            end(invocation); failSession(error); return nil
+            end(invocation); failSession(error, context: context); return nil
         }
+    }
+    /// One phase span (`pi.durable.phase`) around a phase handler and its decision commit, not the next handler, a durable
+    /// wait, or recovery. Its parent is the task's stored carrier, extracted, or the adapter root. During the span the
+    /// invocation's context carries it, so handlers, reports, and the decision commit record on it.
+    private func phaseSpan<T>(_ invocation: TaskInvocation, _ task: TaskRecord, _ body: () async -> T) async -> T {
+        let parent: any TelemetryContext = task.trace.map { telemetry.propagation?.extract($0) ?? telemetry } ?? telemetry
+        let checkpoint = task.state.checkpoint?.objectValue
+        let phase = checkpoint?["phase"]?.stringValue ?? "undefined"
+        let resumed = state.withLock { $0.resumed.remove(task.id) != nil }
+        var attributes: SpanAttributes = [
+            "task.id": .number(Double(task.id.rawValue)), "task.name": .string(task.kind), "phase": .string(phase),
+            "kind": .string(invocation.abort ? "abort" : "run"), "resumed": .boolean(resumed),
+        ]
+        if let attempt = checkpoint?["attempt"]?.numberValue { attributes["attempt"] = .number(attempt) }
+        let start = createTypedSpanStarter(parent, [durableTelemetrySchema])
+        return await start("pi.durable.phase", attributes) { (span: any TelemetrySpan, _: TypedSpanStarter) async -> T in
+            if let propagation = span.propagation, let links = invocation.links {
+                for carrier in links { span.addLink(SpanLink(context: propagation.extract(carrier))) }
+            }
+            let previous = invocation.state.withLock { state in
+                let previous = state.context
+                state.context = previous.withTelemetry(span)
+                return previous
+            }
+            let started = ContinuousClock.now
+            let value = await body()
+            invocation.state.withLock { $0.context = previous }
+            endPhaseSpan(span, invocation, task: task, phase: phase, started: started)
+            return value
+        }
+    }
+    /// The phase's outcome on its span: `next=<phase>`, `waiting`, `sleeping`, `done`, `faulted`, or `aborted`; a failed
+    /// outcome's fixed category and diagnostic, cut to 500 characters, as its error status; and its duration.
+    private func endPhaseSpan(_ span: any TelemetrySpan, _ invocation: TaskInvocation, task: TaskRecord, phase: String,
+                              started: ContinuousClock.Instant) {
+        let (record, fault, ended) = invocation.state.withLock { ($0.record, $0.fault, $0.ended) }
+        let terminal = fault ?? record.state.outcome
+        let outcome: String
+        if let terminal {
+            switch terminal {
+            case .completed: outcome = "done"
+            case .aborted: outcome = "aborted"
+            default: outcome = "faulted"
+            }
+        } else if record.state.status == "waiting" || record.state.status == "sleeping" {
+            outcome = record.state.status
+        } else if ended || closing {
+            outcome = "aborted"
+        } else {
+            outcome = "next=\(record.state.checkpoint?.objectValue?["phase"]?.stringValue ?? "undefined")"
+        }
+        span.setAttributes(["outcome": .string(outcome)])
+        switch terminal {
+        case .faulted(let error, _)?: span.setStatus(.error(name: "task_faulted", message: telemetryPrefix(error.message, 500)))
+        case .failed(let error, _, _)?: span.setStatus(.error(name: "task_failed", message: telemetryPrefix(error.message, 500)))
+        case .orphaned(let reason, _)?: span.setStatus(.error(name: "task_orphaned", message: telemetryPrefix(reason, 500)))
+        default: if outcome == "aborted" { span.setStatus(.ok) }
+        }
+        let elapsed = started.duration(to: .now).components
+        durationMetric.record(Double(elapsed.seconds) * 1000 + Double(elapsed.attoseconds) / 1e15,
+                              attributes: ["task": .string(task.kind), "phase": .string(phase), "outcome": .string(outcome)],
+                              context: span)
     }
     private func run(_ reservation: Reservation) async {
         let invocation = reservation.invocation, phase = RuntimePhase(reservation.definition, reservation.snapshot)
         let runtime = TaskRuntime(scheduler: self, invocation: invocation, phase: phase)
         if invocation.abort {
             guard let current = current(invocation.taskId), !closing else { return }
-            var failure: (any Error)?
-            do { try await reservation.definition.abort(current, runtime, invocation.context) } catch { failure = error }
-            _ = await step(invocation) { _, _ in .fault(failure ?? SessionError.message("Abort handler of task \(invocation.taskId.rawValue) returned without a terminal outcome")) }
+            await phaseSpan(invocation, current) {
+                var failure: (any Error)?
+                do { try await reservation.definition.abort(current, runtime, invocation.context) } catch { failure = error }
+                _ = await step(invocation) { _, _ in .fault(failure ?? SessionError.message("Abort handler of task \(invocation.taskId.rawValue) returned without a terminal outcome")) }
+            }
             return
         }
+        // The first decision runs before any span; each phase span then owns a handler and the decision after it.
         var previous: JSONValue?, failure: (any Error)?
-        while true {
-            let found = await step(invocation) { tx, current in
-                if current.abortRequested { return .end }
-                // An owner's cancellation intent ends it too, before its cascade marks it; reservation then holds it back.
-                if !current.background && belowCancelled(current.parent) {
-                    state.withLock { $0.cascadePending = true }
-                    scheduleReconcile()
-                    return .end
-                }
-                guard let previous else { return .proceed }
-                if let failure { return .fault(failure) }
-                if jsonStructurallyEqual(current.state.checkpoint!, previous) {
-                    let name = previous.objectValue?["phase"]?.stringValue ?? "undefined"
-                    return .fault(SessionError.message("Task \(current.kind) phase \(name) returned without durable progress"))
-                }
-                let snapshot = registry.snapshot(), next = snapshot.task(name: current.kind)
-                let old = phase.state.withLock { $0.definition }
-                phase.state.withLock { $0.snapshot = snapshot }
-                if next?.identity != old.identity {
-                    if let next, next.version == current.version || (next.version > current.version && next.migrate != nil) {
-                        try tx.setTask(current.replacing(state: .pending(checkpoint: current.state.checkpoint!))); return .end
-                    }
-                    let shouldReport = phase.state.withLock { state -> Bool in
-                        if let next { if state.reported == next.identity && !state.reportedMissing { return false }; state.reported = next.identity; state.reportedMissing = false }
-                        else { if state.reportedMissing { return false }; state.reported = nil; state.reportedMissing = true }
-                        return true
-                    }
-                    if shouldReport {
-                        let about = aboutTask(current, extension: .some(invocation.extension))
-                        report(SessionError.message("Task \(current.id.rawValue) keeps running under its old \(current.kind) definition"),
-                               .taskOutdated(task: about.task, extension: about.extension, reason: next == nil ? .missingTask : .incompatibleTask))
-                    }
-                }
-                return .proceed
+        var found = await decideStep(invocation, phase: phase, previous: nil, failure: nil)
+        while let task = found, !closing {
+            found = await phaseSpan(invocation, task) {
+                previous = task.state.checkpoint; failure = nil
+                phase.state.withLock { $0.agent = nil }
+                do { try await phase.state.withLock({ $0.definition }).run(task, runtime, invocation.context) }
+                catch { failure = error }
+                return await decideStep(invocation, phase: phase, previous: previous, failure: failure)
             }
-            guard let found, !closing else { return }
-            previous = found.state.checkpoint; failure = nil
-            phase.state.withLock { $0.agent = nil }
-            do { try await phase.state.withLock({ $0.definition }).run(found, runtime, invocation.context) }
-            catch { failure = error }
+        }
+    }
+    /// Precedence rules for a run invocation, on the line: whether it continues with the next phase.
+    private func decideStep(_ invocation: TaskInvocation, phase: RuntimePhase, previous: JSONValue?, failure: (any Error)?) async -> TaskRecord? {
+        let context = invocation.context
+        return await step(invocation) { tx, current in
+            if current.abortRequested { return .end }
+            // An owner's cancellation intent ends it too, before its cascade marks it; reservation then holds it back.
+            if !current.background && belowCancelled(current.parent) {
+                state.withLock { $0.cascadePending = true }
+                scheduleReconcile()
+                return .end
+            }
+            guard let previous else { return .proceed }
+            if let failure { return .fault(failure) }
+            if jsonStructurallyEqual(current.state.checkpoint!, previous) {
+                let name = previous.objectValue?["phase"]?.stringValue ?? "undefined"
+                return .fault(SessionError.message("Task \(current.kind) phase \(name) returned without durable progress"))
+            }
+            let snapshot = registry.snapshot(), next = snapshot.task(name: current.kind)
+            let old = phase.state.withLock { $0.definition }
+            phase.state.withLock { $0.snapshot = snapshot }
+            if next?.identity != old.identity {
+                if let next, next.version == current.version || (next.version > current.version && next.migrate != nil) {
+                    try tx.setTask(current.replacing(state: .pending(checkpoint: current.state.checkpoint!))); return .end
+                }
+                let shouldReport = phase.state.withLock { state -> Bool in
+                    if let next { if state.reported == next.identity && !state.reportedMissing { return false }; state.reported = next.identity; state.reportedMissing = false }
+                    else { if state.reportedMissing { return false }; state.reported = nil; state.reportedMissing = true }
+                    return true
+                }
+                if shouldReport {
+                    let about = aboutTask(current, extension: .some(invocation.extension))
+                    report(SessionError.message("Task \(current.id.rawValue) keeps running under its old \(current.kind) definition"),
+                           .taskOutdated(task: about.task, extension: about.extension, reason: next == nil ? .missingTask : .incompatibleTask),
+                           context)
+                }
+            }
+            return .proceed
         }
     }
 }
@@ -787,7 +906,8 @@ internal extension TaskRecord {
                           abortRequested: abortRequested ?? self.abortRequested, abortReason: abortReason,
                           abandonOnRestart: abandonOnRestart, startedAt: startedAt, endedAt: endedAt,
                           restarts: next.outcome == nil ? restarts : nil,
-                          memos: next.outcome == nil ? (memos ?? self.memos) : nil, extensionFields: extensionFields)
+                          memos: next.outcome == nil ? (memos ?? self.memos) : nil, trace: trace, links: links,
+                          extensionFields: extensionFields)
     }
     /// The record with an abort mark: `restart` for an abandonment; without a reason, a request, which replaces
     /// `restart`. The restart count starts over: it now counts cut-offs of the abort handler.
@@ -795,14 +915,14 @@ internal extension TaskRecord {
         TaskRecord(id: id, conversationId: conversationId, kind: kind, version: version, input: input, state: state,
                    owner: owner, background: background, abortRequested: true, abortReason: reason,
                    abandonOnRestart: abandonOnRestart, startedAt: startedAt, endedAt: endedAt, memos: memos,
-                   extensionFields: extensionFields)
+                   trace: trace, links: links, extensionFields: extensionFields)
     }
     /// The record with `restarts` as its restart count; nil removes it.
     func withRestarts(_ restarts: Int?) -> TaskRecord {
         TaskRecord(id: id, conversationId: conversationId, kind: kind, version: version, input: input, state: state,
                    owner: owner, background: background, abortRequested: abortRequested, abortReason: abortReason,
                    abandonOnRestart: abandonOnRestart, startedAt: startedAt, endedAt: endedAt, restarts: restarts,
-                   memos: memos, extensionFields: extensionFields)
+                   memos: memos, trace: trace, links: links, extensionFields: extensionFields)
     }
     /// The record without its restart count, as after a state the task committed.
     func progressed() -> TaskRecord { restarts == nil ? self : withRestarts(nil) }

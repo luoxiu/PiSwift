@@ -1,18 +1,32 @@
 import Foundation
 import PiSwiftChord
+import PiSwiftTelemetry
 import Synchronization
 
 private struct WeakHarness: Sendable { weak var value: Harness? }
 
+/// Reports to `onReport`, the last place an error goes, and mirrors each as a `pi.durable.reports` count by type and a
+/// `pi.durable.report` event on the span of `context`, if any (upstream `safeReport`). No error payload is recorded.
+internal typealias HarnessReport = @Sendable (any Error, ReportInfo, ChordContext?) -> Void
+private func harnessReport(_ onReport: (@Sendable (any Error, ReportInfo) -> Void)?, telemetry: any TelemetryContext) -> HarnessReport {
+    let reports = createTypedMetrics(telemetry.metrics ?? noopTelemetryMetrics, [durableTelemetrySchema]).counter("pi.durable.reports")
+    return { error, info, context in
+        onReport?(error, info)
+        reports.add(1, attributes: ["type": .string(info.type)])
+        context?.telemetry.addEvent("pi.durable.report", attributes: reportEventAttributes(info))
+    }
+}
+
 private final class HarnessSessionHooks: SessionHooks {
     let scheduler = Mutex<TaskScheduler?>(nil)
     let app: (@Sendable (Transaction, ConversationRecord) async throws -> Void)?
-    let onReport: @Sendable (any Error, ReportInfo) -> Void
-    init(app: (@Sendable (Transaction, ConversationRecord) async throws -> Void)?, onReport: @escaping @Sendable (any Error, ReportInfo) -> Void) {
+    let onReport: HarnessReport
+    init(app: (@Sendable (Transaction, ConversationRecord) async throws -> Void)?, onReport: @escaping HarnessReport) {
         self.app = app; self.onReport = onReport
     }
     /// The Session's failure, once, and listener errors go to `onReport`, the last place an error goes.
-    func report(_ error: any Error, info: ReportInfo) { onReport(error, info) }
+    func report(_ error: any Error, info: ReportInfo) { onReport(error, info, nil) }
+    func report(_ error: any Error, info: ReportInfo, context: ChordContext?) { onReport(error, info, context) }
     func conversationCreated(_ tx: Transaction, record: ConversationRecord) async throws {
         _ = try await tx.doc(LiveDoc, conversationId: record.id)
         _ = try await tx.doc(InboxDoc, conversationId: record.id)
@@ -52,7 +66,8 @@ public final class Harness: Sendable {
             let snapshot = options.registry.snapshot()
             let missing = ["pi.generation", "pi.tool", "pi.compaction"].filter { snapshot.task(name: $0) == nil }
             if !missing.isEmpty { throw HarnessOpenError.missingBuiltins(missing) }
-            let report: @Sendable (any Error, ReportInfo) -> Void = options.onReport ?? { _, _ in }
+            let telemetry = options.telemetry ?? noopTelemetryContext
+            let report = harnessReport(options.onReport, telemetry: telemetry)
             let hooks = HarnessSessionHooks(app: options.conversationCreated, onReport: report)
             let now = options.now ?? { Int64(Date().timeIntervalSince1970 * 1000) }
             // Read at each use, as all settings are, but only this field: it is read on every commit.
@@ -63,12 +78,12 @@ public final class Harness: Sendable {
             let settings: @Sendable () -> Settings = { options.settings?.resolve() ?? resolveSettings() }
             let reference = Mutex(WeakHarness())
             let scheduler = TaskScheduler(session: session, registry: options.registry, models: options.currentModels,
-                now: now, onWake: options.onWake, timers: hostTimers(options.setTimer, report: { report($0, .hostError(callback: .setTimer, task: nil)) }),
-                settings: settings,
+                now: now, onWake: options.onWake, timers: hostTimers(options.setTimer, report: { report($0, .hostError(callback: .setTimer, task: nil), nil) }),
+                settings: settings, telemetry: telemetry,
                 agent: { id, snapshot, callContext in
                     let state = try await session.snapshot(AgentDoc, conversationId: id, context: callContext)
                     return resolveAgent(state: state, snapshot: snapshot, settings: settings(),
-                                        report: { report($0, .extensionError(extension: $1, task: nil, conversationId: id)) })
+                                        report: { report($0, .extensionError(extension: $1, task: nil, conversationId: id), callContext) })
                 }, env: { id, callContext in
                     guard let build = options.env else { return nil }
                     let cwd = try await session.snapshot(AgentDoc, conversationId: id, context: callContext)?.cwd
@@ -82,7 +97,8 @@ public final class Harness: Sendable {
                 settleOutcome: { tx, record, outcome in try await settleSchedulerOutcome(tx: tx, record: record, outcome: outcome) },
                 withdrawInputs: { tx, id in try await withdrawQueuedInputs(tx: tx, conversationId: id) })
             hooks.scheduler.withLock { $0 = scheduler }
-            let submissions = try Submissions(session: session, storage: storage, now: now, settings: settings, resume: { scheduler.resume() })
+            let submissions = try Submissions(session: session, storage: storage, now: now, settings: settings,
+                                              resume: { scheduler.resume() }, telemetry: telemetry)
             let harness = try Harness(session: session, storage: storage, options: options, tasks: scheduler, submissions: submissions)
             reference.withLock { $0.value = harness }
             do { try await scheduler.open(context: context) }
@@ -236,9 +252,9 @@ public final class Harness: Sendable {
     internal func resolveConversationAgent(id: ConversationID, context: ChordContext) async throws -> Agent {
         try assertOpen(); try context.abortSignal?.throwIfAborted()
         let value = try await session.snapshot(AgentDoc, conversationId: id, context: context)
-        let report = options.onReport ?? { _, _ in }
         return resolveAgent(state: value, snapshot: options.registry.snapshot(), settings: options.settings?.resolve() ?? resolveSettings(),
-                            report: { report($0, .extensionError(extension: $1, task: nil, conversationId: id)) })
+                            report: { [session] in session.report($0, info: .extensionError(extension: $1, task: nil, conversationId: id),
+                                                                  context: context) })
     }
 }
 /// The harness cannot use the supplied registry to load its built-in tasks.

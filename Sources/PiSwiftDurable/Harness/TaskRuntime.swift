@@ -18,7 +18,7 @@ public struct HookRunner: Sendable {
                 catch {
                     if runtime.signal.aborted || context.abortSignal?.aborted == true { throw error }
                     runtime.scheduler.report(error, .extensionError(extension: extensionName, task: reportTask(runtime.invocation),
-                                                                    conversationId: nil))
+                                                                    conversationId: nil), runtime.invocation.context)
                 }
             }
         }
@@ -58,7 +58,7 @@ public final class TaskRuntime: Sendable {
     public func report(_ error: any Error, from: ReportFrom? = nil) throws { try invocation.check(); reportTask(error, from: from) }
     /// `report()` without the invocation check, for work that ends with it, such as a progress commit.
     internal func reportTask(_ error: any Error, from: ReportFrom? = nil) {
-        scheduler.report(error, scheduler.reportInfo(invocation, from: from))
+        scheduler.report(error, scheduler.reportInfo(invocation, from: from), invocation.context)
     }
     /// Commits state only while this invocation still owns the task. Inside the callback read only through `tx`:
     /// `snapshot`, `documentState`, `watchDoc`, `getTask`, and the other Session and runtime reads may queue on the line
@@ -73,8 +73,18 @@ public final class TaskRuntime: Sendable {
     public func commit(_ change: (Transaction, TaskRecord) async throws -> TaskState?,
                        context: ChordContext) async throws {
         try await withTaskCancellationContext(context) { context in
+            let checkpoint = Mutex<String?>(nil)
             try await scheduler.gated(invocation, context: context) { tx, current in
-                if let next = try await change(tx, current) { try await scheduler.commitState(tx, invocation: invocation, current: current, next: next) }
+                guard let next = try await change(tx, current) else { return }
+                try await scheduler.commitState(tx, invocation: invocation, current: current, next: next)
+                // A committed change of the running phase, while the invocation continues.
+                if case .running(let value, _) = next, let phase = value.objectValue?["phase"]?.stringValue,
+                   current.state.checkpoint?.objectValue?["phase"]?.stringValue != phase {
+                    checkpoint.withLock { $0 = phase }
+                }
+            }
+            if let phase = checkpoint.withLock({ $0 }) {
+                invocation.context.telemetry.addEvent("pi.durable.checkpoint", attributes: ["phase": .string(phase)])
             }
         }
     }

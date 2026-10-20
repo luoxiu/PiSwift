@@ -1,4 +1,5 @@
 import PiSwiftChord
+import PiSwiftTelemetry
 
 /// The part of a task definition required to create a durable task.
 /// The harness can add phases and execution hooks in a later order.
@@ -17,8 +18,21 @@ public struct TaskKind<Input: Codable & Sendable, Checkpoint: Codable & Sendable
     }
 }
 
+/// Where a new task's phase spans belong (`TaskOptions.trace`).
+public enum TaskTrace: Sendable, Equatable {
+    /// This carrier, stored as the task's `trace`.
+    case carrier(TelemetryCarrier)
+    /// The adapter's root: no carrier is stored.
+    case root
+}
+
 /// Owner and placement selected when a task is created.
 public struct TaskOptions: Sendable {
+    /// Nil inherits the carrier of the creating commit's span; `.carrier` overrides it; `.root` starts at the adapter
+    /// root without a stored carrier.
+    public let trace: TaskTrace?
+    /// Immutable creation-time links, attached to the spans of this task's first invocation.
+    public let links: [TelemetryCarrier]?
     /// The owner edge assigned when this record is created.
     public let ownership: TaskOwnership
     /// The conversation that owns or is addressed by this value.
@@ -32,11 +46,17 @@ public struct TaskOptions: Sendable {
     public let abandonOnRestart: Bool?
     /// Selects task ownership, optional conversation, background lifetime, and restart abandonment.
     public init(ownership: TaskOwnership, conversationId: ConversationID? = nil, background: Bool = false,
-                abandonOnRestart: Bool? = nil) {
+                abandonOnRestart: Bool? = nil, trace: TaskTrace? = nil, links: [TelemetryCarrier]? = nil) {
         self.ownership = ownership
         self.conversationId = conversationId
         self.background = background
         self.abandonOnRestart = abandonOnRestart
+        self.trace = trace
+        self.links = links
+    }
+    func with(trace: TaskTrace?, links: [TelemetryCarrier]?) -> TaskOptions {
+        TaskOptions(ownership: ownership, conversationId: conversationId, background: background,
+                    abandonOnRestart: abandonOnRestart, trace: trace, links: links)
     }
 }
 

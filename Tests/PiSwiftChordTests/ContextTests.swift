@@ -104,78 +104,83 @@ struct ContextTests {
     func telemetry() async throws {
         let telemetry = InMemoryTelemetryContext()
         let other = InMemoryTelemetryContext()
-        let key = ChordContextKey<String>("principal")
-        let controller = AbortController()
-        let base = ChordContext.background.withAbortSignal(controller.signal).withValue("owner", for: key)
-        let context = base.withTelemetry(telemetry)
-        let replaced = context.withTelemetry(other)
-        #expect(base.telemetry === noopTelemetryContext)
-        #expect(context.telemetry === telemetry)
-        #expect(replaced.telemetry === other)
-        #expect(replaced.value(key) == "owner")
-        #expect(replaced.abortSignal === base.abortSignal)
-        #expect(context.withoutAbortSignal().telemetry === telemetry)
-        // Swift: upstream narrows the child's `telemetry` to `TelemetrySpan` in the callback's type; Swift casts.
-        await context.traceIn(SpanOptions(name: "outer")) { child in
-            #expect(child.value(key) == "owner")
-            #expect(child.abortSignal === context.abortSignal)
-            (child.telemetry as? any TelemetrySpan)?.addEvent("started")
-            _ = await child.traceIn(SpanOptions(name: "inner")) { nested in
-                (nested.telemetry as? any TelemetrySpan)?.addLink(SpanLink(context: child.telemetry))
-                return 42
+        try await telemetry.startSpan(SpanOptions(name: "caller")) { parent in
+            try await other.startSpan(SpanOptions(name: "other")) { otherSpan in
+                let key = ChordContextKey<String>("principal")
+                let controller = AbortController()
+                let base = ChordContext.background.withAbortSignal(controller.signal).withValue("owner", for: key)
+                let context = base.withTelemetry(parent)
+                let replaced = context.withTelemetry(otherSpan)
+                #expect(base.telemetry === noopTelemetryContext)
+                #expect(context.telemetry === parent)
+                #expect(replaced.telemetry === otherSpan)
+                #expect(replaced.value(key) == "owner")
+                #expect(replaced.abortSignal === base.abortSignal)
+                #expect(context.withoutAbortSignal().telemetry === parent)
+                await context.traceIn(SpanOptions(name: "outer")) { child in
+                    #expect(child.value(key) == "owner")
+                    #expect(child.abortSignal === context.abortSignal)
+                    child.telemetry.addEvent("started")
+                    _ = await child.traceIn(SpanOptions(name: "inner")) { nested in
+                        nested.telemetry.addLink(SpanLink(context: child.telemetry))
+                        return 42
+                    }
+                }
+                let spans = telemetry.getSpans()
+                let caller = try #require(spans.first), outer = spans[1], inner = spans[2]
+                #expect(outer.parentId == caller.id)
+                #expect(inner.parentId == outer.id)
+                #expect(inner.links.first?.context == outer.context)
+                #expect(outer.events == [RecordedTelemetryEvent(name: "started")])
+                #expect(context.telemetry === parent)
+                controller.abort()
+                #expect(context.abortSignal?.aborted == true)
+                // Swift addition: the derived context names its telemetry key, as upstream's `withContextValue` does.
+                #expect(String(describing: replaced).hasSuffix(".WithValue(chord.telemetry).WithValue(chord.telemetry)"))
             }
         }
-        let spans = telemetry.getSpans()
-        let outer = try #require(spans.first), inner = try #require(spans.last)
-        #expect(outer.parentId == nil)
-        #expect(inner.parentId == outer.id)
-        #expect(inner.links.first?.context == outer.context)
-        #expect(outer.events == [RecordedTelemetryEvent(name: "started")])
-        #expect(context.telemetry === telemetry)
-        controller.abort()
-        #expect(context.abortSignal?.aborted == true)
-        // Swift addition: the derived context names its telemetry key, as upstream's `withContextValue` does.
-        #expect(String(describing: replaced).hasSuffix(".WithValue(chord.telemetry).WithValue(chord.telemetry)"))
     }
 
     @Test("isolates concurrent traceIn branches and preserves callback results and errors")
     func concurrentTraceIn() async throws {
         final class Failure: Error, Sendable { let reason = "same value" }
         let telemetry = InMemoryTelemetryContext()
-        let context = ChordContext.background.withTelemetry(telemetry)
-        let gate = ContextTestGate()
-        async let first = context.traceIn(SpanOptions(name: "first")) { child in
-            await gate.wait()
-            return await child.traceIn(SpanOptions(name: "first.child")) { _ in "first" }
-        }
-        async let second = context.traceIn(SpanOptions(name: "second")) { child in
-            let result = await child.traceIn(SpanOptions(name: "second.child")) { _ in "second" }
-            await gate.open()
-            return result
-        }
-        #expect(await [first, second] == ["first", "second"])
-        let spans = telemetry.getSpans()
-        for name in ["first", "second"] {
-            let parent = spans.first { $0.name == name }
-            #expect(spans.first { $0.name == "\(name).child" }?.parentId == parent?.id)
-        }
-        let failure = Failure()
-        do {
-            try await context.traceIn(SpanOptions(name: "throw")) { _ in throw failure }
-            Issue.record("traceIn must throw")
-        } catch { #expect(error as? Failure === failure) }
-        do {
-            try await context.traceIn(SpanOptions(name: "reject")) { _ in
-                await Task.yield()
-                throw failure
+        await telemetry.startSpan(SpanOptions(name: "caller")) { parent in
+            let context = ChordContext.background.withTelemetry(parent)
+            let gate = ContextTestGate()
+            async let first = context.traceIn(SpanOptions(name: "first")) { child in
+                await gate.wait()
+                return await child.traceIn(SpanOptions(name: "first.child")) { _ in "first" }
             }
-            Issue.record("traceIn must throw")
-        } catch { #expect(error as? Failure === failure) }
-        let noop = await ChordContext.background.traceIn(SpanOptions(name: "noop")) { child in
-            (child.telemetry as? any TelemetrySpan)?.addLink(SpanLink(context: telemetry))
-            return 42
+            async let second = context.traceIn(SpanOptions(name: "second")) { child in
+                let result = await child.traceIn(SpanOptions(name: "second.child")) { _ in "second" }
+                await gate.open()
+                return result
+            }
+            #expect(await [first, second] == ["first", "second"])
+            let spans = telemetry.getSpans()
+            for name in ["first", "second"] {
+                let parent = spans.first { $0.name == name }
+                #expect(spans.first { $0.name == "\(name).child" }?.parentId == parent?.id)
+            }
+            let failure = Failure()
+            do {
+                try await context.traceIn(SpanOptions(name: "throw")) { _ in throw failure }
+                Issue.record("traceIn must throw")
+            } catch { #expect(error as? Failure === failure) }
+            do {
+                try await context.traceIn(SpanOptions(name: "reject")) { _ in
+                    await Task.yield()
+                    throw failure
+                }
+                Issue.record("traceIn must throw")
+            } catch { #expect(error as? Failure === failure) }
+            let noop = await ChordContext.background.traceIn(SpanOptions(name: "noop")) { child in
+                child.telemetry.addLink(SpanLink(context: parent))
+                return 42
+            }
+            #expect(noop == 42)
         }
-        #expect(noop == 42)
     }
 
     @Test("stops waiting when the invocation is cancelled")

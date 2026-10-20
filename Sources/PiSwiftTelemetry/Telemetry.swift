@@ -1,4 +1,4 @@
-// Ports the contract half of upstream `packages/telemetry/src/index.ts` at 48909d987.
+// Ports the contract half of upstream `packages/telemetry/src/index.ts` at 2ec55d808.
 // The schema half is in `TelemetrySchema.swift`, metrics are in `Metrics.swift`.
 
 /// An attribute value: a string, number, or boolean, or an array of one of them.
@@ -111,11 +111,22 @@ public enum SpanStatus: Sendable, Hashable {
 /// open until `body` returns or throws, and returns the same value or throws the same error.
 /// Implementations are `nonisolated(nonsending)`, so `body` runs on the caller's executor.
 public protocol TelemetryContext: AnyObject, Sendable {
+    /// The adapter's metrics, if it has them. Child spans and extracted parents carry the same object.
+    var metrics: (any TelemetryMetrics)? { get }
+    /// The adapter's propagation, if it has it. Child spans and extracted parents carry the same object.
+    var propagation: (any TelemetryPropagation)? { get }
     /// Runs `body` in a new child span and settles the span when `body` finishes.
     nonisolated(nonsending) func startSpan<T, E: Error>(
         _ options: SpanOptions,
         _ body: (any TelemetrySpan) async throws(E) -> T
     ) async throws(E) -> T
+}
+
+extension TelemetryContext {
+    /// A tracing adapter that only starts spans has no metrics.
+    public var metrics: (any TelemetryMetrics)? { nil }
+    /// A tracing adapter that only starts spans has no propagation.
+    public var propagation: (any TelemetryPropagation)? { nil }
 }
 
 /// Records attributes, events, and status. A span is also the parent context of its child spans.

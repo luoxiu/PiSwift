@@ -137,7 +137,7 @@ private func runGeneration(_ checkpoint: GenerationCheckpoint, _ runtime: TaskRu
         let bridge = ContextCancellationBridge(context: context.withAbortSignal(runtime.signal))
         defer { withExtendedLifetime(bridge) {} }
         let message = await runtime.models.fetchDeferred(model: model, handle: try required(checkpoint.handle, "handle").handle,
-                                                        options: DeferredFetchOptions(signal: bridge.token))
+                                                        options: DeferredFetchOptions(signal: bridge.token, telemetry: context.telemetry))
         try await classifyGeneration(runtime, request: checkpoint, message: message, context: context)
     case .tools:
         let assistant = try required(checkpoint.assistant, "assistant")
@@ -226,7 +226,9 @@ private func requestGeneration(_ checkpoint: GenerationCheckpoint, _ runtime: Ta
     let sessionId = try await ensureProviderSessionId(runtime: runtime, context: context)
     let bridge = ContextCancellationBridge(context: context.withAbortSignal(runtime.signal))
     defer { withExtendedLifetime(bridge) {} }
-    let options = try generationStreamOptions(required(checkpoint.streamOptions, "streamOptions"), thinkingLevel: required(checkpoint.thinkingLevel, "thinkingLevel"), signal: bridge.token, sessionId: sessionId)
+    var options = try generationStreamOptions(required(checkpoint.streamOptions, "streamOptions"), thinkingLevel: required(checkpoint.thinkingLevel, "thinkingLevel"), signal: bridge.token, sessionId: sessionId)
+    // The request records its span under this phase's.
+    options.telemetry = context.telemetry
     let message = try await streamGeneration(runtime: runtime, model: model, messages: messages, options: options, attempt: attempt, context: context)
     try await classifyGeneration(runtime, request: checkpoint, message: message, messages: view.messages, context: context)
 }
@@ -297,7 +299,8 @@ private func abortGeneration(_ checkpoint: GenerationCheckpoint, _ runtime: Task
         do {
             let bridge = ContextCancellationBridge(context: context.withAbortSignal(runtime.signal))
             defer { withExtendedLifetime(bridge) {} }
-            try await runtime.models.cancelDeferred(model: model, handle: handle.handle, options: DeferredCancelOptions(signal: bridge.token))
+            try await runtime.models.cancelDeferred(model: model, handle: handle.handle,
+                                                    options: DeferredCancelOptions(signal: bridge.token, telemetry: context.telemetry))
         } catch { try runtime.report(error, from: .host(.models)) }
     }
     let unstarted = checkpoint.phase == .tools ? try await generationCalls(runtime: runtime, assistant: required(checkpoint.assistant, "assistant"), callIds: checkpoint.pending ?? [], context: context) : []

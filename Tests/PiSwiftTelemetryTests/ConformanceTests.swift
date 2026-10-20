@@ -1,4 +1,4 @@
-// Ports upstream `packages/telemetry/test/conformance.test.ts` at 48909d987.
+// Ports upstream `packages/telemetry/test/conformance.test.ts` at 2ec55d808.
 
 import Testing
 import PiSwiftTelemetry
@@ -45,6 +45,7 @@ struct InMemoryTelemetryConformanceTests {
         // Upstream's two "passivity" cases and "recording: ignores failed attribute calls atomically"
         // pass Proxy values that throw on read. Swift values cannot, so those three are not ported.
         #expect(inMemoryConformance.map(\.description) == [
+            "capabilities: carries adapter capabilities through contexts and spans",
             "metrics: records ordered measurements and optional histogram exemplars",
             "metrics: copies inputs and suppresses invalid measurements atomically",
             "links: records initial and late links without changing parents",

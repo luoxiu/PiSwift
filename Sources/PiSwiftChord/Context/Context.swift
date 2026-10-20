@@ -53,7 +53,7 @@ public struct ChordContext: Sendable, CustomStringConvertible {
     /// A context for a caller that has not yet supplied its own context.
     public static let todo = ChordContext(node: ContextNode(name: "[Context TODO_CONTEXT]"))
     private static let abortSignalKey = ChordContextKey<AbortSignal>("chord.abortSignal")
-    private static let telemetryKey = ChordContextKey<any TelemetryContext>("chord.telemetry")
+    private static let telemetryKey = ChordContextKey<any TelemetrySpan>("chord.telemetry")
 
     private let node: ContextNode
 
@@ -72,9 +72,9 @@ public struct ChordContext: Sendable, CustomStringConvertible {
     /// The effective cancellation signal, or nil if cancellation is absent or masked.
     public var abortSignal: AbortSignal? { value(Self.abortSignalKey) }
 
-    /// The explicit telemetry parent of work in this context. It is never absent: by default it is
-    /// `noopTelemetryContext`.
-    public var telemetry: any TelemetryContext { value(Self.telemetryKey) ?? noopTelemetryContext }
+    /// The current span: the explicit telemetry parent of work in this context. It is never absent: by default it is
+    /// the no-op span `noopTelemetryContext`. Adapters belong to hosts, which start root spans; a context never holds one.
+    public var telemetry: any TelemetrySpan { value(Self.telemetryKey) ?? noopTelemetryContext }
 
     /// Adds or replaces a value. A nil value masks the parent's value.
     public func withValue<Value>(_ value: Value?, for key: ChordContextKey<Value>) -> ChordContext {
@@ -92,8 +92,8 @@ public struct ChordContext: Sendable, CustomStringConvertible {
         withValue(nil, for: Self.abortSignalKey)
     }
 
-    /// Derives an explicit telemetry parent without changing cancellation or application values.
-    public func withTelemetry(_ telemetry: any TelemetryContext) -> ChordContext {
+    /// Derives an explicit telemetry parent, a span, without changing cancellation or application values.
+    public func withTelemetry(_ telemetry: any TelemetrySpan) -> ChordContext {
         withValue(telemetry, for: Self.telemetryKey)
     }
 

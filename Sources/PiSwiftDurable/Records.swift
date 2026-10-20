@@ -1,4 +1,5 @@
 import PiSwiftChord
+import PiSwiftTelemetry
 
 /// Ownership selected when a conversation is created. Stored conversations use a separate owner edge.
 public enum ConversationOwnership: Sendable, Equatable, Codable {
@@ -555,10 +556,15 @@ public struct TaskRecord: Sendable, Equatable, Codable {
     public let restarts: Int?
     /// The durable task memos used to avoid repeated effects.
     public let memos: JSONObject?
+    /// The adapter-owned carrier of the context that created this task; its phase invocations extract it as their parent.
+    /// Absent without propagation, or for `TaskOptions.trace` `.root`.
+    public let trace: TelemetryCarrier?
+    /// Immutable creation-time links, attached to the spans of this task's first invocation.
+    public let links: [TelemetryCarrier]?
     /// Unknown JSON members retained by upstream record copies.
     public let extensionFields: JSONObject
     /// Creates a complete stored task record, including ownership and execution state.
-    public init(id: TaskID, conversationId: ConversationID, kind: String, version: Double, input: JSONValue, state: TaskState, owner: TaskID? = nil, background: Bool = false, abortRequested: Bool = false, abortReason: TaskAbortReason? = nil, abandonOnRestart: Bool = false, startedAt: Double? = nil, endedAt: Double? = nil, restarts: Int? = nil, memos: JSONObject? = nil, extensionFields: JSONObject = [:]) {
+    public init(id: TaskID, conversationId: ConversationID, kind: String, version: Double, input: JSONValue, state: TaskState, owner: TaskID? = nil, background: Bool = false, abortRequested: Bool = false, abortReason: TaskAbortReason? = nil, abandonOnRestart: Bool = false, startedAt: Double? = nil, endedAt: Double? = nil, restarts: Int? = nil, memos: JSONObject? = nil, trace: TelemetryCarrier? = nil, links: [TelemetryCarrier]? = nil, extensionFields: JSONObject = [:]) {
         self.id = id
         self.conversationId = conversationId
         self.kind = kind
@@ -574,6 +580,8 @@ public struct TaskRecord: Sendable, Equatable, Codable {
         self.endedAt = endedAt
         self.restarts = restarts
         self.memos = memos
+        self.trace = trace
+        self.links = links
         self.extensionFields = extensionFields
     }
     /// Decodes this value from its durable JSON representation.
@@ -594,8 +602,10 @@ public struct TaskRecord: Sendable, Equatable, Codable {
         endedAt = try recordOptional(object, "endedAt")
         restarts = try recordOptional(object, "restarts")
         memos = try recordOptional(object, "memos")
+        trace = try recordOptional(object, "trace")
+        links = try recordOptional(object, "links")
         if state.status == "completing" || state.status == "terminal" { try recordForbid(object, ["memos"]) }
-        extensionFields = recordExtensions(object, excluding: ["id", "conversationId", "kind", "version", "input", "state", "owner", "background", "abortRequested", "abortReason", "abandonOnRestart", "startedAt", "endedAt", "restarts", "memos"])
+        extensionFields = recordExtensions(object, excluding: ["id", "conversationId", "kind", "version", "input", "state", "owner", "background", "abortRequested", "abortReason", "abandonOnRestart", "startedAt", "endedAt", "restarts", "memos", "trace", "links"])
     }
     /// Encodes this value with the durable JSON representation.
     public func encode(to encoder: any Encoder) throws {
@@ -618,6 +628,8 @@ public struct TaskRecord: Sendable, Equatable, Codable {
         try recordSetOptional(&object, "endedAt", endedAt)
         try recordSetOptional(&object, "restarts", restarts)
         try recordSetOptional(&object, "memos", memos)
+        try recordSetOptional(&object, "trace", trace)
+        try recordSetOptional(&object, "links", links)
         try object.encode(to: encoder)
     }
 }
@@ -639,6 +651,12 @@ public enum InputSubmissionState: Sendable, Equatable, Codable {
         case .placed: "placed"
         case .done: "done"
         case .unanswered: "unanswered"
+        }
+    }
+    /// The JSON members this state does not model, such as the record's `trace`.
+    public var extensions: JSONObject {
+        switch self {
+        case .queued(let extensions), .placed(_, let extensions), .done(_, _, let extensions), .unanswered(_, _, _, let extensions): extensions
         }
     }
     /// Decodes this value from its durable JSON representation.
@@ -698,6 +716,12 @@ public enum WriteSubmissionState: Sendable, Equatable, Codable {
         case .queued: "queued"
         case .done: "done"
         case .unanswered: "unanswered"
+        }
+    }
+    /// The JSON members this state does not model, such as the record's `trace`.
+    public var extensions: JSONObject {
+        switch self {
+        case .queued(let extensions), .done(_, let extensions), .unanswered(_, _, let extensions): extensions
         }
     }
     /// Decodes this value from its durable JSON representation.
@@ -762,6 +786,16 @@ public enum SubmissionRecord: Sendable, Equatable, Codable {
     /// The stored execution or submission state tag.
     public var status: String {
         switch self { case .input(_, _, _, let state): state.status; case .write(_, _, _, let state): state.status }
+    }
+    /// The adapter-owned carrier of the admission span; absent without propagation. Stored as the record's `trace`
+    /// member, which the state keeps among its extension members, so it survives every state change.
+    public var trace: TelemetryCarrier? {
+        let extensions: JSONObject
+        switch self {
+        case .input(_, _, _, let state): extensions = state.extensions
+        case .write(_, _, _, let state): extensions = state.extensions
+        }
+        return try? extensions["trace"]?.decode(TelemetryCarrier.self)
     }
     /// Decodes this value from its durable JSON representation.
     public init(from decoder: any Decoder) throws {

@@ -1,4 +1,5 @@
 import PiSwiftChord
+import PiSwiftTelemetry
 import Synchronization
 
 internal struct TransactionTableState: Sendable {
@@ -178,9 +179,27 @@ extension Transaction {
         }
     }
 
-    /// Creates a typed task and stores its encoded input and initial checkpoint.
+    /// Creates a typed task and stores its encoded input and initial checkpoint. Its `trace` is the carrier of this
+    /// commit's span unless `options.trace` says otherwise (see `TaskOptions.trace`).
     public func createTask<Input, Checkpoint>(_ task: TaskKind<Input, Checkpoint>, input: Input, options: TaskOptions) async throws -> TaskID {
+        try await createTask(task, input: input, options: options, submissionIds: nil)
+    }
+    /// `createTask` for a run started for `submissionIds`: it takes the first submission's carrier as its trace, or none,
+    /// and links the others' carriers. Staged submissions are read before Storage (upstream `TaskCreationOptions`).
+    internal func createTask<Input, Checkpoint>(_ task: TaskKind<Input, Checkpoint>, input: Input, options: TaskOptions,
+                                                submissionIds: [SubmissionID]?) async throws -> TaskID {
         try await operation(tableWrite: true) {
+            var options = options
+            if let submissionIds {
+                var trace: TaskTrace?, links: [TelemetryCarrier]?
+                for (index, id) in submissionIds.enumerated() {
+                    var submission = tableState.withLock { $0.submissions[id] }
+                    if submission == nil { submission = try await storage.submission(id, context: context) }
+                    if index == 0 { trace = submission?.trace.map(TaskTrace.carrier) ?? .root }
+                    else if let carrier = submission?.trace { links = (links ?? []) + [carrier] }
+                }
+                options = options.with(trace: trace, links: links)
+            }
             var owner: TaskRecord?
             if case .task(let ownerId, _) = options.ownership {
                 owner = try await currentTask(ownerId)
@@ -200,9 +219,16 @@ extension Transaction {
             let inputValue = try JSONValue(encoding: input)
             let id: TaskID = try await storage.mintId()
             try assertOpen()
+            let trace: TelemetryCarrier?
+            switch options.trace {
+            case .root: trace = nil
+            case .carrier(let carrier): trace = carrier
+            case nil: trace = context.telemetry.propagation?.inject(context.telemetry)
+            }
             let record = TaskRecord(id: id, conversationId: conversationId, kind: task.name, version: task.version,
                                     input: inputValue, state: .pending(checkpoint: checkpoint), owner: owner?.id,
-                                    background: options.background, abandonOnRestart: options.abandonOnRestart == true)
+                                    background: options.background, abandonOnRestart: options.abandonOnRestart == true,
+                                    trace: trace, links: options.links)
             try validateTableJSON(record)
             tableState.withLock { state in
                 if state.tasks[id] == nil { state.taskOrder.append(id) }
@@ -261,7 +287,8 @@ extension Transaction {
                                         input: value.input, state: value.state, owner: value.owner, background: value.background,
                                         abortRequested: value.abortRequested, abortReason: value.abortReason,
                                         abandonOnRestart: value.abandonOnRestart, startedAt: startedAt, endedAt: endedAt,
-                                        restarts: value.restarts, memos: value.memos, extensionFields: value.extensionFields)
+                                        restarts: value.restarts, memos: value.memos, trace: value.trace, links: value.links,
+                                        extensionFields: value.extensionFields)
                 try validateTableJSON(record)
                 task.write = record
                 if state.tasks[value.id] == nil { state.taskOrder.append(value.id) }

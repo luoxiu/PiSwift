@@ -1,4 +1,5 @@
 import Foundation
+import PiSwiftTelemetry
 
 private struct ModelStringCodingKey: CodingKey {
     let stringValue: String
@@ -220,6 +221,9 @@ public struct StreamOptions: Sendable {
     public var azureBaseUrl: String?
     public var azureDeploymentName: String?
 
+    /// Explicit parent span for telemetry produced by this logical request; nil records none (upstream `telemetry`).
+    public var telemetry: (any TelemetrySpan)?
+
     public init(
         env: [String: String]? = nil,
         temperature: Double? = nil,
@@ -243,8 +247,10 @@ public struct StreamOptions: Sendable {
         azureApiVersion: String? = nil,
         azureResourceName: String? = nil,
         azureBaseUrl: String? = nil,
-        azureDeploymentName: String? = nil
+        azureDeploymentName: String? = nil,
+        telemetry: (any TelemetrySpan)? = nil
     ) {
+        self.telemetry = telemetry
         self.env = env
         self.temperature = temperature
         self.samplingParams = samplingParams
@@ -297,6 +303,9 @@ public struct DeferredFetchOptions: Sendable {
     /// Maximum provider long-poll duration in milliseconds. `nil` or 0 performs one status check.
     public var wait: Int?
 
+    /// Explicit parent span for telemetry produced by this logical request; nil records none (upstream `telemetry`).
+    public var telemetry: (any TelemetrySpan)?
+
     public init(
         apiKey: String? = nil,
         headers: ProviderHeaders? = nil,
@@ -305,8 +314,10 @@ public struct DeferredFetchOptions: Sendable {
         timeoutMs: Int? = nil,
         onResponse: ResponseHandler? = nil,
         httpClient: (any ProviderHTTPClient)? = nil,
-        wait: Int? = nil
+        wait: Int? = nil,
+        telemetry: (any TelemetrySpan)? = nil
     ) {
+        self.telemetry = telemetry
         self.apiKey = apiKey
         self.headers = headers
         self.env = env
@@ -327,6 +338,9 @@ public struct DeferredCancelOptions: Sendable {
     public var onResponse: ResponseHandler?
     public var httpClient: (any ProviderHTTPClient)?
 
+    /// Explicit parent span for telemetry produced by this logical request; nil records none (upstream `telemetry`).
+    public var telemetry: (any TelemetrySpan)?
+
     public init(
         apiKey: String? = nil,
         headers: ProviderHeaders? = nil,
@@ -334,8 +348,10 @@ public struct DeferredCancelOptions: Sendable {
         signal: CancellationToken? = nil,
         timeoutMs: Int? = nil,
         onResponse: ResponseHandler? = nil,
-        httpClient: (any ProviderHTTPClient)? = nil
+        httpClient: (any ProviderHTTPClient)? = nil,
+        telemetry: (any TelemetrySpan)? = nil
     ) {
+        self.telemetry = telemetry
         self.apiKey = apiKey
         self.headers = headers
         self.env = env
@@ -382,6 +398,9 @@ public struct SimpleStreamOptions: Sendable {
     public var azureBaseUrl: String?
     public var azureDeploymentName: String?
 
+    /// Explicit parent span for telemetry produced by this logical request; nil records none (upstream `telemetry`).
+    public var telemetry: (any TelemetrySpan)?
+
     public init(
         env: [String: String]? = nil,
         temperature: Double? = nil,
@@ -409,8 +428,10 @@ public struct SimpleStreamOptions: Sendable {
         azureResourceName: String? = nil,
         azureBaseUrl: String? = nil,
         azureDeploymentName: String? = nil,
-        deferred: DeferredRequest? = nil
+        deferred: DeferredRequest? = nil,
+        telemetry: (any TelemetrySpan)? = nil
     ) {
+        self.telemetry = telemetry
         self.deferred = deferred
         self.env = env
         self.toolChoice = toolChoice
@@ -1344,6 +1365,9 @@ public struct ImagesOptions: Sendable {
     public var maxRetryDelayMs: Int?
     public var metadata: [String: AnyCodable]?
 
+    /// Explicit parent span for telemetry produced by this logical request; nil records none (upstream `telemetry`).
+    public var telemetry: (any TelemetrySpan)?
+
     public init(
         env: [String: String]? = nil,
         signal: CancellationToken? = nil,
@@ -1355,8 +1379,10 @@ public struct ImagesOptions: Sendable {
         timeoutMs: Int? = nil,
         maxRetries: Int? = nil,
         maxRetryDelayMs: Int? = nil,
-        metadata: [String: AnyCodable]? = nil
+        metadata: [String: AnyCodable]? = nil,
+        telemetry: (any TelemetrySpan)? = nil
     ) {
+        self.telemetry = telemetry
         self.env = env
         self.signal = signal
         self.apiKey = apiKey

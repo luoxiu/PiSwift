@@ -6,7 +6,8 @@ PiSwiftTelemetry ports `@earendil-works/pi-telemetry`
 ([`packages/telemetry`](https://github.com/earendil-works/pi/tree/482c1381a/packages/telemetry))
 at upstream `482c1381a`, the parent of `48909d987`. Upstream's sources, tests, and README there are
 unchanged since `35f5c265d` (v0.84.0). Later upstream commits that `FLEET_FORK.md` lists as ported
-come on top: propagation, links, and metrics (`48909d987`). It has no dependencies. The package
+come on top: propagation, links, and metrics (`48909d987`), and capabilities on every context
+(`2ec55d808`). It has no dependencies. The package
 requires macOS 15 or iOS 18.
 
 It provides:
@@ -39,8 +40,12 @@ succeeds, fails, or is persisted.
 ## Core Context API
 
 `startSpan` runs a callback in a new child span. The callback gets the span, which is also the
-parent context of its children. `ReadmeExamplesTests` runs the code blocks; the marker names in
-that file identify each block.
+parent context of its children. A context may expose its adapter's `metrics` and `propagation`;
+child spans and extracted parents carry the same objects. The adapter, a `TelemetryContext`, starts
+root spans and stays with the host; invocation contexts (`ChordContext.telemetry`) and PiSwiftAI's
+request options carry a `TelemetrySpan`, never the adapter. A tracing adapter that only implements
+`startSpan` is valid. `ReadmeExamplesTests` runs the code blocks; the marker names in that file
+identify each block.
 
 ```swift
 func loadAccount(_ accountId: String, telemetry: any TelemetryContext = noopTelemetryContext) async throws -> Account? {
@@ -74,6 +79,8 @@ An adapter must:
 
 - run the callback once, in the caller's task, before `startSpan` returns. Mark `startSpan`
   `nonisolated(nonsending)`, so the callback also runs on the caller's executor;
+- expose its optional `metrics` and `propagation` on its root, its spans, and its extracted parents,
+  inert fallback spans included;
 - return the callback's value, or throw the error it threw;
 - keep the backend span open until the callback returns or throws;
 - treat a return as `ok` and a throw as `error`, unless the callback set a status;
@@ -88,8 +95,9 @@ The conformance cases check the observable behavior.
 
 ## Propagation and Span Links
 
-An adapter may also implement `TelemetryPropagation`. Keep that capability on the one adapter the
-application configures, not on every context:
+An adapter may also implement `TelemetryPropagation`. Expose it as `context.propagation`, so code can
+inject or extract with the context it already has; the root, the spans, and the extracted parents share
+the adapter's object:
 
 ```swift
 public protocol TelemetryPropagation: AnyObject, Sendable {
@@ -145,7 +153,9 @@ links need the plain `startSpan()`.
 ## Metrics
 
 An adapter may implement `TelemetryMetrics` alongside `TelemetryContext` and `TelemetryPropagation`.
-Applications configure one adapter, not a backend for each capability:
+Applications configure one adapter, not a backend for each capability. Expose it as `context.metrics`;
+child spans keep it, so a nested model call records metrics without its own setting. The in-memory
+adapter implements the factories itself:
 
 ```swift
 let bytes = telemetry.counter("network.bytes", options: InstrumentOptions(
@@ -205,9 +215,10 @@ is unbounded and records no timestamps.
 
 ## No-op Context
 
-`noopTelemetryContext` is the default when telemetry is optional. It runs callbacks in the
-caller's task and returns their values and errors. It passes one shared inert span, also to
-nested spans. It does not inspect or retain names, attributes, events, or statuses.
+`noopTelemetryContext`, the shared inert span, is the default when telemetry is optional. It runs
+callbacks in the caller's task and returns their values and errors. It passes itself, also to
+nested spans. Its `metrics` and `propagation` are `noopTelemetryMetrics` and `noopTelemetryPropagation`.
+It does not inspect or retain names, attributes, events, or statuses.
 
 ## In-Memory Reference Adapter
 
@@ -254,7 +265,8 @@ func telemetryAdapterConformance(_ testCase: TelemetryAdapterConformanceCase) as
 }
 ```
 
-The cases cover the callback contract and links. A fixture that supplies `propagation` also gets the
+The cases cover the capabilities on roots, child spans, extracted parents, and inert spans, the
+callback contract, and links. A fixture that supplies `propagation` also gets the
 JSON round trip, multiple adapter hops, and the fallback for unknown carriers; one that supplies
 `metrics` and `getMetrics` gets ordered measurements, exemplars, input copying, and the suppression of
 invalid measurements and boundaries. A failed check throws `TelemetryConformanceFailure` with its file
@@ -310,6 +322,14 @@ Attribute types are `string`, `number`, `boolean`, and their arrays. A definitio
 Start and event attributes state `required`. The parent rule is `.any`, `.rootOrExternal`, or
 `.spans([...])`. It describes; nothing enforces it.
 
+## Pi Schemas
+
+PiSwiftAI exports `aiTelemetrySchema` (upstream `AI_TELEMETRY_SCHEMA`): `pi.ai.request` and `pi.ai.poll`
+spans with their events and metrics, recorded when request options carry a parent span in `telemetry`.
+PiSwiftDurable exports `durableTelemetrySchema` (upstream `DURABLE_TELEMETRY_SCHEMA`): `pi.durable.submit`
+and `pi.durable.phase` spans, their events, and metrics, recorded with `HarnessOptions.telemetry`. Both use
+pi-owned `pi.ai.*` and `pi.durable.*` names, which an adapter may translate to backend conventions.
+
 ## Security and Portability
 
 Telemetry is diagnostics, not durable application state. Do not persist a context, a span, or a
@@ -357,5 +377,15 @@ credentials, and free-form error details out of attributes unless a schema and d
   against upstream's two regular expressions and its safe-integer bound.
 - `TelemetryAdapterFixture` is a struct of closures. `dispose` replaces `AsyncDisposable`: it runs after
   every case, and when both the case and `dispose` fail, the case's error is thrown.
-- PiSwiftAI does not take a telemetry context yet; upstream pi-ai's request options do.
+- `metrics` and `propagation` are protocol requirements with default implementations that return nil,
+  for upstream's optional members. `noopTelemetryContext` has the type `any TelemetrySpan`. An inert
+  in-memory span is a span of its own type carrying the recorder's capabilities, where upstream spreads
+  the no-op span and overrides them. In-memory spans keep their recorder's context alive, as the
+  capability they expose.
+- PiSwiftAI records `pi.ai.*` spans in its dispatch functions `stream`, `streamSimple`, and
+  `streamDeferred`, and in `complete`, `completeSimple`, and `fetchDeferred`, which use them; upstream
+  records them in `Models`, which PiSwiftAI does not have. Without `telemetry` in the options, the
+  provider's stream is returned unchanged; with it, a task forwards the events through an observed stream.
+  A setup failure throws, as these functions do, after it is recorded as upstream records its error
+  event. Each metrics object's instruments are created once and cached by a weak reference to it.
   See `FLEET_FORK.md`.

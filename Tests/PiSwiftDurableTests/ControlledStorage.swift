@@ -51,6 +51,7 @@ actor ControlledStorage: DurableStorage {
     private(set) var commits: [[StorageWrite]] = []
     private(set) var mintCount = 0
     private(set) var documentReadCount = 0
+    private(set) var submissionReadCount = 0
 
     func holdCommits() -> Gate {
         nextGateID += 1
@@ -154,6 +155,7 @@ actor ControlledStorage: DurableStorage {
     }
     func submission(_ id: SubmissionID, context: ChordContext) async throws -> SubmissionRecord? {
         try assertOpen()
+        submissionReadCount += 1
         return try await storage.submission(id, context: context)
     }
     func scanSubmissions(_ query: SubmissionQuery, limit: Int, cursor: Cursor?, context: ChordContext) async throws -> Page<SubmissionRecord, Cursor> {

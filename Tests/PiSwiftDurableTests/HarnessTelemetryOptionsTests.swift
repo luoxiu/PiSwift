@@ -6,7 +6,7 @@ import PiSwiftTelemetry
 
 @Suite struct HarnessTelemetryOptionsTests {
     // Swift: upstream's `@ts-expect-error` for an object without `startSpan` is a type error in Swift too, so it is
-    // not a test. The adapter's optional capabilities are protocols it may also implement.
+    // not a test.
     @Test func acceptsOneAdapterWithOptionalPropagationAndMetricsCapabilities() {
         let adapter = InMemoryTelemetryContext()
         let full = HarnessOptions(models: FakeDurableModels(), registry: Registry(), telemetry: adapter)
@@ -15,8 +15,9 @@ import PiSwiftTelemetry
         #expect(full.telemetry === adapter)
         #expect(contextOnly.telemetry === noopTelemetryContext)
         #expect(omitted.telemetry == nil)
-        #expect(full.telemetry is any TelemetryPropagation)
-        #expect(full.telemetry is any TelemetryMetrics)
-        #expect(!(contextOnly.telemetry is any TelemetryPropagation))
+        // Upstream (2ec55d808) reads the optional capabilities from the context's members.
+        #expect(full.telemetry?.propagation === adapter)
+        #expect(full.telemetry?.metrics === adapter)
+        #expect(contextOnly.telemetry?.propagation === noopTelemetryPropagation)
     }
 }

@@ -1,4 +1,4 @@
-// Ports upstream `packages/telemetry/src/testing/conformance.ts` at 48909d987.
+// Ports upstream `packages/telemetry/src/testing/conformance.ts` at 2ec55d808.
 
 import Foundation
 import PiSwiftTelemetry
@@ -146,6 +146,29 @@ public func createTelemetryAdapterConformance(
     _ factory: @escaping TelemetryAdapterFixtureFactory
 ) -> [TelemetryAdapterConformanceCase] {
     [
+        createCase(factory, "capabilities", "carries adapter capabilities through contexts and spans") { fixture in
+            let metrics = fixture.metrics ?? fixture.context.metrics
+            let propagation = fixture.propagation ?? fixture.context.propagation
+            let assertCapabilities = { (context: any TelemetryContext) throws in
+                try ok(context.metrics === metrics, "Expected the adapter's metrics on \(context)")
+                try ok(context.propagation === propagation, "Expected the adapter's propagation on \(context)")
+            }
+            try assertCapabilities(fixture.context)
+            var settled: (any TelemetrySpan)?
+            try await fixture.context.startSpan(SpanOptions(name: "capabilities")) { span in
+                settled = span
+                try assertCapabilities(span)
+                try await span.startSpan(SpanOptions(name: "capabilities.child")) { child in try assertCapabilities(child) }
+                if let propagation {
+                    let parent = propagation.extract(propagation.inject(span))
+                    try assertCapabilities(parent)
+                    try await parent.startSpan(SpanOptions(name: "capabilities.extracted")) { child in try assertCapabilities(child) }
+                }
+            }
+            guard let settled else { throw TelemetryConformanceFailure("Expected callback span") }
+            try await settled.startSpan(SpanOptions(name: "capabilities.inert")) { child in try assertCapabilities(child) }
+        },
+
         createCase(factory, "metrics", "records ordered measurements and optional histogram exemplars") { fixture in
             guard let metrics = fixture.metrics else { return }
             guard let getMetrics = fixture.getMetrics else {

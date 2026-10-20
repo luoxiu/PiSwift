@@ -1,10 +1,13 @@
-// Ports upstream `packages/telemetry/src/noop.ts` at 48909d987.
+// Ports upstream `packages/telemetry/src/noop.ts` at 2ec55d808.
 
 /// The one inert span. It is its own child for nested spans.
 internal final class NoopTelemetrySpan: TelemetrySpan {
     static let shared = NoopTelemetrySpan()
 
     private init() {}
+
+    var metrics: (any TelemetryMetrics)? { noopTelemetryMetrics }
+    var propagation: (any TelemetryPropagation)? { noopTelemetryPropagation }
 
     nonisolated(nonsending) func startSpan<T, E: Error>(
         _ options: SpanOptions,
@@ -19,10 +22,11 @@ internal final class NoopTelemetrySpan: TelemetrySpan {
     func setStatus(_ status: SpanStatus) {}
 }
 
-/// Shared telemetry context used when an application does not provide one.
-/// It runs callbacks in the caller's task and passes them one shared inert span, including for nested
-/// spans. It does not inspect or retain names, attributes, links, events, or statuses.
-public let noopTelemetryContext: any TelemetryContext = NoopTelemetrySpan.shared
+/// Shared telemetry context used when an application does not provide one: the one inert span.
+/// It runs callbacks in the caller's task and passes them itself, including for nested spans. It does
+/// not inspect or retain names, attributes, links, events, or statuses. Its `metrics` and `propagation`
+/// are `noopTelemetryMetrics` and `noopTelemetryPropagation`.
+public let noopTelemetryContext: any TelemetrySpan = NoopTelemetrySpan.shared
 
 private final class NoopTelemetryPropagation: TelemetryPropagation {
     static let shared = NoopTelemetryPropagation()

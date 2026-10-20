@@ -53,15 +53,48 @@ a system message, even one an edit omits later. After a compaction, the baseline
 the kept history, assistant messages included. Any other system message after an assistant
 message stays in place. Stored entries and `contributions` keep the committed order.
 
-Calls take a `ChordContext`, which carries cancellation and explicit telemetry.
-`ChordContext.background` does not cancel and uses no-op telemetry.
+Calls take a `ChordContext`, which carries cancellation and its current `TelemetrySpan`.
+`ChordContext.background` does not cancel and uses the no-op span. The Harness owns the root
+adapter; a context never holds one.
 `ChordContextKey` carries typed values. These names replace upstream `Context` and
 `ContextKey`. PiSwiftAI already has a public `Context`. This rename is the user's choice.
 Cancellation of a submission wait cancels that wait. It does not withdraw the submission.
 
-`HarnessOptions.telemetry` takes a host-owned `TelemetryContext` adapter from PiSwiftTelemetry,
-which may also implement `TelemetryPropagation` and `TelemetryMetrics`. It reserves the adapter
-setting: Durable emits no spans or metrics yet and persists no carriers.
+`HarnessOptions.telemetry` takes a host-owned `TelemetryContext` from PiSwiftTelemetry, with optional
+`propagation` and `metrics`; without it, nothing is recorded. `durableTelemetrySchema` describes its
+spans, events, and metrics. Attributes hold IDs and control metadata, never messages, arguments, or
+results; the IDs point into the transcript.
+
+- `pi.durable.submit` covers the public `submit` call and its commit. Each input starts a new trace at
+  the adapter root, linked to its caller's current span; a write is a child of its caller's span. A
+  duplicate `requestId` keeps the original submission and carrier. Internal admissions, such as a
+  compaction's write, record events on their phase span and no submit span.
+- `pi.durable.phase` covers one run or abort phase of every task, with its decision commit, never the
+  next phase, a durable wait, or a restart. Its attributes name the task, the phase, the attempt when
+  the checkpoint has one, `resumed`, and the outcome; tool phases also name the tool and the call.
+  Nested tasks and background compactions inherit the creating phase; model requests get the phase's
+  span in their options. Hooks add no spans.
+- A failed outcome sets the error status with a fixed category (`task_faulted`, `task_failed`, or
+  `task_orphaned`) and the outcome's diagnostic cut to 500 characters (an orphaned task's reason).
+  Diagnostics can hold caller content; no error detail or exception name is recorded. An `aborted`
+  outcome, a close or cancellation included, keeps status `ok`.
+- Every `onReport` report also records a `pi.durable.report` event on its current span: the no-op
+  span drops it when there is none, and no root report span is made. Only `type`, the fixed `reason`,
+  `extension`, and `task.id` are recorded, never the error. `pi.durable.reports` counts every report by
+  `type`. `onReport` itself is unchanged.
+- Committed entries and settled submissions record `pi.durable.entry` and `pi.durable.submission`. A
+  committed change of the running phase records `pi.durable.checkpoint`; a nested call answered from its
+  stored result records `pi.durable.replay`.
+- With propagation, submissions and tasks store an opaque `trace` carrier in their JSON, without a
+  storage migration. Phase spans extract their task's carrier, or start at the adapter root when it is
+  absent or unknown. `TaskOptions.trace` nil inherits the creating commit's span, `.carrier` overrides
+  it, and `.root` starts at the adapter root without storing one. A run started for several queued
+  inputs takes the first input's trace, and its first invocation's spans link to the others through the
+  task's immutable `links`. A steer stays in the running trace; its submit span links to the run's
+  carrier. A reopened task's first invocation has `resumed: true`, in the same trace.
+- Metrics record `pi.durable.phase.duration` (milliseconds; task, phase, outcome) and
+  `pi.durable.tasks.active` (live tasks by task name), without record IDs. Closing the Harness releases
+  its active counts.
 
 ## Quick Start
 
@@ -694,6 +727,16 @@ until a compaction produces a summary. The event snapshot carries it as
   `TaskBlockedReason` serves both `inspect()` and `TaskGraphNode.blocked`. `restartLimit` is a `Double`, so
   `.infinity` never parks; a fraction rounds down. `agentHooks(_:taskName:)` returns `(extension:hook:)` pairs, where
   upstream returns `{ extension, handlers }`.
+- A submission's `trace` is a member of its JSON, as upstream, but Swift keeps it among the state's
+  extension members (`InputSubmissionState.extensions`, `WriteSubmissionState.extensions`), which carry
+  over every state change, and `SubmissionRecord.trace` reads it; the record's cases are unchanged.
+  `TaskRecord.trace` and `links` are fields. `TaskTrace` (`.carrier`, `.root`) replaces upstream's
+  `TelemetryCarrier | "root"`. `SessionHooks` gains `report(_:info:context:)`, whose default calls
+  `report(_:info:)`. A task cannot commit an `orphaned` outcome (only the scheduler writes one, to tasks
+  without an invocation), so no phase span ends `task_orphaned`. Model requests carry the phase span in
+  `SimpleStreamOptions.telemetry`, `DeferredFetchOptions.telemetry`, and `DeferredCancelOptions.telemetry`;
+  `PiSwiftAIDurableModels` resolves the API key before PiSwiftAI starts the request's span, so the key
+  lookup is outside it. A `Transaction` keeps its context after the commit; upstream resets it.
 - This library has no CLI or TUI code. PowerShell and Windows process support are outside scope.
 
 Upstream examples 00–31 have Swift integration tests with assertions for the library

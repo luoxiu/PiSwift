@@ -207,8 +207,10 @@ private func summarizeCompaction(_ task: RunningTask<CompactionInput, Compaction
     ]
     let bridge = ContextCancellationBridge(context: context.withAbortSignal(runtime.signal))
     defer { withExtendedLifetime(bridge) {} }
-    let options = try compactionStreamOptions(request, signal: bridge.token,
+    var options = try compactionStreamOptions(request, signal: bridge.token,
         sessionId: await ensureProviderSessionId(runtime: runtime, context: context))
+    // The request records its span under this phase's.
+    options.telemetry = context.telemetry
     let message = await runtime.models.completeSimple(model: model, context: .init(messages: messages), options: options)
     try runtime.signal.throwIfAborted()
     let summary = compactionSummaryText(message), policy = runtime.settings.retry
@@ -259,7 +261,7 @@ private func placeCompactionSummary(_ tx: Transaction, _ runtime: TaskRuntime, _
     let result: CompactionResult
     if current.owner == nil {
         result = try await CompactionResult(submissionId: admitSubmission(tx: tx, conversationId: runtime.conversationId,
-            draft: .write(entry: entry, requestId: "compaction:\(runtime.taskId.rawValue)"), now: runtime.now(), queueModes: runtime.settings))
+            draft: .write(entry: entry, requestId: "compaction:\(runtime.taskId.rawValue)"), now: runtime.now(), queueModes: runtime.settings).id)
     } else {
         result = try await CompactionResult(entryId: tx.appendEntry(runtime.conversationId, value: entry).id)
     }

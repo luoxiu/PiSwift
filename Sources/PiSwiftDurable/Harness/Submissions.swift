@@ -1,5 +1,6 @@
 import PiSwiftAI
 import PiSwiftChord
+import PiSwiftTelemetry
 import Synchronization
 
 /// User text or content blocks submitted to a conversation.
@@ -122,25 +123,46 @@ internal final class Submissions: Sendable {
     private let now: @Sendable () -> Int64
     private let settings: @Sendable () -> Settings
     private let resume: @Sendable () -> Void
+    /// `HarnessOptions.telemetry`: inputs start their admission span at its root.
+    private let telemetry: any TelemetryContext
     private let waiters = Waiters<SubmissionID, SettledSubmission>()
     private struct State: Sendable { var closed = false; var subscriptions: [SessionSubscription] = [] }
     private let state = Mutex(State())
     internal func hasPendingWait(id: SubmissionID) -> Bool { waiters.keys.contains(id) }
     init(session: Session, storage: any DurableStorage, now: @escaping @Sendable () -> Int64,
-         settings: @escaping @Sendable () -> Settings, resume: @escaping @Sendable () -> Void) throws {
+         settings: @escaping @Sendable () -> Settings, resume: @escaping @Sendable () -> Void,
+         telemetry: any TelemetryContext = noopTelemetryContext) throws {
         self.session = session; self.storage = storage; self.now = now; self.settings = settings; self.resume = resume
+        self.telemetry = telemetry
         let commits = try session.observeCommits { [weak self] publication, _ in self?.observe(publication) }
         let close = try session.subscribeClose { [weak self, session] in
             self?.state.withLock { $0.closed = true }; self?.waiters.rejectAll(closedError(session))
         }
         state.withLock { $0.subscriptions = [commits, close] }
     }
+    /// Admits a submission in one commit inside a `pi.durable.submit` span. An input starts a new trace at the adapter
+    /// root, linked to the caller's span; a write is a child of the caller's span.
     func submit(conversationId: ConversationID, draft: SubmissionDraft, context: ChordContext) async throws -> Submission {
         resume()
-        let id = try await session.commit({ tx in
-            try await admitSubmission(tx: tx, conversationId: conversationId, draft: draft, now: now(), queueModes: settings())
-        }, context: context)
-        return Submission(id: id, submissions: self)
+        let parent: any TelemetryContext = draft.type == "input" ? telemetry : context.telemetry
+        let start = createTypedSpanStarter(parent, [durableTelemetrySchema])
+        return try await start("pi.durable.submit", [
+            "submission.type": .string(draft.type), "conversation.id": .number(Double(conversationId.rawValue)),
+        ]) { span, _ in
+            if draft.type == "input" { span.addLink(SpanLink(context: context.telemetry)) }
+            do {
+                let admission = try await session.commit({ tx in
+                    try await admitSubmission(tx: tx, conversationId: conversationId, draft: draft, now: now(),
+                                              queueModes: settings(), span: span)
+                }, context: context.withTelemetry(span))
+                span.setAttributes(["submission.id": .number(Double(admission.id.rawValue)), "result": .string(admission.status)])
+                return Submission(id: admission.id, submissions: self)
+            } catch {
+                // Error text may contain caller content. Record only the status.
+                span.setStatus(.error(nil))
+                throw error
+            }
+        }
     }
     func get(id: SubmissionID, context: ChordContext) async throws -> Submission? {
         try context.abortSignal?.throwIfAborted()
@@ -199,24 +221,40 @@ private func checkInputEntry(_ entry: InputEntry) throws {
 /// `ConversationBusy`. An idle conversation with queued items queues it behind them and runs a final boundary.
 /// Otherwise idle input places its entry (`pi.user`, or the input's own) and starts a run, and an idle write appends
 /// its entry and settles `done`, or `stale` when its head reaches before the active range.
-internal func admitSubmission(tx: Transaction, conversationId: ConversationID, draft: SubmissionDraft, now: Int64, queueModes: Settings) async throws -> SubmissionID {
+///
+/// With `span`, the admission span, each created submission stores its carrier as `trace`, and a steer links the span
+/// to the running generation's trace. Returns the submission and how it was admitted: `queued`, `placed`, or `done`
+/// (a settled write, a stale one included); an existing request reports its submission's status.
+internal func admitSubmission(tx: Transaction, conversationId: ConversationID, draft: SubmissionDraft, now: Int64, queueModes: Settings,
+                              span: (any TelemetrySpan)? = nil) async throws -> SubmissionAdmission {
     if case .input(_, _, let entry?, _) = draft { try checkInputEntry(entry) }
     if let requestId = draft.requestId, let existing = try await tx.submissionByRequest(conversationId, requestId: requestId) {
         guard existing.type == draft.type else { throw SessionError.message("Request \(requestId) already identifies a submission of type \(existing.type)") }
-        return existing.id
+        return SubmissionAdmission(id: existing.id, status: existing.status == "unanswered" ? "done" : existing.status)
     }
+    // The record's `trace` member, kept among each state's extension members.
+    let fields: JSONObject = try span.flatMap { span in span.propagation?.inject(span) }.map { ["trace": try JSONValue(encoding: $0)] } ?? [:]
     if case .write(let entry, let requestId) = draft, isDisplayOnly(entry),
        try await !hasQueuedReset(tx.doc(InboxDoc, conversationId: conversationId).snapshot().decode(InboxState.self).items) {
         let appended = try await tx.appendEntry(conversationId, value: entry)
-        return try await tx.createSubmission(.write(conversationId: conversationId, requestId: requestId, state: .done(entry: appended.id))).id
+        let record = try await tx.createSubmission(.write(conversationId: conversationId, requestId: requestId,
+                                                          state: .done(entry: appended.id, extensions: fields)))
+        return SubmissionAdmission(id: record.id, status: "done")
     }
     let live = try await tx.doc(LiveDoc, conversationId: conversationId)
-    let busy = try live.get("run") != nil
+    let run = try live.get("run")?.decode(LiveRun.self)
+    let busy = run != nil
+    if case .input(_, .steer, _, _) = draft, let run, let span, let propagation = span.propagation,
+       let trace = try await tx.task(run.taskId)?.trace {
+        span.addLink(SpanLink(context: propagation.extract(trace)))
+    }
     if busy, case .input(_, .reject, _, _) = draft { throw ConversationBusy(conversationId: conversationId) }
     let boundary = busy ? nil : try await prepareBoundary(tx: tx, conversationId: conversationId, modes: queueModes)
     let queued = try boundary?.inbox.child("items")?.count() ?? 0
     if boundary == nil || queued > 0 {
-        let record = try await tx.createSubmission(draft.type == "input" ? .input(conversationId: conversationId, requestId: draft.requestId) : .write(conversationId: conversationId, requestId: draft.requestId))
+        let record = try await tx.createSubmission(draft.type == "input"
+            ? .input(conversationId: conversationId, requestId: draft.requestId, state: .queued(extensions: fields))
+            : .write(conversationId: conversationId, requestId: draft.requestId, state: .queued(extensions: fields)))
         let inbox: JSONDraft
         if let boundary { inbox = boundary.inbox } else { inbox = try await tx.doc(InboxDoc, conversationId: conversationId) }
         let item: InboxItem
@@ -226,26 +264,35 @@ internal func admitSubmission(tx: Transaction, conversationId: ConversationID, d
         case .write(let entry, _): item = InboxItem(id: record.id, mode: .write, entry: entry)
         }
         try inbox.child("items")!.append(JSONValue(encoding: item))
-        if let boundary {
-            let result = try await applyBoundary(tx: tx, boundary: boundary, at: .final, now: now)
-            if !result.users.isEmpty { try await startRun(tx: tx, conversationId: conversationId, live: live, inputs: result.users) }
-        }
-        return record.id
+        guard let boundary else { return SubmissionAdmission(id: record.id, status: "queued") }
+        let result = try await applyBoundary(tx: tx, boundary: boundary, at: .final, now: now)
+        if !result.users.isEmpty { try await startRun(tx: tx, conversationId: conversationId, live: live, inputs: result.users) }
+        return SubmissionAdmission(id: record.id, status: draft.type == "write" ? "done" : result.users.last == record.id ? "placed" : "queued")
     }
     switch draft {
     case .write(let entry, let requestId):
         if isStale(boundary: boundary!, entry: entry) {
-            return try await tx.createSubmission(.write(conversationId: conversationId, requestId: requestId, state: .unanswered(reason: "stale"))).id
+            let record = try await tx.createSubmission(.write(conversationId: conversationId, requestId: requestId,
+                                                              state: .unanswered(reason: "stale", extensions: fields)))
+            return SubmissionAdmission(id: record.id, status: "done")
         }
         let appended = try await tx.appendEntry(conversationId, value: entry)
-        return try await tx.createSubmission(.write(conversationId: conversationId, requestId: requestId, state: .done(entry: appended.id))).id
+        let record = try await tx.createSubmission(.write(conversationId: conversationId, requestId: requestId,
+                                                          state: .done(entry: appended.id, extensions: fields)))
+        return SubmissionAdmission(id: record.id, status: "done")
     case .input(let content, _, let inputEntry, let requestId):
         let message = try EntryRecord.encodeMessages([.user(UserMessage(content: content, timestamp: now))])[0]
         let entry = try await appendInput(tx: tx, conversationId: conversationId, message: message, entry: inputEntry)
-        let record = try await tx.createSubmission(.input(conversationId: conversationId, requestId: requestId, state: .placed(entry: entry.id)))
+        let record = try await tx.createSubmission(.input(conversationId: conversationId, requestId: requestId,
+                                                          state: .placed(entry: entry.id, extensions: fields)))
         try await startRun(tx: tx, conversationId: conversationId, live: live, inputs: [record.id])
-        return record.id
+        return SubmissionAdmission(id: record.id, status: "placed")
     }
+}
+/// The submission an admission returns, and whether it was `queued`, `placed`, or `done` (upstream `Admission`).
+internal struct SubmissionAdmission: Sendable {
+    let id: SubmissionID
+    let status: String
 }
 private func inputContentJSON(_ content: UserInput) throws -> JSONValue {
     try EntryRecord.encodeMessages([.user(UserMessage(content: content, timestamp: 0))])[0].objectValue!["content"]!

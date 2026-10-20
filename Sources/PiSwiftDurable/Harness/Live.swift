@@ -260,7 +260,9 @@ internal func endRun(tx: Transaction, live: JSONDraft, taskId: TaskID, settlemen
     try live.remove("generation"); try live.remove("tools"); try live.remove("nestedTools")
 }
 internal func startRun(tx: Transaction, conversationId: ConversationID, live: JSONDraft, inputs: [SubmissionID]) async throws {
-    let id = try await createGeneration(tx: tx, conversationId: conversationId)
+    // The run takes the first input's trace and links the others'.
+    let id = try await tx.createTask(generationTask.kind, input: GenerationInput(),
+                                     options: .init(ownership: .conversation(), conversationId: conversationId), submissionIds: inputs)
     try live.set("run", JSONValue(encoding: LiveRun(taskId: id, inputs: inputs)))
 }
 internal func handOver(live: JSONDraft, from: TaskID, to: TaskID) throws {

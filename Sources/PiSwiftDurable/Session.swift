@@ -1,5 +1,6 @@
 import Foundation
 import PiSwiftChord
+import PiSwiftTelemetry
 import Synchronization
 
 /// Hooks for the harness. Conversation creation runs inside its transaction.
@@ -11,6 +12,9 @@ public protocol SessionHooks: Sendable {
     /// Receives the Session's failure, once, and errors of listeners, which never fail what ran them; `info` says where
     /// each came from.
     func report(_ error: any Error, info: ReportInfo)
+    /// `report(_:info:)` with the context whose span the report belongs to, when there is one: the commit's whose
+    /// listener threw, or the caller's of a failing commit.
+    func report(_ error: any Error, info: ReportInfo, context: ChordContext?)
 }
 public extension SessionHooks {
     /// Performs no initialization unless the application supplies an override.
@@ -19,6 +23,8 @@ public extension SessionHooks {
     func beforeClose() async {}
     /// A plain Session drops reports.
     func report(_ error: any Error, info: ReportInfo) {}
+    /// Drops the context and calls `report(_:info:)`.
+    func report(_ error: any Error, info: ReportInfo, context: ChordContext?) { report(error, info: info) }
 }
 /// Session hooks that perform no application initialization.
 public struct DefaultSessionHooks: SessionHooks {
@@ -104,19 +110,24 @@ public final class Session: Sendable {
     /// Fail the Session with `error`, the first wins, and report it once. Admission ends, and close listeners run now;
     /// they read the error from `failure`. The Storage guard calls this; the Harness also calls it for a throw in its
     /// scheduler's own commits.
-    internal func fail(_ error: any Error) { guarded.fail(error) }
+    /// `context` is the one whose span the failure report belongs to, if any.
+    internal func fail(_ error: any Error, context: ChordContext? = nil) {
+        if guarded.recordFailure(error) { failed(error, context: context) }
+    }
     /// The first failure: end the waits that race it, close (which runs the close listeners), then report.
-    private func failed(_ error: any Error) {
+    private func failed(_ error: any Error, context: ChordContext? = nil) {
         let waits = state.withLock { state in let waits = state.failureWaits; state.failureWaits = [:]; return waits }
         for wait in waits.values { wait(SessionFailed(error)) }
         // Seal first, so a report handler that calls back finds the Session failed. Closing runs the close listeners
         // synchronously; a failing backend close is the caller's to see, and here nobody waits.
         beginClose(cleanup: .background)
-        report(error, info: .sessionFailed)
+        report(error, info: .sessionFailed, context: context)
     }
     /// Internal: the Session's failure, and errors of listeners, which never fail what ran them; `info` defaults to a
-    /// listener. A plain Session drops them.
-    internal func report(_ error: any Error, info: ReportInfo = .listener) { hooks.report(error, info: info) }
+    /// listener, and `context` is the one whose span the report belongs to, if any. A plain Session drops them.
+    internal func report(_ error: any Error, info: ReportInfo = .listener, context: ChordContext? = nil) {
+        hooks.report(error, info: info, context: context)
+    }
     /// Run `work`, ending the wait with `SessionFailed` the moment the Session fails; the work runs on.
     internal func untilFailed<T: Sendable>(_ work: @escaping @Sendable () async throws -> T) async throws -> T {
         let promise = HarnessPromise<T>(), id = UUID()
@@ -193,9 +204,23 @@ public final class Session: Sendable {
         for write in writes {
             switch write {
             case .conversation(let value, _): changes.append(.conversation(value))
-            case .entry(let value, _): changes.append(.entry(value))
+            case .entry(let value, _):
+                // Committed: the events name records, never their content.
+                context.telemetry.addEvent("pi.durable.entry", attributes: [
+                    "entry.id": .number(Double(value.id.rawValue)), "entry.kind": .string(value.kind),
+                ])
+                changes.append(.entry(value))
             case .task(let value, _): changes.append(.task(value))
-            case .submission(let value, _): changes.append(.submission(value))
+            case .submission(let value, _):
+                if value.status == "done" || value.status == "unanswered" {
+                    var answer: AttributeValue?
+                    if case .input(_, _, _, .done(_, let entry, _)) = value { answer = .number(Double(entry.rawValue)) }
+                    context.telemetry.addEvent("pi.durable.submission", attributes: [
+                        "submission.id": .number(Double(value.id.rawValue)), "status": .string(value.status),
+                        "answer.entry_id": answer,
+                    ])
+                }
+                changes.append(.submission(value))
             default: break
             }
         }
@@ -204,10 +229,10 @@ public final class Session: Sendable {
         let (internals, listeners) = state.withLock { ($0.internalCommits, $0.commits) }
         // The commit is durable: a failing listener neither fails the commit nor skips the others.
         for listener in internals {
-            do { try listener.call(publication, context) } catch { fail(error) }
+            do { try listener.call(publication, context) } catch { fail(error, context: context) }
         }
         for listener in listeners {
-            do { try listener.call(publication, context) } catch { report(error) }
+            do { try listener.call(publication, context) } catch { report(error, context: context) }
         }
         sweepDocuments()
         return result

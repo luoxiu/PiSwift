@@ -1,6 +1,7 @@
 import Foundation
 import PiSwiftAI
 import PiSwiftChord
+import Synchronization
 
 /// A model-issued call, read from its assistant entry, or a nested call a running tool made through `executeTool()`,
 /// whose call the input carries because no entry holds it. JSON uses the upstream `kind` tag.
@@ -199,12 +200,16 @@ internal enum ToolEnding { case completed, failed(String), aborted }
 private func readToolCall(_ runtime: TaskRuntime, _ input: ToolTaskInput, _ context: ChordContext) async throws -> ToolHookCall {
     switch input {
     case .nested(let nested):
+        context.telemetry.setAttributes(["tool.name": .string(nested.call.name), "tool.call_id": .string(nested.call.id)])
         return ToolHookCall(call: try nested.call.toolCall(), parent: .init(taskId: nested.parent, callId: nested.parentCallId))
     case let .model(assistant, callId):
         if let entry = try await runtime.entry(assistantEntry, id: assistant, context: context),
            case .assistant(let message) = try entry.record.messages()?.first {
             for block in message.content {
-                if case .toolCall(let call) = block, harnessNamesEqual(call.id, callId) { return ToolHookCall(call: call) }
+                if case .toolCall(let call) = block, harnessNamesEqual(call.id, callId) {
+                    context.telemetry.setAttributes(["tool.name": .string(call.name), "tool.call_id": .string(call.id)])
+                    return ToolHookCall(call: call)
+                }
             }
         }
         throw TaskDefinitionError("Entry \(assistant.rawValue) has no tool call \(callId)")
@@ -414,7 +419,8 @@ internal func startNestedCall(_ runtime: TaskRuntime, parentCallId: String, name
                               key: String, progress: Bool?, abandonOnRestart: Bool,
                               context: ChordContext) async throws -> TaskID {
     let call = NestedToolCall(id: "\(parentCallId)/\(key)", name: name, arguments: arguments)
-    return try await withTaskCancellationContext(context) { context in
+    let replayed = Mutex(false)
+    let id = try await withTaskCancellationContext(context) { context in
         try await runtime.scheduler.gated(runtime.invocation, context: context) { tx, _ in
             // Opened, or created empty for a key not made yet.
             let state = try await tx.doc(NestedCallDoc, taskId: runtime.taskId, key: key, seed: .null)
@@ -424,6 +430,8 @@ internal func startNestedCall(_ runtime: TaskRuntime, parentCallId: String, name
                       jsonStructurallyEqual(.object(found.call.arguments), .object(call.arguments)) else {
                     throw TaskDefinitionError("Nested call \(call.id) was already made with another tool or other arguments")
                 }
+                let answered = try state.get("result") != nil
+                replayed.withLock { $0 = answered }
                 return existing
             }
             let input = ToolTaskInput.nested(NestedToolTaskInput(parent: runtime.taskId, parentCallId: parentCallId,
@@ -439,6 +447,9 @@ internal func startNestedCall(_ runtime: TaskRuntime, parentCallId: String, name
             return created
         }
     }
+    // Answered from its stored result, once committed.
+    if replayed.withLock({ $0 }) { context.telemetry.addEvent("pi.durable.replay", attributes: ["tool.name": .string(name)]) }
+    return id
 }
 /// What programs get of a tool's output when it declares no schema: one text item as its string, one image as itself,
 /// nothing as `""`, and anything else as the content list.

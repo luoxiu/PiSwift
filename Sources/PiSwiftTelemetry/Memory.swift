@@ -1,4 +1,4 @@
-// Ports upstream `packages/telemetry/src/memory.ts` at 48909d987.
+// Ports upstream `packages/telemetry/src/memory.ts` at 2ec55d808.
 
 import Foundation
 import Synchronization
@@ -228,22 +228,28 @@ private func automaticErrorStatus(_ error: any Error) -> SpanStatus {
     return .error(name: String(describing: type(of: error)), message: message)
 }
 
+/// A span of an in-memory recorder. Its metrics and propagation are its recorder's context, which it keeps alive; the
+/// context does not keep its spans, so there is no cycle.
 private final class InMemoryTelemetrySpan: TelemetrySpan, InMemoryCarrierContext {
-    let recorder: InMemoryTelemetryRecorder
+    let owner: InMemoryTelemetryContext
     let id: Int
     let carrier: TelemetryCarrier
+    var recorder: InMemoryTelemetryRecorder { owner.recorder }
 
-    init(recorder: InMemoryTelemetryRecorder, id: Int, carrier: TelemetryCarrier) {
-        self.recorder = recorder
+    init(owner: InMemoryTelemetryContext, id: Int, carrier: TelemetryCarrier) {
+        self.owner = owner
         self.id = id
         self.carrier = carrier
     }
+
+    var metrics: (any TelemetryMetrics)? { owner }
+    var propagation: (any TelemetryPropagation)? { owner }
 
     nonisolated(nonsending) func startSpan<T, E: Error>(
         _ options: SpanOptions,
         _ body: (any TelemetrySpan) async throws(E) -> T
     ) async throws(E) -> T {
-        try await startInMemorySpan(recorder, parent: InMemoryParent(context: carrier, localId: id, span: id), options, body)
+        try await startInMemorySpan(owner, parent: InMemoryParent(context: carrier, localId: id, span: id), options, body)
     }
 
     func addLink(_ link: SpanLink) {
@@ -271,36 +277,63 @@ private final class InMemoryTelemetrySpan: TelemetrySpan, InMemoryCarrierContext
 
 /// A parent extracted from a carrier. Children record it as their parent context; it never becomes inert.
 private final class InMemoryExtractedParent: InMemoryCarrierContext {
-    let recorder: InMemoryTelemetryRecorder
+    let owner: InMemoryTelemetryContext
     let carrier: TelemetryCarrier
     let localId: Int?
 
-    init(recorder: InMemoryTelemetryRecorder, carrier: TelemetryCarrier, localId: Int?) {
-        self.recorder = recorder
+    init(owner: InMemoryTelemetryContext, carrier: TelemetryCarrier, localId: Int?) {
+        self.owner = owner
         self.carrier = carrier
         self.localId = localId
     }
+
+    var metrics: (any TelemetryMetrics)? { owner }
+    var propagation: (any TelemetryPropagation)? { owner }
 
     nonisolated(nonsending) func startSpan<T, E: Error>(
         _ options: SpanOptions,
         _ body: (any TelemetrySpan) async throws(E) -> T
     ) async throws(E) -> T {
-        try await startInMemorySpan(recorder, parent: InMemoryParent(context: carrier, localId: localId, span: nil), options, body)
+        try await startInMemorySpan(owner, parent: InMemoryParent(context: carrier, localId: localId, span: nil), options, body)
     }
 }
 
+/// A span that records nothing, under a settled parent: like the no-op span, but with its recorder's capabilities, and
+/// children that are inert too.
+private final class InMemoryInertSpan: TelemetrySpan {
+    let owner: InMemoryTelemetryContext
+
+    init(owner: InMemoryTelemetryContext) { self.owner = owner }
+
+    var metrics: (any TelemetryMetrics)? { owner }
+    var propagation: (any TelemetryPropagation)? { owner }
+
+    nonisolated(nonsending) func startSpan<T, E: Error>(
+        _ options: SpanOptions,
+        _ body: (any TelemetrySpan) async throws(E) -> T
+    ) async throws(E) -> T {
+        try await body(InMemoryInertSpan(owner: owner))
+    }
+
+    func addLink(_ link: SpanLink) {}
+    func addEvent(_ name: String, attributes: SpanAttributes?) {}
+    func setAttributes(_ attributes: SpanAttributes) {}
+    func setStatus(_ status: SpanStatus) {}
+}
+
 nonisolated(nonsending) private func startInMemorySpan<T, E: Error>(
-    _ recorder: InMemoryTelemetryRecorder,
+    _ owner: InMemoryTelemetryContext,
     parent: InMemoryParent?,
     _ options: SpanOptions,
     _ body: (any TelemetrySpan) async throws(E) -> T
 ) async throws(E) -> T {
+    let recorder = owner.recorder
     guard let created = recorder.createSpan(parent: parent, options: options) else {
-        return try await noopTelemetryContext.startSpan(options, body)
+        return try await body(InMemoryInertSpan(owner: owner))
     }
     let id = created.id
     do throws(E) {
-        let value = try await body(InMemoryTelemetrySpan(recorder: recorder, id: id, carrier: created.carrier))
+        let value = try await body(InMemoryTelemetrySpan(owner: owner, id: id, carrier: created.carrier))
         recorder.settle(id, error: nil)
         return value
     } catch {
@@ -371,16 +404,21 @@ private func memorySpanId(_ value: String) -> Int? {
 /// It is also the adapter's propagation and metrics. Storage is unbounded and process-local. A thrown error
 /// records its type name and description as the automatic error status, unless the callback set a status.
 public final class InMemoryTelemetryContext: TelemetryContext, TelemetryPropagation, TelemetryMetrics {
-    private let recorder = InMemoryTelemetryRecorder()
+    fileprivate let recorder = InMemoryTelemetryRecorder()
 
     /// Creates an empty recorder.
     public init() {}
+
+    /// This context: it implements the metrics itself, and its spans and extracted parents carry it.
+    public var metrics: (any TelemetryMetrics)? { self }
+    /// This context: it implements the propagation itself, and its spans and extracted parents carry it.
+    public var propagation: (any TelemetryPropagation)? { self }
 
     nonisolated(nonsending) public func startSpan<T, E: Error>(
         _ options: SpanOptions,
         _ body: (any TelemetrySpan) async throws(E) -> T
     ) async throws(E) -> T {
-        try await startInMemorySpan(recorder, parent: nil, options, body)
+        try await startInMemorySpan(self, parent: nil, options, body)
     }
 
     /// Returns a detached carrier for a known span or extracted parent, including settled spans.
@@ -395,7 +433,7 @@ public final class InMemoryTelemetryContext: TelemetryContext, TelemetryPropagat
               isMemoryScope(scope), let id = memorySpanId(span) else { return self }
         let context = ["pi-memory-scope": scope, "pi-memory-span": span]
         let local = scope == recorder.scope && recorder.state.withLock { id <= $0.spans.count }
-        return InMemoryExtractedParent(recorder: recorder, carrier: context, localId: local ? id : nil)
+        return InMemoryExtractedParent(owner: self, carrier: context, localId: local ? id : nil)
     }
 
     public func counter(_ name: String, options: InstrumentOptions?) -> any TelemetryCounter {

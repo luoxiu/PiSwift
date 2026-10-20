@@ -1,4 +1,4 @@
-// Ports upstream `packages/telemetry/test/telemetry.test.ts` at 482c1381a.
+// Ports upstream `packages/telemetry/test/telemetry.test.ts` at 2ec55d808.
 // Upstream's compile-time checks (`expectTypeOf`, `@ts-expect-error`) test TypeScript inference,
 // which Swift does not have. The "does not inspect or retain telemetry payloads" case passes
 // Proxy values that throw on read, which Swift values cannot be.
@@ -162,6 +162,10 @@ struct NoopTelemetryContextTests {
         #expect(result == 42)
         // Upstream checks that the span is frozen; the Swift span is stateless and is the shared context.
         #expect(firstSpan === noopTelemetryContext)
+        #expect(noopTelemetryContext.metrics === noopTelemetryMetrics)
+        #expect(noopTelemetryContext.propagation === noopTelemetryPropagation)
+        #expect(firstSpan?.metrics === noopTelemetryMetrics)
+        #expect(firstSpan?.propagation === noopTelemetryPropagation)
     }
 
     @Test func preservesSynchronousAndAsynchronousRejectionValues() async {

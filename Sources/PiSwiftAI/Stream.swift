@@ -181,15 +181,18 @@ private func hasGoogleVertexCredentials(env: [String: String]) -> Bool {
     #endif
 }
 
+/// Streams one request. With `options.telemetry`, the request records a `pi.ai.request` span (see `aiTelemetrySchema`).
 public func stream(model: Model, context: Context, options: StreamOptions? = nil) throws -> AssistantMessageEventStream {
-    try validateHTTPClientSupport(api: model.api, transport: options?.transport, httpClient: options?.httpClient)
-    if getApiProvider(model.api) == nil {
-        ensureBuiltInProviders()
+    try observedRequest(model, telemetry: options?.telemetry, reasoning: nil, poll: false) {
+        try validateHTTPClientSupport(api: model.api, transport: options?.transport, httpClient: options?.httpClient)
+        if getApiProvider(model.api) == nil {
+            ensureBuiltInProviders()
+        }
+        guard let provider = getApiProvider(model.api) else {
+            throw StreamError.noApiProvider(model.api.rawValue)
+        }
+        return provider.stream(model, normalizeContext(context), options)
     }
-    guard let provider = getApiProvider(model.api) else {
-        throw StreamError.noApiProvider(model.api.rawValue)
-    }
-    return provider.stream(model, normalizeContext(context), options)
 }
 
 public func complete(model: Model, context: Context, options: StreamOptions? = nil) async throws -> AssistantMessage {
@@ -201,18 +204,22 @@ public func streamSimple(model: Model, context: Context, options: SimpleStreamOp
     try streamSimple(model: model, context: normalizeContext(context), options: options)
 }
 
+/// Streams one request with simple options. With `options.telemetry`, the request records a `pi.ai.request` span (see
+/// `aiTelemetrySchema`).
 public func streamSimple(model: Model, context: TranscriptContext, options: SimpleStreamOptions? = nil) throws -> AssistantMessageEventStream {
-    try validateHTTPClientSupport(api: model.api, transport: options?.transport, httpClient: options?.httpClient)
-    if getApiProvider(model.api) == nil {
-        ensureBuiltInProviders()
+    try observedRequest(model, telemetry: options?.telemetry, reasoning: options?.reasoning, poll: false) {
+        try validateHTTPClientSupport(api: model.api, transport: options?.transport, httpClient: options?.httpClient)
+        if getApiProvider(model.api) == nil {
+            ensureBuiltInProviders()
+        }
+        guard let provider = getApiProvider(model.api) else {
+            throw StreamError.noApiProvider(model.api.rawValue)
+        }
+        var resolvedOptions = options ?? SimpleStreamOptions()
+        let requestedMaxTokens = options?.maxTokens ?? model.maxTokens
+        resolvedOptions.maxTokens = clampSimpleMaxTokensToContext(model: model, context: context, maxTokens: requestedMaxTokens)
+        return provider.streamSimple(model, context, resolvedOptions)
     }
-    guard let provider = getApiProvider(model.api) else {
-        throw StreamError.noApiProvider(model.api.rawValue)
-    }
-    var resolvedOptions = options ?? SimpleStreamOptions()
-    let requestedMaxTokens = options?.maxTokens ?? model.maxTokens
-    resolvedOptions.maxTokens = clampSimpleMaxTokensToContext(model: model, context: context, maxTokens: requestedMaxTokens)
-    return provider.streamSimple(model, context, resolvedOptions)
 }
 
 private func validateHTTPClientSupport(
@@ -256,15 +263,18 @@ public func completeSimple(model: Model, context: Context, options: SimpleStream
     return await stream.result()
 }
 
+/// Polls a deferred request once. With `options.telemetry`, the poll records a `pi.ai.poll` span (see `aiTelemetrySchema`).
 public func streamDeferred(model: Model, handle: DeferredHandle, options: DeferredFetchOptions? = nil) throws -> AssistantMessageEventStream {
-    if getApiProvider(model.api) == nil { ensureBuiltInProviders() }
-    guard let provider = getApiProvider(model.api) else {
-        throw StreamError.noApiProvider(model.api.rawValue)
+    try observedRequest(model, telemetry: options?.telemetry, reasoning: nil, poll: true) {
+        if getApiProvider(model.api) == nil { ensureBuiltInProviders() }
+        guard let provider = getApiProvider(model.api) else {
+            throw StreamError.noApiProvider(model.api.rawValue)
+        }
+        guard let fetch = provider.fetchDeferred else {
+            throw StreamError.deferredUnsupported(provider: model.provider)
+        }
+        return fetch(model, handle, options)
     }
-    guard let fetch = provider.fetchDeferred else {
-        throw StreamError.deferredUnsupported(provider: model.provider)
-    }
-    return fetch(model, handle, options)
 }
 
 public func fetchDeferred(model: Model, handle: DeferredHandle, options: DeferredFetchOptions? = nil) async throws -> AssistantMessage {

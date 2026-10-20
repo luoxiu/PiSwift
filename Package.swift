@@ -111,6 +111,7 @@ let package = Package(
         .target(
             name: "PiSwiftAI",
             dependencies: [
+                "PiSwiftTelemetry",
                 .product(name: "OpenAI", package: "OpenAI"),
                 .product(name: "SwiftAnthropic", package: "SwiftAnthropic"),
             ],
@@ -205,7 +206,7 @@ let package = Package(
         ),
         .testTarget(
             name: "PiSwiftAITests",
-            dependencies: ["PiSwiftAI", "TestEnvironmentSupport"],
+            dependencies: ["PiSwiftAI", "PiSwiftTelemetry", "TestEnvironmentSupport"],
             resources: [
                 .process("Resources")
             ],
