@@ -243,7 +243,15 @@ supply other committed views. Use `Submission.wait` for a submission's exact out
 | `JsonlStorage.open(directory:)` | Recoverable JSONL files | Reopen, recovery, conformance, TypeScript replay |
 | Custom `DurableStorage` | Host-defined | Reusable storage conformance cases |
 
-One process must own each storage's files. Use one open storage per file or directory.
+SQLite storage can namespace its tables and indexes when it shares a database file with host
+tables: pass `.init(prefix: "pi_")` to `SqliteStorage.open(path:options:)`. Storage renders the
+prefixed names into its SQL. A prefix must be a SQLite identifier and cannot begin with `sqlite_`.
+An invalid prefix throws before the file is created. Changing the prefix does not migrate existing
+data. The names follow upstream's, so a TypeScript storage with the same prefix uses the same tables.
+
+One process must own each storage's files. Use one open storage per file or directory, or per
+prefix in a shared SQLite file. Two storages that open a new file at the same time can fail with
+`database is locked`, so open one before the others.
 There is no cross-process lock. Keep commits serialized through Session.
 Preparation alone does not reserve a future commit. SQLite uses the Apple SDK library
 and requires SQLite 3.37 or later. The port reads the upstream SQLite schema.
