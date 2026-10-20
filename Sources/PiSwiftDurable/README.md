@@ -4,8 +4,9 @@
 
 PiSwiftDurable ports the library core of `@earendil-works/pi-durable` at
 [v1.1.0](https://github.com/earendil-works/pi/tree/v1.1.0/packages/durable),
-plus the later upstream commits that `FLEET_FORK.md` lists as ported.
-It uses PiSwiftAI for model types and PiSwiftChord for JSON state, observation,
+plus the later upstream commits through `73f8de80b` (2026-10-19) that `FLEET_FORK.md` lists as
+ported; that file also says which ones are not followed or are held back (code mode).
+It uses PiSwiftAI for model types, PiSwiftTelemetry for its spans and metrics, and PiSwiftChord for JSON state, observation,
 bounded output (`OutputBuffer` and `Progress`, upstream's `@earendil-works/chord/output`), and
 the SQLite driver and migration runner (upstream's `@earendil-works/chord/sqlite`).
 The package requires macOS 15 or iOS 18. It uses Swift 6 strict concurrency.

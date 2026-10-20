@@ -7,7 +7,8 @@ PiSwiftTelemetry ports `@earendil-works/pi-telemetry`
 at upstream `482c1381a`, the parent of `48909d987`. Upstream's sources, tests, and README there are
 unchanged since `35f5c265d` (v0.84.0). Later upstream commits that `FLEET_FORK.md` lists as ported
 come on top: propagation, links, and metrics (`48909d987`), and capabilities on every context
-(`2ec55d808`). It has no dependencies. The package
+(`2ec55d808`). Upstream's telemetry store and trace renderer (`d9025a5f5`) are not ported yet. It has
+no dependencies. The package
 requires macOS 15 or iOS 18.
 
 It provides:
