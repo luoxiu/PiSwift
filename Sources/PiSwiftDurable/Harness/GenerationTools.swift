@@ -100,22 +100,37 @@ internal func finishToolRound(runtime: TaskRuntime, assistant: EntryID, tools: [
 }
 
 /// `addTools` of a tool round, applied to `tools` and `modelTools` in place (agent.ts `addTools`), so the next request
-/// offers the tools: an array gets each name it lacks appended, `{ remove }` loses the names, and an unset filter
-/// already lets every tool through, so nothing is written.
+/// offers the tools: an array gets each name it lacks appended, and `{ remove }` loses the names. An unset `tools`
+/// already enables every tool, so nothing is written for it. An unset or object `modelTools` also gets each name
+/// appended to its `add`, which loads deferred tools and has no effect for others. By name, without the registry: a
+/// tool that is not registered now, such as one of an MCP server that is reconnecting, is offered once it is again.
 func addGenerationTools(tx: Transaction, conversationId: ConversationID, added: [String]) async throws {
     let agent = try await tx.doc(AgentDoc, conversationId: conversationId)
-    for field in ["tools", "modelTools"] {
-        guard let filter = try agent.get(field) else { continue }
-        if let values = filter.arrayValue, let draft = try agent.child(field) {
-            var names = values.compactMap(\.stringValue)
-            for name in added where !names.contains(where: { harnessNamesEqual($0, name) }) {
-                try draft.append(.string(name)); names.append(name)
-            }
-        } else if let removed = filter["remove"]?.arrayValue {
+    if let tools = try agent.get("tools") {
+        if let values = tools.arrayValue, let draft = try agent.child("tools") {
+            try appendGenerationToolNames(draft, values, added)
+        } else if let removed = tools["remove"]?.arrayValue {
             let names = removed.compactMap(\.stringValue)
             if names.contains(where: { name in added.contains { harnessNamesEqual($0, name) } }) {
-                try agent.set(field, .object(["remove": .array(names.filter { name in !added.contains { harnessNamesEqual($0, name) } }.map(JSONValue.string))]))
+                try agent.set("tools", .object(["remove": .array(names.filter { name in !added.contains { harnessNamesEqual($0, name) } }.map(JSONValue.string))]))
             }
         }
+    }
+    let modelTools = try agent.get("modelTools")
+    if let values = modelTools?.arrayValue, let draft = try agent.child("modelTools") {
+        try appendGenerationToolNames(draft, values, added)
+        return
+    }
+    // Assigned whole; a document write of an equal value records no change.
+    let edit = loadedModelTools(try modelTools?.decode(ModelToolSelection.self), added)
+    var value = JSONObject()
+    if let remove = edit.remove { value["remove"] = .array(remove.map(JSONValue.string)) }
+    value["add"] = .array(edit.add.map(JSONValue.string))
+    try agent.set("modelTools", .object(value))
+}
+private func appendGenerationToolNames(_ draft: JSONDraft, _ values: [JSONValue], _ added: [String]) throws {
+    var names = values.compactMap(\.stringValue)
+    for name in added where !names.contains(where: { harnessNamesEqual($0, name) }) {
+        try draft.append(.string(name)); names.append(name)
     }
 }

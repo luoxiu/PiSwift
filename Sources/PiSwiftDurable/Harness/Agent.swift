@@ -51,6 +51,32 @@ public enum ToolSelection: Sendable, Equatable, Codable {
     }
     private enum Keys: String, CodingKey { case remove }
 }
+/// Stored names of the tools the model is offered, either an exact offer list or edits to the enabled tools it may call.
+public enum ModelToolSelection: Sendable, Equatable, Codable {
+    /// Offers precisely these names, in order, deferred ones too.
+    case exact([String])
+    /// Offers every enabled tool the model may call except deferred ones and those in `remove`, in registry order,
+    /// followed by the deferred tools in `add` that are not in `remove`, in `add` order.
+    case edit(remove: [String]? = nil, add: [String]? = nil)
+    /// Decodes this value from its durable JSON representation.
+    public init(from decoder: any Decoder) throws {
+        let single = try decoder.singleValueContainer()
+        if let names = try? single.decode([String].self) { self = .exact(names); return }
+        let object = try decoder.container(keyedBy: Keys.self)
+        self = .edit(remove: try object.decodeIfPresent([String].self, forKey: .remove),
+                     add: try object.decodeIfPresent([String].self, forKey: .add))
+    }
+    /// Encodes this value with the durable JSON representation.
+    public func encode(to encoder: any Encoder) throws {
+        switch self {
+        case let .exact(names): var c = encoder.singleValueContainer(); try c.encode(names)
+        case let .edit(remove, add):
+            var c = encoder.container(keyedBy: Keys.self)
+            try c.encodeIfPresent(remove, forKey: .remove); try c.encodeIfPresent(add, forKey: .add)
+        }
+    }
+    private enum Keys: String, CodingKey { case remove, add }
+}
 
 /// The pi.agent document value.
 public struct AgentState: Sendable, Equatable, Codable {
@@ -62,9 +88,14 @@ public struct AgentState: Sendable, Equatable, Codable {
     public var extensions: ExtensionSelection?
     /// Filters the selected extensions' tools: the enabled tools. An exact list enables exactly these, in order.
     public var tools: ToolSelection?
-    /// Filters the enabled tools the model may call (`callers` includes `model`): the tools offered to it. An exact list
-    /// offers exactly these, in order. Never widens: other tools can still call the ones it leaves out.
-    public var modelTools: ToolSelection?
+    /// Filters the enabled tools the model may call (`callers` includes `model`): the tools offered to it. Never widens:
+    /// other tools can still call the ones it leaves out.
+    /// - Unset: every such tool except deferred ones.
+    /// - An exact list: exactly these, in order, deferred ones too.
+    /// - An edit: every such tool except deferred ones and those in `remove`, in registry order, followed by the
+    ///   deferred tools in `add` that are not in `remove`, in `add` order. Names of tools that are not deferred or not
+    ///   registered have no effect in `add`.
+    public var modelTools: ModelToolSelection?
     /// Additional agent or compaction instructions.
     public var instructions: String?
     /// The working directory used by this conversation or command.
@@ -72,7 +103,7 @@ public struct AgentState: Sendable, Equatable, Codable {
     /// Creates stored agent overrides. Absent fields use host defaults.
     public init(model: ModelRef? = nil, thinkingLevel: ModelThinkingLevel? = nil,
                 extensions: ExtensionSelection? = nil, tools: ToolSelection? = nil,
-                modelTools: ToolSelection? = nil, instructions: String? = nil, cwd: String? = nil) {
+                modelTools: ModelToolSelection? = nil, instructions: String? = nil, cwd: String? = nil) {
         self.model = model; self.thinkingLevel = thinkingLevel; self.extensions = extensions
         self.tools = tools; self.modelTools = modelTools; self.instructions = instructions; self.cwd = cwd
     }
@@ -144,6 +175,13 @@ public enum ToolChange: Sendable {
     /// Excludes these names or definitions from the default selection.
     case remove([ToolRegistration])
 }
+/// Replace the offered tool list, or remove tools from it and load deferred ones.
+public enum ModelToolChange: Sendable {
+    /// Offers precisely these tools, in order, deferred ones too.
+    case exact([ToolRegistration])
+    /// Removes these tools from the offer and loads these deferred tools.
+    case edit(remove: [ToolRegistration]? = nil, add: [ToolRegistration]? = nil)
+}
 /// A partial change to stored agent configuration. Clear restores the default for a field.
 public struct AgentChange: Sendable {
     /// Whether to keep, clear, or replace the saved model reference.
@@ -154,8 +192,9 @@ public struct AgentChange: Sendable {
     public var extensions: AgentFieldChange<ExtensionChange>
     /// Whether to keep, clear, or replace the saved filter of enabled tools.
     public var tools: AgentFieldChange<ToolChange>
-    /// Whether to keep, clear, or replace the saved filter of the enabled tools the model is offered.
-    public var modelTools: AgentFieldChange<ToolChange>
+    /// Whether to keep, clear, or replace the saved filter of the enabled tools the model is offered. Replaces the stored
+    /// filter as a whole; tools loaded with `control.addTools` are in its `add`.
+    public var modelTools: AgentFieldChange<ModelToolChange>
     /// Whether to keep, clear, or replace the saved agent instructions.
     public var instructions: AgentFieldChange<String>
     /// Whether to keep, clear, or replace the saved working directory.
@@ -163,7 +202,7 @@ public struct AgentChange: Sendable {
     /// Selects the fields to keep, clear, or replace in stored agent configuration.
     public init(model: AgentFieldChange<ModelRef> = .unchanged, thinkingLevel: AgentFieldChange<ModelThinkingLevel> = .unchanged,
                 extensions: AgentFieldChange<ExtensionChange> = .unchanged, tools: AgentFieldChange<ToolChange> = .unchanged,
-                modelTools: AgentFieldChange<ToolChange> = .unchanged,
+                modelTools: AgentFieldChange<ModelToolChange> = .unchanged,
                 instructions: AgentFieldChange<String> = .unchanged, cwd: AgentFieldChange<String> = .unchanged) {
         self.model = model; self.thinkingLevel = thinkingLevel; self.extensions = extensions
         self.tools = tools; self.modelTools = modelTools; self.instructions = instructions; self.cwd = cwd
@@ -179,37 +218,54 @@ public func applyAgentChange(_ state: inout AgentState, _ change: AgentChange) {
     case .set(.exact(let items)): state.extensions = .exact(items.map(\.name))
     case .set(.edit(let add, let remove)): state.extensions = .edit(add: add?.map(\.name), remove: remove?.map(\.name))
     }
-    applyToolChange(&state.tools, change.tools)
-    applyToolChange(&state.modelTools, change.modelTools)
-    apply(&state.instructions, change.instructions); apply(&state.cwd, change.cwd)
-}
-private func applyToolChange(_ value: inout ToolSelection?, _ change: AgentFieldChange<ToolChange>) {
-    switch change {
+    switch change.tools {
     case .unchanged: break
-    case .clear: value = nil
-    case .set(.exact(let items)): value = .exact(items.map(\.name))
-    case .set(.remove(let items)): value = .remove(items.map(\.name))
+    case .clear: state.tools = nil
+    case .set(.exact(let items)): state.tools = .exact(items.map(\.name))
+    case .set(.remove(let items)): state.tools = .remove(items.map(\.name))
     }
+    switch change.modelTools {
+    case .unchanged: break
+    case .clear: state.modelTools = nil
+    case .set(.exact(let items)): state.modelTools = .exact(items.map(\.name))
+    case .set(.edit(let remove, let add)): state.modelTools = .edit(remove: remove?.map(\.name), add: add?.map(\.name))
+    }
+    apply(&state.instructions, change.instructions); apply(&state.cwd, change.cwd)
 }
 private func apply<Value>(_ value: inout Value?, _ change: AgentFieldChange<Value>) {
     switch change { case .unchanged: break; case .clear: value = nil; case .set(let next): value = next }
 }
 /// `addTools` of a tool round, applied to `tools` and `modelTools`, so the next request offers the tools: an exact list
-/// gets each name it lacks appended, `remove` loses the names, and an unset filter already lets every tool through.
+/// gets each name it lacks appended, and `remove` loses the names. An unset `tools` already enables every tool, so it
+/// stays unset. An unset or edit `modelTools` also gets each name appended to its `add`, which loads deferred tools and
+/// has no effect for others. By name, without the registry: a tool that is not registered now, such as one of an MCP
+/// server that is reconnecting, is offered once it is again.
 public func addAgentTools(_ state: inout AgentState, _ added: [String]) {
-    addToolNames(&state.tools, added)
-    addToolNames(&state.modelTools, added)
-}
-private func addToolNames(_ filter: inout ToolSelection?, _ added: [String]) {
-    switch filter {
+    switch state.tools {
     case nil: break
     case .exact(var names):
         for name in added where !names.contains(where: { harnessNamesEqual($0, name) }) { names.append(name) }
-        filter = .exact(names)
+        state.tools = .exact(names)
     case .remove(let names):
         let removed = names.filter { name in !added.contains { harnessNamesEqual($0, name) } }
-        if removed.count != names.count { filter = .remove(removed) }
+        if removed.count != names.count { state.tools = .remove(removed) }
     }
+    if case .exact(var names) = state.modelTools {
+        for name in added where !names.contains(where: { harnessNamesEqual($0, name) }) { names.append(name) }
+        state.modelTools = .exact(names)
+        return
+    }
+    let edit = loadedModelTools(state.modelTools, added)
+    state.modelTools = .edit(remove: edit.remove, add: edit.add)
+}
+/// An unset or edit `modelTools` after loading `added`: the names leave `remove`, which is dropped once empty, and join
+/// `add`, each once.
+func loadedModelTools(_ filter: ModelToolSelection?, _ added: [String]) -> (remove: [String]?, add: [String]) {
+    var remove: [String] = [], add: [String] = []
+    if case .edit(let removed, let loaded) = filter { remove = removed ?? []; add = loaded ?? [] }
+    remove = remove.filter { name in !added.contains { harnessNamesEqual($0, name) } }
+    for name in added where !add.contains(where: { harnessNamesEqual($0, name) }) { add.append(name) }
+    return (remove.isEmpty ? nil : remove, add)
 }
 
 /// Returns the hooks supplied by the selected extensions for this task.
@@ -258,11 +314,34 @@ public func resolveAgent(state: AgentState? = nil, snapshot: RegistrySnapshot, s
     }
     let enabled = filterTools(tools, state?.tools)
     let callableBy = { (caller: ToolCaller) in { (tool: ToolRegistration) in tool.callers?.contains(caller) ?? true } }
-    let offered = filterTools(enabled.filter(callableBy(.model)), state?.modelTools)
+    let modelCallable = enabled.filter(callableBy(.model))
+    let offered = offeredTools(modelCallable, state?.modelTools)
+    let deferred = modelCallable.filter { tool in
+        tool.deferred == true && !offered.contains { harnessNamesEqual($0.name, tool.name) }
+    }
     let callable = enabled.filter(callableBy(.tools))
     if let instructions = state?.instructions { sections.append(section(instructionsKey) { _, _ in instructions }) }
     return Agent(model: state?.model, thinkingLevel: state?.thinkingLevel ?? .off, extensions: extensions,
-                 tools: offered, callable: callable, sections: sections, instructions: state?.instructions, cwd: state?.cwd)
+                 tools: offered, callable: callable, deferred: deferred, sections: sections,
+                 instructions: state?.instructions, cwd: state?.cwd)
+}
+
+/// The tools offered to the model, as `AgentState.modelTools` describes.
+private func offeredTools(_ tools: [ToolRegistration], _ filter: ModelToolSelection?) -> [ToolRegistration] {
+    var remove: [String] = [], add: [String] = []
+    switch filter {
+    case .exact(let names): return filterTools(tools, .exact(names))
+    case .edit(let removed, let loaded): remove = removed ?? []; add = loaded ?? []
+    case nil: break
+    }
+    let removed = { (name: String) in remove.contains { harnessNamesEqual($0, name) } }
+    let kept = tools.filter { tool in tool.deferred != true && !removed(tool.name) }
+    // Loaded deferred tools follow in load order, so loading one appends to the declared tools.
+    let loaded = uniqueHarnessNames(add).compactMap { name -> ToolRegistration? in
+        guard let tool = tools.first(where: { harnessNamesEqual($0.name, name) }), tool.deferred == true, !removed(name) else { return nil }
+        return tool
+    }
+    return kept + loaded
 }
 
 /// `tools` through a stored filter: an exact list selects exactly its names, in its order; `remove` drops names.

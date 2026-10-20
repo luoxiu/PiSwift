@@ -55,9 +55,9 @@ private func callable(_ root: Conversation) async throws -> [String] { try await
         #expect(probe.received["read"]?.isError == false)
         #expect(probe.received["bash"]?.isError == false)
 
-        try await opened.root.configure(change: .init(modelTools: .set(.remove([bash]))), context: .background)
+        try await opened.root.configure(change: .init(modelTools: .set(.edit(remove: [bash]))), context: .background)
         #expect(try await offered(opened.root) == ["read", "probe"])
-        #expect(try await opened.harness.snapshot(AgentDoc, conversationId: opened.root.id, context: .background)?.modelTools == .remove(["bash"]))
+        #expect(try await opened.harness.snapshot(AgentDoc, conversationId: opened.root.id, context: .background)?.modelTools == .edit(remove: ["bash"]))
         try await opened.root.configure(change: .init(modelTools: .clear), context: .background)
         #expect(try await offered(opened.root) == ["read", "bash", "probe"])
         try await opened.harness.close(context: .background)

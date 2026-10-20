@@ -160,6 +160,15 @@ attempt made.
 `callers` on a tool says who may call it: `.model`, `.tools`, or both by default.
 A conversation's `modelTools` narrows the tools the model is offered. Tools can still
 call the others. `Agent.callable` lists the tools nested calls resolve among.
+
+A tool with `deferred: true` is not offered to the model until it is loaded, though other
+tools can call it any time. `createToolSearchExtension()` adds the `tool_search` tool. It
+ranks `Agent.deferred`, the deferred tools not loaded yet, with BM25 over their names,
+descriptions, and parameter names and descriptions, and loads the matches with
+`control.addTools`. That appends them to the `add` of the conversation's `modelTools`.
+Loaded tools follow the other tools in load order, so a load only appends declarations and
+the cached prefix holds. They stay offered on that branch, also after a compaction. Use it
+for large tool sets, such as an MCP server's.
 A task created with `abandonOnRestart` is aborted with reason `restart`, with its owned
 work, when a later Harness starts scheduling. Such a task waits for a missing definition
 instead of becoming orphaned. `runtime.abortOwned` aborts an owned task and waits for it.
@@ -462,6 +471,10 @@ until a compaction produces a summary. The event snapshot carries it as
   do. `PI_DURABLE_DOCUMENT_RETENTION_MS` replaces the default for the test suite's second run.
 - `InputEntry` holds only `kind` and `data`, so taking those two members of an input's entry is
   its decoding. A queued input's entry is `InboxItem.inputEntry`, stored as upstream's `entry`.
+- `ModelToolSelection` and `ModelToolChange` replace the `modelTools` union: `.exact`, or
+  `.edit(remove:add:)`. `ToolRegistration.deferred` is `Bool?`, set to `true`. The tool search
+  is part of this library rather than upstream's `/tool-search` entry. Its public names match
+  PiSwiftCodingAgent's, so a file that imports both qualifies them with the module name.
 - This library has no CLI or TUI code. PowerShell and Windows process support are outside scope.
 
 Upstream examples 00–31 have Swift integration tests with assertions for the library
