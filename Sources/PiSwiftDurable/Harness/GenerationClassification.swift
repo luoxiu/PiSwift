@@ -24,11 +24,13 @@ func classifyGeneration(_ runtime: TaskRuntime, request: GenerationCheckpoint, m
         return try await startGenerationToolRound(runtime: runtime, request: request, message: message, calls: calls, messages: messages, context: context)
     }
     if [.stop, .length, .toolUse].contains(message.stopReason) { return try await answerGeneration(runtime: runtime, message: message, context: context) }
+    // The retry and compaction policies govern the next attempt, so they are read now rather than pinned at preparation.
     let settings = runtime.settings
     let overflow = message.stopReason == .error && isContextOverflow(message)
-    if overflow && request.compacted == nil && settings.compaction.enabled {
+    let compaction = compactionPolicy(settings, model: try required(request.model, "model"))
+    if overflow && request.compacted == nil && compaction.enabled {
         let view = try await runtime.context(runtime.conversationId, at: request.cutoff, context: context)
-        if generationSelectCut(view: view, keepRecentTokens: settings.compaction.keepRecentTokens) != nil {
+        if generationSelectCut(view: view, keepRecentTokens: compaction.keepRecentTokens) != nil {
             try await runtime.commit({ tx, _ in
                 let live = try await tx.doc(LiveDoc, conversationId: runtime.conversationId)
                 _ = try await appendGenerationAssistant(tx: tx, conversationId: runtime.conversationId, message: message)

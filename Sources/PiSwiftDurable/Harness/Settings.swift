@@ -105,13 +105,18 @@ public struct CompactionPolicy: Sendable, Equatable, Codable {
     public var keepRecentTokens: Int
     /// Token budget reserved for a background compaction.
     public var backgroundTokens: Int
+    /// Per-model overrides of this harness-wide policy, keyed by exact `"provider/modelId"`, as `Settings` carries them.
+    /// The policy resolved for one model has none.
+    public var modelOverrides: [String: CompactionPolicyOverrides]?
     /// Sets concrete token budgets and the automatic compaction switch.
-    public init(enabled: Bool = true, reserveTokens: Int = 16384, keepRecentTokens: Int = 20000, backgroundTokens: Int = 32768) {
+    public init(enabled: Bool = true, reserveTokens: Int = 16384, keepRecentTokens: Int = 20000, backgroundTokens: Int = 32768,
+                modelOverrides: [String: CompactionPolicyOverrides]? = nil) {
         self.enabled = enabled; self.reserveTokens = reserveTokens; self.keepRecentTokens = keepRecentTokens; self.backgroundTokens = backgroundTokens
+        self.modelOverrides = modelOverrides
     }
 }
 /// Optional compaction settings. Absent fields use the harness defaults.
-public struct CompactionPolicyOverrides: Sendable {
+public struct CompactionPolicyOverrides: Sendable, Equatable, Codable {
     /// Whether this policy is active.
     public var enabled: Bool?
     /// Token budget left free for the next model response.
@@ -123,6 +128,26 @@ public struct CompactionPolicyOverrides: Sendable {
     /// Selects optional compaction policy fields to replace their defaults.
     public init(enabled: Bool? = nil, reserveTokens: Int? = nil, keepRecentTokens: Int? = nil, backgroundTokens: Int? = nil) {
         self.enabled = enabled; self.reserveTokens = reserveTokens; self.keepRecentTokens = keepRecentTokens; self.backgroundTokens = backgroundTokens
+    }
+}
+/// Harness-wide compaction settings. `modelOverrides` is keyed by exact `"provider/modelId"`; each field it sets
+/// replaces the harness-wide one for that model, so small- and large-window models can share a harness.
+public struct CompactionSettings: Sendable {
+    /// Whether this policy is active.
+    public var enabled: Bool?
+    /// Token budget left free for the next model response.
+    public var reserveTokens: Int?
+    /// Token budget for recent context retained after compaction.
+    public var keepRecentTokens: Int?
+    /// Token budget reserved for a background compaction.
+    public var backgroundTokens: Int?
+    /// Fields that replace the harness-wide ones for one model, keyed by exact `"provider/modelId"`.
+    public var modelOverrides: [String: CompactionPolicyOverrides]?
+    /// Selects optional compaction policy fields to replace their defaults, and per-model overrides of them.
+    public init(enabled: Bool? = nil, reserveTokens: Int? = nil, keepRecentTokens: Int? = nil, backgroundTokens: Int? = nil,
+                modelOverrides: [String: CompactionPolicyOverrides]? = nil) {
+        self.enabled = enabled; self.reserveTokens = reserveTokens; self.keepRecentTokens = keepRecentTokens; self.backgroundTokens = backgroundTokens
+        self.modelOverrides = modelOverrides
     }
 }
 /// Publication intervals for partial model messages and tool output.
@@ -162,8 +187,8 @@ public struct HarnessSettings: Sendable {
     public var stream: ConversationStreamOptions?
     /// The current scheduled request retry, when present.
     public var retry: RetryPolicyOverrides?
-    /// Host overrides for automatic compaction thresholds.
-    public var compaction: CompactionPolicyOverrides?
+    /// Host overrides for automatic compaction thresholds, harness-wide and per model.
+    public var compaction: CompactionSettings?
     /// Host overrides for message and output publication intervals.
     public var progress: ProgressPolicyOverrides?
     /// The default policy for parallel or sequential tool calls.
@@ -180,7 +205,7 @@ public struct HarnessSettings: Sendable {
     public var documentRetentionMs: DocumentRetention?
     /// Selects host defaults and optional request, compaction, and queue policies.
     public init(extensions: [Extension]? = nil, stream: ConversationStreamOptions? = nil,
-                retry: RetryPolicyOverrides? = nil, compaction: CompactionPolicyOverrides? = nil,
+                retry: RetryPolicyOverrides? = nil, compaction: CompactionSettings? = nil,
                 progress: ProgressPolicyOverrides? = nil, toolExecution: ToolExecutionMode? = nil,
                 steeringMode: QueueMode? = nil, followUpMode: QueueMode? = nil, contextRetentionMs: Int64? = nil,
                 documentRetentionMs: DocumentRetention? = nil) {
@@ -209,7 +234,7 @@ public struct Settings: Sendable {
     public var stream: ConversationStreamOptions
     /// The retry policy after host overrides and defaults are resolved.
     public var retry: ConversationRetryPolicy
-    /// The compaction policy after host overrides and defaults are resolved.
+    /// Harness-wide policy over the defaults; per-model overrides apply where the model is known.
     public var compaction: CompactionPolicy
     /// The publication policy after host overrides and defaults are resolved.
     public var progress: ProgressPolicy
@@ -232,7 +257,8 @@ public func resolveSettings(_ settings: HarnessSettings? = nil) -> Settings {
         retry: .init(enabled: retry?.enabled ?? true, maxRetries: retry?.maxRetries ?? 3,
                      baseDelayMs: retry?.baseDelayMs ?? 2000, maxAgentDelayMs: retry?.maxAgentDelayMs ?? 60000),
         compaction: .init(enabled: compact?.enabled ?? true, reserveTokens: compact?.reserveTokens ?? 16384,
-                         keepRecentTokens: compact?.keepRecentTokens ?? 20000, backgroundTokens: compact?.backgroundTokens ?? 32768),
+                         keepRecentTokens: compact?.keepRecentTokens ?? 20000, backgroundTokens: compact?.backgroundTokens ?? 32768,
+                         modelOverrides: compact?.modelOverrides),
         progress: .init(partialIntervalMs: settings?.progress?.partialIntervalMs ?? 100,
                         outputIntervalMs: settings?.progress?.outputIntervalMs ?? 100),
         toolExecution: settings?.toolExecution ?? .parallel,

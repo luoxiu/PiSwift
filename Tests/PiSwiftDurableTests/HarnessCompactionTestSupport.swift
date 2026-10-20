@@ -75,8 +75,9 @@ func compactionOpen(policy: CompactionPolicy = compactionManualPolicy, contextWi
 func compactionText(_ label: String, _ tokens: Int) -> String {
     label + " " + String(repeating: "x", count: max(0, tokens * 4 - label.count - 1))
 }
-func compactionOverrides(_ policy: CompactionPolicy) -> CompactionPolicyOverrides {
-    .init(enabled: policy.enabled, reserveTokens: policy.reserveTokens, keepRecentTokens: policy.keepRecentTokens, backgroundTokens: policy.backgroundTokens)
+func compactionOverrides(_ policy: CompactionPolicy) -> CompactionSettings {
+    .init(enabled: policy.enabled, reserveTokens: policy.reserveTokens, keepRecentTokens: policy.keepRecentTokens, backgroundTokens: policy.backgroundTokens,
+          modelOverrides: policy.modelOverrides)
 }
 func compactionFailure(_ message: String) -> AssistantMessage { chatAssistant("", reason: .error, error: message) }
 func compactionTurn(_ chat: CompactionChat, _ user: String, _ reply: String) async throws {

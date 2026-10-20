@@ -9,8 +9,7 @@ let compactionBackgroundPolicy = CompactionPolicy(enabled: true, reserveTokens: 
 let compactionBlockingPolicy = CompactionPolicy(enabled: true, reserveTokens: 300, keepRecentTokens: 150, backgroundTokens: 0)
 let compactionOverflowText = "prompt is too long: 250000 tokens > 200000 maximum"
 func compactionSetPolicy(_ chat: CompactionChat, _ policy: CompactionPolicy) {
-    chat.setup.updateSettings { $0.compaction = .init(enabled: policy.enabled, reserveTokens: policy.reserveTokens,
-        keepRecentTokens: policy.keepRecentTokens, backgroundTokens: policy.backgroundTokens) }
+    chat.setup.updateSettings { $0.compaction = compactionOverrides(policy) }
 }
 func compactionTasks(_ chat: CompactionChat) async throws -> [TaskRecord] {
     try await chat.harness.inspect(context: .background).tasks.map(\.record).filter { $0.kind == "pi.compaction" }

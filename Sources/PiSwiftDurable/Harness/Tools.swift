@@ -6,7 +6,7 @@ import PiSwiftChord
 public struct ToolControl: Sendable, Equatable, Codable {
     /// Tool names to add to the conversation offer policy.
     public var addTools: [String]?
-    /// Whether the tool requests the current run to end.
+    /// End the run without another model request when every result of the round sets it to `true`; `false` is a no-op.
     public var terminate: Bool?
     /// Optional text passed to the next agent or conversation boundary.
     public var handoff: String?

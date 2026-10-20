@@ -243,6 +243,16 @@ struct HarnessToolTests {
         #expect(tasks.items.allSatisfy { $0.state.status == "terminal" })
         try await opened.harness.close(context: .background)
     }
+    // :678 (#10858).
+    @Test func falseTerminateDoesNotEndRun() async throws {
+        let setup = HarnessChatSetup()
+        try installHarnessTool(harnessTestTool("keep", execute: { _, _, _ in .init(output: [], control: .init(terminate: false)) }), setup: setup)
+        setup.models.setResponses([.message(try toolCalls([("keep", [:], "c1")])), .message(chatAssistant("done"))])
+        let opened = try await openChat(setup: setup)
+        #expect(try await opened.root.submit(.input(content: .text("go")), context: .background).wait(context: .background).status == "done")
+        #expect(try await allEntries(opened.root).last?.kind == assistantEntry.kind)
+        try await opened.harness.close(context: .background)
+    }
     // :1035,1066.
     @Test func replacementKeepsCallAndRefreshesNextRequest() async throws {
         let setup = HarnessChatSetup(), started = HarnessChatSignal(), release = HarnessChatSignal(), versions = Mutex<[String]>([])

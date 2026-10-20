@@ -109,7 +109,7 @@ public let generationTask = TaskDefinition<GenerationInput, GenerationCheckpoint
 public func createGeneration(tx: Transaction, conversationId: ConversationID) async throws -> TaskID {
     try await tx.createTask(generationTask, input: GenerationInput(), options: .init(ownership: .conversation(), conversationId: conversationId))
 }
-private func required<Value>(_ value: Value?, _ key: String) throws -> Value {
+func required<Value>(_ value: Value?, _ key: String) throws -> Value {
     guard let value else { throw TaskDefinitionError("Generation checkpoint is missing \(key)") }; return value
 }
 private func runGeneration(_ checkpoint: GenerationCheckpoint, _ runtime: TaskRuntime, _ context: ChordContext) async throws {
@@ -184,7 +184,7 @@ private func prepareGeneration(_ checkpoint: GenerationCheckpoint, _ runtime: Ta
     let desired = try await renderSections(agent.sections, input: input, shown: shown,
                                           report: { runtime.scheduler.report($0) }, context: context)
     let entries = try planSystemEntries(view: view, desired: desired, registrations: agent.tools, timestamp: runtime.now())
-    let threshold = checkpoint.compacted == nil ? try generationThresholdCompaction(view: view, planned: entries, contextWindow: model.contextWindow, policy: settings.compaction) : nil
+    let threshold = checkpoint.compacted == nil ? try generationThresholdCompaction(view: view, planned: entries, contextWindow: model.contextWindow, policy: compactionPolicy(settings, model: ref)) : nil
     if threshold == .blocking {
         try await runtime.commit({ tx, _ in
             let child = try await createGenerationCompaction(tx: tx, conversationId: runtime.conversationId, reason: .threshold, owner: runtime.taskId)

@@ -32,6 +32,12 @@ by default, `0` right after use, `.forever` never. Set it in `HarnessSettings`, 
 Harness reads at each use, or in `Session.open`. The next access loads it from storage.
 A watch or document state keeps the incarnation it observes until that incarnation retires.
 
+`HarnessSettings.compaction` sets the compaction thresholds. Fixed token counts rarely suit a 32k
+and a 1M context window alike, so `modelOverrides` sets them per model, keyed by exact
+`"provider/modelId"`. Each field an entry sets replaces the harness-wide one for that model.
+The conversation's current model picks the entry at the threshold check, after a context
+overflow, and when a compaction selects what to summarize.
+
 Changes go to storage before observers receive them. A transcript normally contains
 `pi.user`, a positional `pi.system` entry, and `pi.assistant`. Tool rounds also add
 `pi.tool-result`. Built-in documents include `pi.agent`, `pi.provider`, `pi.live`,
@@ -435,7 +441,8 @@ repeated `requestId` finds a submission that was already admitted.
 
 An invalid read fails only that call. Storages throw `StorageRequestError` for a bad
 cursor, an unknown conversation, or history a document does not keep. A read whose caller
-cancelled it also fails only itself. User code fails only its unit: a task phase faults
+cancelled it also fails only itself. The exemption covers reads only: any error from `commit` or
+`mintId`, `StorageRequestError` included, ends the Harness as above. User code fails only its unit: a task phase faults
 its task, a tool gets an error result, and a hook is reported and skipped. A throwing
 commit or close listener is reported, and the other listeners still run. A throw in the
 Harness's own bookkeeping, such as a scheduler commit, fails the Harness.
@@ -512,6 +519,9 @@ until a compaction produces a summary. The event snapshot carries it as
 - `ShellOutputSkip` is a type alias of PiSwiftChord's `OutputSkip`, where upstream declares the same shape
   twice. `Progress` takes a `ProgressClock`, which `DurableClock` refines, so a Harness clock paces it.
   A file that also imports Foundation names it `PiSwiftChord.Progress`.
+- `CompactionSettings` repeats `CompactionPolicyOverrides`' four fields and adds `modelOverrides`, where upstream
+  intersects the types. The resolved `CompactionPolicy` in `Settings` carries `modelOverrides` too, and the policy
+  resolved for one model has none.
 - This library has no CLI or TUI code. PowerShell and Windows process support are outside scope.
 
 Upstream examples 00–31 have Swift integration tests with assertions for the library

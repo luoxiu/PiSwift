@@ -22,7 +22,7 @@ public func harnessSettings(from settingsManager: SettingsManager) -> HarnessSet
                 baseDelayMs: retry.baseDelayMs.map { Int64($0) },
                 maxAgentDelayMs: retry.maxAgentDelayMs.map { Int64($0) }
             ),
-            compaction: CompactionPolicyOverrides(
+            compaction: CompactionSettings(
                 enabled: compaction.enabled,
                 reserveTokens: compaction.reserveTokens,
                 keepRecentTokens: compaction.keepRecentTokens,
