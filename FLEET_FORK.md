@@ -104,3 +104,8 @@
 - Session 在自己的状态锁里调宿主 `setTimer` 武装文档清理计时器（`f44707e7f` 起就在锁里排清理），宿主 `setTimer` 对后台计时器抛错时，
   `onReport` 也在这把锁里被调；宿主若在 `onReport` 里同步调 `Harness.resume()` 之类要读 Session 状态的方法，会死锁。上游单线程没有这个问题。
   改法是把武装挪到锁外（调度器的两个计时器已经是先占位、锁外武装、再认领）。默认计时器和 `TestClock` 都不抛错，Bear Days 不受影响。
+- PiSwiftAI 的 `onPayload` 只能查看请求（`PayloadSnapshot.swift` 的 `emitPayload`），上游 pi-ai 的 `onPayload` 可以返回一份替换的
+  payload（`packages/ai/src/types.ts:178`；每个 provider 都是 `const nextParams = await options?.onPayload?.(params, model)`）。
+  对齐要让每个 provider 发出 handler 返回的 JSON，而不是 SDK 编码出的请求；Bear Days 目前用 PiSwiftAI 可注入的 HTTP client 绕开。
+- `LocalExecutionShellTests`「abort, timeout, and cleanup stop descendants」在上一批的一次全量并行跑里失败过一次（单独跑 3 次都过）；
+  不是已知的「idle grace period」那条偶发，没有排查。
