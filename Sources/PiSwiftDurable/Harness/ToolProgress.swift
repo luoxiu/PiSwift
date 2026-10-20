@@ -96,7 +96,7 @@ internal final class ToolReporter: Sendable {
         let reported = ToolReported(limits); self.reported = reported
         let writer = ToolProgressWriter(runtime: runtime, reported: reported, publishes: publishes, context: context)
         let progress = Progress(write: { try await writer.write() }, onError: { error in
-            if !runtime.signal.aborted { runtime.scheduler.report(error) }
+            if !runtime.signal.aborted { runtime.reportTask(error) }
         }, minIntervalMs: runtime.settings.progress.outputIntervalMs, clock: RuntimeProgressClock(runtime: runtime))
         let stream = AsyncStream<Event>.makeStream()
         events = stream.continuation

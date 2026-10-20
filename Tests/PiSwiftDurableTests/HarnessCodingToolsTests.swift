@@ -10,7 +10,7 @@ func codingChat(storage: any DurableStorage = MemoryStorage(), setup: HarnessCha
     let harness = try await Harness.open(storage: storage, options: .init(models: setup.models,
         registry: setup.registry, settings: setup.settingsProvider,
         env: { target, _ in LocalExecutionEnv(cwd: target.cwd ?? directory) },
-        onReport: { setup.reports.append($0) }), context: .background)
+        onReport: { setup.reports.append($0, info: $1) }), context: .background)
     let root = try await harness.root(options: .init(agent: .init(
         model: .set(.init(provider: "faux", modelId: "faux-1")), cwd: .set(directory))), context: .background)
     if resume { try harness.resume() }

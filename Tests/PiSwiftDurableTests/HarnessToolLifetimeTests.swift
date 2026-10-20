@@ -97,7 +97,7 @@ struct HarnessToolLifetimeTests {
         try installHarnessTool(harnessTestTool(), setup: setup)
         setup.models.setResponses([.message(try toolCalls([("echo", [:], "c1")])), .message(chatAssistant("done"))])
         let harness = try await Harness.open(storage: MemoryStorage(), options: .init(models: setup.models, registry: setup.registry,
-            env: { _, _ in throw TaskDefinitionError("no sandbox") }, onReport: { setup.reports.append($0) }), context: .background)
+            env: { _, _ in throw TaskDefinitionError("no sandbox") }, onReport: { setup.reports.append($0, info: $1) }), context: .background)
         let root = try await harness.root(options: .init(agent: .init(model: .set(.init(provider: "faux", modelId: "faux-1")))), context: .background)
         #expect(try await root.submit(.input(content: .text("go")), context: .background).wait(context: .background).status == "done")
         let result = try #require(harnessToolResults(await allEntries(root)).first)

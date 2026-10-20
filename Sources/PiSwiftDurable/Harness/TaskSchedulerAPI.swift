@@ -31,6 +31,45 @@ extension TaskScheduler {
         }
         return marked.0
     }
+    /// Run a task parked by the restart limit again: clears its restart count and enables scheduling. Does nothing for a
+    /// task that is not parked; throws for an unknown one.
+    func retry(id: TaskID, context: ChordContext) async throws {
+        try await session.commit({ tx in
+            guard let current = try await tx.task(id) else { throw SessionError.message("Task \(id.rawValue) does not exist") }
+            if current.state.status == "terminal" || current.restarts == nil { return }
+            try tx.setTask(current.progressed())
+        }, context: context)
+        resume()
+    }
+    /// Why a live task cannot run here, if it cannot: its definition (missing, too old, failed migration) or the restart
+    /// limit. A running task, an abort-marked one, and one holding its outcome are never blocked.
+    func blockedReason(_ record: TaskRecord) -> TaskBlockedReason? {
+        let status = record.state.status
+        if status == "running" || status == "completing" || status == "terminal" || record.abortRequested { return nil }
+        if record.parked(restartLimit()) { return .restartLimit }
+        let definition = registry.snapshot().task(name: record.kind)
+        let fit = fit(record, definition: definition)
+        if let reason = fit.reason { return TaskBlockedReason(rawValue: reason) }
+        return fit.migrates && definition?.migrate == nil ? .migrationFailed : nil
+    }
+    /// Call `listener` when blocked reasons may have changed without a commit: a registry change or a failed migration.
+    func subscribeBlocked(_ listener: @escaping @Sendable () -> Void) -> @Sendable () -> Void {
+        let id = UUID()
+        state.withLock { $0.blockedListeners[id] = listener }
+        return { [weak self] in _ = self?.state.withLock { $0.blockedListeners.removeValue(forKey: id) } }
+    }
+    func notifyBlocked() {
+        for listener in state.withLock({ Array($0.blockedListeners.values) }) { listener() }
+    }
+    /// `settings.restartLimit`.
+    func restartLimit() -> Double { settings().restartLimit }
+    /// The report info of a failure of a task.
+    func taskInfo(taskId: TaskID, kind: String, conversationId: ConversationID, faulted: Bool? = nil) -> ReportInfo {
+        ReportInfo(source: .task, taskId: taskId, taskKind: kind, conversationId: conversationId, faulted: faulted)
+    }
+    func taskInfo(_ invocation: TaskInvocation, faulted: Bool? = nil) -> ReportInfo {
+        taskInfo(taskId: invocation.taskId, kind: invocation.kind, conversationId: invocation.conversationId, faulted: faulted)
+    }
     func waitForTask(id: TaskID, context: ChordContext) async throws -> SettledTask {
         let promise: HarnessPromise<SettledTask> = try await session.readOnLine {
             if closing { throw closedError(session) }
@@ -94,6 +133,7 @@ extension TaskScheduler {
                 let on = state.withLock { $0.waitingOn(record) }
                 if !on.isEmpty { derived = .waiting(on: on) }
                 else if record.notDue(now()), case .sleeping(_, let until, _) = record.state { derived = .sleeping(until: until) }
+                else if record.parked(restartLimit()) { derived = .blocked(reason: .restartLimit) }
                 else {
                     let definition = snapshot.task(name: record.kind), fit = fit(record, definition: definition)
                     if let reason = fit.reason { derived = .blocked(reason: TaskBlockedReason(rawValue: reason)!, error: fit.error) }
@@ -138,8 +178,9 @@ extension TaskScheduler {
             guard outcome.status != "faulted", outcome.status != "orphaned" else {
                 throw SessionError.message("Only the scheduler can commit \(outcome.status) outcomes")
             }
-            try await terminate(tx, record: current, outcome: outcome)
-        case .running, .waiting, .sleeping: try tx.setTask(current.replacing(state: next))
+            try await terminate(tx, record: current.progressed(), outcome: outcome)
+        // A state the task committed is progress: its restart count starts over.
+        case .running, .waiting, .sleeping: try tx.setTask(current.progressed().replacing(state: next))
         default: throw SessionError.message("A task handler can commit only running, waiting, sleeping, or terminal state")
         }
     }

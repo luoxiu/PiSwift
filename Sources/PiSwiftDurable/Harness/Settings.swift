@@ -178,6 +178,24 @@ public let defaultRetryPolicy = ConversationRetryPolicy()
 public let defaultCompactionPolicy = CompactionPolicy()
 /// The default progress policy used when the host supplies no override.
 public let defaultProgressPolicy = ProgressPolicy()
+/// Default `settings.restartLimit`.
+public let defaultRestartLimit: Double = 5
+
+/// A restart limit as given when it is a number of restarts, `1` or more (`.infinity` never parks); else the default.
+private func restartLimit(_ limit: Double?) -> Double {
+    guard let limit, limit >= 1 else { return defaultRestartLimit }
+    return limit
+}
+
+/// What a failed run does with the inputs queued behind it (`HarnessSettings.afterFailedRun`).
+public enum AfterFailedRun: String, Sendable {
+    /// Leave them queued until the next input or queued write.
+    case keep
+    /// Start the next run with them, as an answer would.
+    case `continue`
+    /// Settle them `unanswered` with reason `run_failed`.
+    case withdraw
+}
 
 /// Optional host settings. Unspecified fields use the default policies.
 public struct HarnessSettings: Sendable {
@@ -203,16 +221,26 @@ public struct HarnessSettings: Sendable {
     /// the next access loads it from Storage. Observed documents always stay. Default ten minutes; `0` drops one right
     /// after use; `.forever` keeps them. A negative count means the default.
     public var documentRetentionMs: DocumentRetention?
+    /// What a run that fails (`model_error`, `no_model`) does with the inputs queued behind it: `keep` leaves them
+    /// queued until the next input or queued write, `continue` starts the next run with them, as an answer would, and
+    /// `withdraw` settles them `unanswered` with reason `run_failed`. Default `keep`.
+    public var afterFailedRun: AfterFailedRun?
+    /// How many times in a row a task may be cut off by a crash or close without changing its state before it is parked
+    /// as blocked (`restart_limit`) instead of run again; `Harness.retryTask()` runs it again. Default 5;
+    /// `.infinity` never parks. Anything below 1 means the default.
+    public var restartLimit: Double?
     /// Selects host defaults and optional request, compaction, and queue policies.
     public init(extensions: [Extension]? = nil, stream: ConversationStreamOptions? = nil,
                 retry: RetryPolicyOverrides? = nil, compaction: CompactionSettings? = nil,
                 progress: ProgressPolicyOverrides? = nil, toolExecution: ToolExecutionMode? = nil,
                 steeringMode: QueueMode? = nil, followUpMode: QueueMode? = nil, contextRetentionMs: Int64? = nil,
-                documentRetentionMs: DocumentRetention? = nil) {
+                documentRetentionMs: DocumentRetention? = nil, afterFailedRun: AfterFailedRun? = nil,
+                restartLimit: Double? = nil) {
         self.extensions = extensions; self.stream = stream; self.retry = retry; self.compaction = compaction
         self.progress = progress; self.toolExecution = toolExecution; self.steeringMode = steeringMode
         self.followUpMode = followUpMode; self.contextRetentionMs = contextRetentionMs
-        self.documentRetentionMs = documentRetentionMs
+        self.documentRetentionMs = documentRetentionMs; self.afterFailedRun = afterFailedRun
+        self.restartLimit = restartLimit
     }
 }
 
@@ -248,6 +276,10 @@ public struct Settings: Sendable {
     public var contextRetentionMs: Int64
     /// How long a loaded document nothing observes stays in memory after its last use.
     public var documentRetentionMs: DocumentRetention
+    /// What a failed run does with the inputs queued behind it.
+    public var afterFailedRun: AfterFailedRun
+    /// Restarts in a row without progress after which a task is parked; `.infinity` never parks.
+    public var restartLimit: Double
 }
 /// Fills unspecified retry, compaction, and progress fields with their defaults.
 public func resolveSettings(_ settings: HarnessSettings? = nil) -> Settings {
@@ -264,5 +296,7 @@ public func resolveSettings(_ settings: HarnessSettings? = nil) -> Settings {
         toolExecution: settings?.toolExecution ?? .parallel,
         steeringMode: settings?.steeringMode ?? .oneAtATime, followUpMode: settings?.followUpMode ?? .oneAtATime,
         contextRetentionMs: settings?.contextRetentionMs ?? 600000,
-        documentRetentionMs: documentRetention(settings?.documentRetentionMs))
+        documentRetentionMs: documentRetention(settings?.documentRetentionMs),
+        afterFailedRun: settings?.afterFailedRun ?? .keep,
+        restartLimit: restartLimit(settings?.restartLimit))
 }

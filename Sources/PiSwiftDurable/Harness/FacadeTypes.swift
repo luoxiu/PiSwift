@@ -9,14 +9,17 @@ public enum SchedulingState: String, Sendable {
     /// The harness is cancelling work and releasing its resources.
     case closing
 }
-/// The definition or migration failure that prevents a task from running.
-public enum TaskBlockedReason: String, Sendable {
+/// Why a task cannot be reserved: no registered definition can take it, or it was cut off `restartLimit` times in a row.
+/// Derived from the registry, the settings, and the record's `restarts`.
+public enum TaskBlockedReason: String, Sendable, Codable {
     /// No installed definition matches the saved task kind.
     case missingTask = "missing_task"
     /// The saved task cannot migrate to the installed definition version.
     case taskTooOld = "task_too_old"
     /// The installed task migration threw an error.
     case migrationFailed = "migration_failed"
+    /// A crash or close cut the task off `settings.restartLimit` times in a row; `Harness.retryTask()` runs it again.
+    case restartLimit = "restart_limit"
 }
 /// The task definition state selected during harness inspection.
 public enum TaskInspectionState: Sendable {
@@ -30,7 +33,8 @@ public enum TaskInspectionState: Sendable {
     case sleeping(until: Int64)
     /// An outcome is saved while ordinary owned work finishes.
     case completing
-    /// The task cannot run until its definition problem is resolved.
+    /// Cannot run here: no registered definition can take it (aborting it settles it as `orphaned`), or it is parked by
+    /// the restart limit (`retryTask()` runs it again).
     case blocked(reason: TaskBlockedReason, error: (any Error)? = nil)
 }
 /// A task record and the reason it is runnable or blocked.
@@ -151,16 +155,17 @@ public struct HarnessOptions: Sendable {
     public var onWake: (@Sendable (Wake) throws -> Void)?
     /// Runs inside the transaction that creates a conversation.
     public var conversationCreated: (@Sendable (Transaction, ConversationRecord) async throws -> Void)?
-    /// Receives failures that do not fail the calling operation, such as a throwing hook or listener, and the error that
-    /// fails the Session, once.
-    public var onReport: (@Sendable (any Error) -> Void)?
+    /// Receives failures that do not fail the calling operation, such as a throwing hook or listener, a task that faulted,
+    /// and the error that fails the Session, once. `info` says where it came from: a host can tell a failed Session
+    /// (`source: .session`, often a platform reset) from a faulted task (`source: .task`, `faulted`).
+    public var onReport: (@Sendable (any Error, ReportInfo) -> Void)?
     /// Supplies host model, registry, clock, timer, settings, and environment services.
     public init(models: any DurableModels, registry: any RegistryReader,
                 settings: HarnessSettingsProvider? = nil, env: HarnessEnvFactory? = nil,
                 now: (@Sendable () -> Int64)? = nil, setTimer: SetTimer? = nil,
                 onWake: (@Sendable (Wake) throws -> Void)? = nil,
                 conversationCreated: (@Sendable (Transaction, ConversationRecord) async throws -> Void)? = nil,
-                onReport: (@Sendable (any Error) -> Void)? = nil) {
+                onReport: (@Sendable (any Error, ReportInfo) -> Void)? = nil) {
         self.init(models: { models }, registry: registry, settings: settings, env: env, now: now, setTimer: setTimer,
                   onWake: onWake, conversationCreated: conversationCreated, onReport: onReport)
     }
@@ -170,7 +175,7 @@ public struct HarnessOptions: Sendable {
                 now: (@Sendable () -> Int64)? = nil, setTimer: SetTimer? = nil,
                 onWake: (@Sendable (Wake) throws -> Void)? = nil,
                 conversationCreated: (@Sendable (Transaction, ConversationRecord) async throws -> Void)? = nil,
-                onReport: (@Sendable (any Error) -> Void)? = nil) {
+                onReport: (@Sendable (any Error, ReportInfo) -> Void)? = nil) {
         self.currentModels = models; self.registry = registry; self.settings = settings; self.env = env
         self.now = now; self.setTimer = setTimer; self.onWake = onWake
         self.conversationCreated = conversationCreated; self.onReport = onReport

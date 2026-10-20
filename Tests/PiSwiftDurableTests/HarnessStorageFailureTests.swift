@@ -356,7 +356,7 @@ private func reported(_ reports: HarnessReports) -> [String] { reports.values.ma
         try registry.install(Extension(name: "tasks", tasks: [AnyTaskDefinition(stubborn)]))
         let box = Mutex<Harness?>(nil), reentered = Mutex<Task<Void, any Error>?>(nil)
         let harness = try await Harness.open(storage: storage, options: .init(models: FakeDurableModels(), registry: registry,
-            onReport: { _ in
+            onReport: { _, _ in
                 reentered.withLock { task in
                     if task == nil, let harness = box.withLock({ $0 }) { task = Task { try await harness.waitForIdle(context: .background) } }
                 }

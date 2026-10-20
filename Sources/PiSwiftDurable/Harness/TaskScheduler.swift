@@ -8,6 +8,7 @@ internal struct InvocationBinding: Sendable {
 }
 internal final class TaskInvocation: Sendable {
     let taskId: TaskID
+    let kind: String
     let conversationId: ConversationID
     let abort: Bool
     let controller = AbortController()
@@ -22,7 +23,7 @@ internal final class TaskInvocation: Sendable {
     }
     let state = Mutex(State())
     init(_ record: TaskRecord, abort: Bool, context: ChordContext) {
-        taskId = record.id; conversationId = record.conversationId; self.abort = abort
+        taskId = record.id; kind = record.kind; conversationId = record.conversationId; self.abort = abort
         self.context = context.withoutAbortSignal().withAbortSignal(controller.signal)
     }
     func check() throws {
@@ -69,7 +70,7 @@ internal final class TaskScheduler: Sendable {
     let resolveAgent: @Sendable (ConversationID, RegistrySnapshot, ChordContext) async throws -> Agent
     let env: @Sendable (ConversationID, ChordContext) async throws -> (any ExecutionEnv)?
     let conversation: @Sendable (ConversationID, InvocationBinding, ChordContext) async throws -> ConversationHandle?
-    let report: @Sendable (any Error) -> Void
+    let report: @Sendable (any Error, ReportInfo) -> Void
     let context: ChordContext
     let settleOutcome: @Sendable (Transaction, TaskRecord, TaskOutcome) async throws -> Void
     let withdrawInputs: @Sendable (Transaction, ConversationID) async throws -> Void
@@ -137,6 +138,7 @@ internal final class TaskScheduler: Sendable {
         /// A wake delivery is running; `wakeDirty` asks it for one more round.
         var wakeScheduled = false
         var wakeDirty = false
+        var blockedListeners: [UUID: @Sendable () -> Void] = [:]
     }
     let state = Mutex(State())
     let taskWaiters = Waiters<TaskID, SettledTask>()
@@ -147,7 +149,7 @@ internal final class TaskScheduler: Sendable {
          agent: @escaping @Sendable (ConversationID, RegistrySnapshot, ChordContext) async throws -> Agent,
          env: @escaping @Sendable (ConversationID, ChordContext) async throws -> (any ExecutionEnv)?,
          conversation: @escaping @Sendable (ConversationID, InvocationBinding, ChordContext) async throws -> ConversationHandle?,
-         report: @escaping @Sendable (any Error) -> Void, context: ChordContext,
+         report: @escaping @Sendable (any Error, ReportInfo) -> Void, context: ChordContext,
          settleOutcome: @escaping @Sendable (Transaction, TaskRecord, TaskOutcome) async throws -> Void = { _, _, _ in },
          withdrawInputs: @escaping @Sendable (Transaction, ConversationID) async throws -> Void = { _, _ in }) {
         self.session = session; storage = session.storage; self.registry = registry; currentModels = models
@@ -158,11 +160,18 @@ internal final class TaskScheduler: Sendable {
     var closing: Bool { state.withLock { $0.closing } }
     func records() -> [TaskRecord] { state.withLock { state in state.ordered(state.live.keys).compactMap { state.live[$0] } } }
     func current(_ id: TaskID) -> TaskRecord? { state.withLock { $0.live[id] } }
+    /// Load live tasks and change surviving `running` tasks back to `pending`, counting the restart. Dispatches nothing. A
+    /// task that reaches the restart limit this way is parked and reported.
     func open(context: ChordContext) async throws {
         let commits = try session.observeCommits { [weak self] publication, _ in self?.observe(publication) }
         let close = try session.subscribeClose { [weak self] in self?.seal() }
-        let unsubscribe = registry.subscribe { [weak self] in self?.kick() }
+        let unsubscribe = registry.subscribe { [weak self] in
+            self?.notifyBlocked()
+            self?.kick()
+        }
         state.withLock { $0.subscriptions = [commits, close]; $0.unsubscribe = unsubscribe }
+        let limit = restartLimit()
+        var parked: [TaskRecord] = []
         try await session.commit({ tx in
             var found: [TaskRecord] = []
             for status in [TaskStatus.pending, .running, .waiting, .sleeping, .completing] {
@@ -177,9 +186,18 @@ internal final class TaskScheduler: Sendable {
                 }
             }
             for record in found {
-                if case .running(let checkpoint, _) = record.state { try tx.setTask(record.replacing(state: .pending(checkpoint: checkpoint))) }
+                if case .running(let checkpoint, _) = record.state {
+                    let restarts = (record.restarts ?? 0) + 1
+                    try tx.setTask(record.replacing(state: .pending(checkpoint: checkpoint)).withRestarts(restarts))
+                    if Double(restarts) >= limit && !record.abortRequested { parked.append(record) }
+                }
             }
         }, context: context)
+        for record in parked {
+            let restarts = (record.restarts ?? 0) + 1
+            let error = SessionError.message("Task \(record.id.rawValue) (\(record.kind)) was cut off \(restarts) times without progress; it is parked until retryTask()")
+            report(error, taskInfo(taskId: record.id, kind: record.kind, conversationId: record.conversationId))
+        }
         state.withLock { $0.cascadePending = true }
         scheduleReconcile()
         scheduleWake()
@@ -498,6 +516,7 @@ internal final class TaskScheduler: Sendable {
     private func reserve() async throws -> [Reservation] {
         var reservations: [Reservation] = []
         var abandoned: [TaskID] = []
+        let limit = restartLimit()
         do {
             try await session.commit({ tx in
                 guard !closing else { return }
@@ -520,7 +539,9 @@ internal final class TaskScheduler: Sendable {
                               state.waitingOn(record, first: true).isEmpty,
                               // It returns at the first pass after its time comes, which the timer, `resume()`, or any
                               // change starts.
-                              !record.notDue(now) else { state.runnable.remove(taskId); return nil }
+                              !record.notDue(now),
+                              // It returns when `retry()` clears its restart count.
+                              !record.parked(limit) else { state.runnable.remove(taskId); return nil }
                         return record
                     }
                     guard let original = candidate else { continue }
@@ -540,7 +561,10 @@ internal final class TaskScheduler: Sendable {
                             let next = try migrate(record.input, record.state.checkpoint!, record.version)
                             record = record.replacing(input: next.input, version: definition.version, state: .running(checkpoint: next.checkpoint))
                         } catch {
-                            state.withLock { $0.failedMigrations[record.id] = (definition.identity, error) }; report(error)
+                            state.withLock { $0.failedMigrations[record.id] = (definition.identity, error) }
+                            // Blocked now without a commit: the graph must hear it.
+                            notifyBlocked()
+                            report(error, taskInfo(taskId: record.id, kind: record.kind, conversationId: record.conversationId))
                             resolution = ("migration_failed", error, false)
                         }
                     }
@@ -605,18 +629,23 @@ internal final class TaskScheduler: Sendable {
     }
     enum Decision { case proceed, end, fault(any Error) }
     private func step(_ invocation: TaskInvocation, decide: (Transaction, TaskRecord) throws -> Decision) async -> TaskRecord? {
+        var fault: (any Error)?
         do {
-            return try await session.commit({ tx in
+            let continued: TaskRecord? = try await session.commit({ tx in
                 guard let current = current(invocation.taskId), current.state.status == "running", !closing else { end(invocation); return nil }
                 switch try decide(tx, current) {
                 case .proceed: return current
                 case .end: end(invocation); return nil
                 case .fault(let error):
                     end(invocation)
+                    fault = error
                     try await terminate(tx, record: current, outcome: .faulted(error: .init(message: String(describing: error))))
                     return nil
                 }
             }, context: context)
+            // Reported once the fault is durable: a host may count it, for example toward a breaker.
+            if let fault { report(fault, taskInfo(invocation, faulted: true)) }
+            return continued
         } catch {
             // The step writes the scheduler's own decision, a fault or a terminal record; a throw there would otherwise
             // leave the task running, to be reserved and run again.
@@ -661,7 +690,10 @@ internal final class TaskScheduler: Sendable {
                         else { if state.reportedMissing { return false }; state.reported = nil; state.reportedMissing = true }
                         return true
                     }
-                    if shouldReport { report(TaskHandoverError(taskId: current.id, kind: current.kind, cause: next == nil ? .missingTask : .incompatibleTask)) }
+                    if shouldReport {
+                        report(TaskHandoverError(taskId: current.id, kind: current.kind, cause: next == nil ? .missingTask : .incompatibleTask),
+                               taskInfo(taskId: current.id, kind: current.kind, conversationId: current.conversationId))
+                    }
                 }
                 return .proceed
             }
@@ -690,6 +722,11 @@ internal extension TaskRecord {
         guard case .sleeping(_, let until, _) = state else { return false }
         return !abortRequested && until > now
     }
+    /// A task cut off `limit` times in a row; an abort mark still runs its abort handler.
+    func parked(_ limit: Double) -> Bool {
+        guard let restarts else { return false }
+        return !abortRequested && Double(restarts) >= limit
+    }
     var failedOutcome: Bool { state.outcome.map { $0.status != "completed" } ?? false }
     func replacing(input: JSONValue? = nil, version: Double? = nil, state: TaskState? = nil,
                    abortRequested: Bool? = nil, memos: JSONObject? = nil) -> TaskRecord {
@@ -697,7 +734,7 @@ internal extension TaskRecord {
         return TaskRecord(id: id, conversationId: conversationId, kind: kind, version: version ?? self.version,
                           input: input ?? self.input, state: next, owner: owner, background: background,
                           abortRequested: abortRequested ?? self.abortRequested, abortReason: abortReason,
-                          abandonOnRestart: abandonOnRestart, startedAt: startedAt, endedAt: endedAt,
+                          abandonOnRestart: abandonOnRestart, startedAt: startedAt, endedAt: endedAt, restarts: restarts,
                           memos: next.outcome == nil ? (memos ?? self.memos) : nil, extensionFields: extensionFields)
     }
     /// The record with an abort mark: `restart` for an abandonment; without a reason, a request, which replaces
@@ -705,9 +742,18 @@ internal extension TaskRecord {
     func withAbortMark(_ reason: TaskAbortReason? = nil) -> TaskRecord {
         TaskRecord(id: id, conversationId: conversationId, kind: kind, version: version, input: input, state: state,
                    owner: owner, background: background, abortRequested: true, abortReason: reason,
-                   abandonOnRestart: abandonOnRestart, startedAt: startedAt, endedAt: endedAt, memos: memos,
-                   extensionFields: extensionFields)
+                   abandonOnRestart: abandonOnRestart, startedAt: startedAt, endedAt: endedAt, restarts: restarts,
+                   memos: memos, extensionFields: extensionFields)
     }
+    /// The record with `restarts` as its restart count; nil removes it.
+    func withRestarts(_ restarts: Int?) -> TaskRecord {
+        TaskRecord(id: id, conversationId: conversationId, kind: kind, version: version, input: input, state: state,
+                   owner: owner, background: background, abortRequested: abortRequested, abortReason: abortReason,
+                   abandonOnRestart: abandonOnRestart, startedAt: startedAt, endedAt: endedAt, restarts: restarts,
+                   memos: memos, extensionFields: extensionFields)
+    }
+    /// The record without its restart count, as after a state the task committed.
+    func progressed() -> TaskRecord { restarts == nil ? self : withRestarts(nil) }
 }
 internal func jsonStructurallyEqual(_ lhs: JSONValue, _ rhs: JSONValue) -> Bool {
     switch (lhs, rhs) {

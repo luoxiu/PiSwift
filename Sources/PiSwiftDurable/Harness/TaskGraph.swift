@@ -73,12 +73,16 @@ public struct TaskGraphNode: Sendable, Equatable, Codable {
     public let abortRequested: Bool
     /// The task status and join or terminal outcome represented by this node.
     public let state: TaskGraphState
+    /// Why it cannot run here, when it cannot: no registered definition takes it (`missingTask`, `taskTooOld`,
+    /// `migrationFailed`), or the restart limit parked it (`restartLimit`). Follows registry changes.
+    public let blocked: TaskBlockedReason?
     /// Conversations owned by the task, in ID order.
     public let conversations: [ConversationID]
 
-    fileprivate init(record: TaskRecord, conversations: [ConversationID]) {
+    fileprivate init(record: TaskRecord, conversations: [ConversationID], blocked: TaskBlockedReason?) {
         id = record.id; kind = record.kind; conversationId = record.conversationId
         owner = record.owner; background = record.background; abortRequested = record.abortRequested
+        self.blocked = blocked
         self.conversations = conversations
         func phase(_ checkpoint: JSONValue) -> String { checkpoint.objectValue?["phase"]?.stringValue ?? "" }
         switch record.state {
@@ -89,18 +93,21 @@ public struct TaskGraphNode: Sendable, Equatable, Codable {
         case .completing(let outcome, _), .terminal(let outcome, _): state = .completing(outcome: outcome.status)
         }
     }
-    private init(node: Self, conversations: [ConversationID]) {
+    private init(node: Self, conversations: [ConversationID], blocked: TaskBlockedReason?) {
         id = node.id; kind = node.kind; conversationId = node.conversationId; owner = node.owner
         background = node.background; abortRequested = node.abortRequested; state = node.state
+        self.blocked = blocked
         self.conversations = conversations
     }
-    fileprivate func owning(_ conversations: [ConversationID]) -> Self { Self(node: self, conversations: conversations) }
+    fileprivate func owning(_ conversations: [ConversationID]) -> Self { Self(node: self, conversations: conversations, blocked: blocked) }
+    fileprivate func blocking(_ blocked: TaskBlockedReason?) -> Self { Self(node: self, conversations: conversations, blocked: blocked) }
     fileprivate var json: JSONValue {
         var object: JSONObject = ["id": .number(Double(id.rawValue)), "kind": .string(kind),
             "conversationId": .number(Double(conversationId.rawValue)), "background": .bool(background),
             "abortRequested": .bool(abortRequested), "state": state.json,
             "conversations": .array(conversations.map { .number(Double($0.rawValue)) })]
         if let owner { object["owner"] = .number(Double(owner.rawValue)) }
+        if let blocked { object["blocked"] = .string(blocked.rawValue) }
         return .object(object)
     }
 }
@@ -136,9 +143,20 @@ private enum TaskGraphObserver: Sendable {
     }
 }
 private final class TaskGraphMount: Sendable {
-    struct State { var value: TaskGraph; var observers: [ObjectIdentifier: TaskGraphObserver] = [:] }
+    struct State {
+        var value: TaskGraph
+        var observers: [ObjectIdentifier: TaskGraphObserver] = [:]
+        /// The live records behind the nodes, so a registry change can derive their blocked reasons again.
+        var records: [String: TaskRecord]
+    }
     let storage: Mutex<State>
-    init(_ value: TaskGraph) { storage = Mutex(State(value: value)) }
+    init(_ value: TaskGraph, records: [String: TaskRecord]) { storage = Mutex(State(value: value, records: records)) }
+}
+
+/// What the graph asks the scheduler: a record's blocked reason, and when reasons may change without a commit.
+internal struct TaskGraphBlocking: Sendable {
+    let blocked: @Sendable (TaskRecord) -> TaskBlockedReason?
+    let subscribeBlocked: @Sendable (@escaping @Sendable () -> Void) -> @Sendable () -> Void
 }
 
 /// Build on the Session line for the first observer. Release with the last observer.
@@ -148,11 +166,13 @@ internal final class TaskGraphView: Sendable {
     private let subscriptions = Mutex<[SessionSubscription]>([])
     private let session: Session
     private let storage: any DurableStorage
+    private let blocking: TaskGraphBlocking
 
-    init(session: Session, storage: any DurableStorage) throws {
-        self.session = session; self.storage = storage
+    init(session: Session, storage: any DurableStorage, blocking: TaskGraphBlocking) throws {
+        self.session = session; self.storage = storage; self.blocking = blocking
         let commits = try session.observeCommits { [weak self] publication, context in self?.advance(publication, context) }
         subscriptions.withLock { $0.append(commits) }
+        _ = blocking.subscribeBlocked { [weak self] in self?.refreshBlocked() }
         do {
             let close = try session.subscribeClose { [weak self] in self?.close() }
             subscriptions.withLock { $0.append(close) }
@@ -167,7 +187,7 @@ internal final class TaskGraphView: Sendable {
                 return (source, .state(source))
             }
             do {
-                let attached = try replicatedState(source, onError: { [session] in session.hooks.report($0) })
+                let attached = try replicatedState(source, onError: { [session] in session.report($0) })
                 do { try context.abortSignal?.throwIfAborted() }
                 catch { attached.dispose(); throw error }
                 return attached
@@ -178,7 +198,7 @@ internal final class TaskGraphView: Sendable {
         let watch = try await session.readOnLine {
             try await attach(context: context) { value, release in
                 let watch = TaskGraphWatch(value: value, replacement: { $0.json }, detach: release,
-                                           report: { [session] in session.hooks.report($0) })
+                                           report: { [session] in session.report($0) })
                 return (watch, .watch(watch))
             }
         }
@@ -196,7 +216,7 @@ internal final class TaskGraphView: Sendable {
         let existing = state.withLock { $0.mount }
         let candidate: TaskGraphMount
         if let existing { candidate = existing }
-        else { candidate = TaskGraphMount(try await build(context)) }
+        else { let built = try await build(context); candidate = TaskGraphMount(built.value, records: built.records) }
         return try state.withLock { state in
             guard !state.closed else { throw closedError(session) }
             try context.abortSignal?.throwIfAborted()
@@ -231,20 +251,58 @@ internal final class TaskGraphView: Sendable {
         let failure = session.failure
         for observer in observers { observer.close(failure: failure) }
     }
-    private func build(_ context: ChordContext) async throws -> TaskGraph {
+    /// On the Session line: derive every node's blocked reason again, and publish the ones that changed.
+    private func refreshBlocked() {
+        guard state.withLock({ $0.mount != nil && !$0.closed }) else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            // Rejected only once the Session is closing or failed.
+            _ = try? await session.readOnLine {
+                guard let mount = state.withLock({ $0.mount }) else { return }
+                // Derived outside the mount's lock: the scheduler reads its own state. The line orders this with `advance`.
+                let records = mount.storage.withLock { $0.records }
+                let reasons = records.mapValues { blocking.blocked($0) }
+                let frame = mount.storage.withLock { state -> (TaskGraph, [Delta.Op], [TaskGraphObserver])? in
+                    var tasks = state.value.tasks
+                    var ops: [Delta.Op] = []
+                    for key in records.keys.sorted() {
+                        guard let node = tasks[key], let blocked = reasons[key], blocked != node.blocked else { continue }
+                        tasks[key] = node.blocking(blocked)
+                        ops.append(blocked.map { .set(["tasks", .key(key), "blocked"], .string($0.rawValue)) }
+                                   ?? .delete(["tasks", .key(key), "blocked"]))
+                    }
+                    guard !ops.isEmpty else { return nil }
+                    let value = TaskGraph(tasks: tasks)
+                    state.value = value
+                    return (value, ops, Array(state.observers.values))
+                }
+                guard let (value, ops, observers) = frame else { return }
+                for observer in observers { observer.advance(value, ops, .background) }
+            }
+        }
+    }
+    private func build(_ context: ChordContext) async throws -> (value: TaskGraph, records: [String: TaskRecord]) {
         var records: [TaskRecord] = []
         for status in [TaskStatus.pending, .running, .waiting, .sleeping, .completing] {
             records += try await scanAll { try await storage.scanTasks(.init(status: status), limit: 256, cursor: $0, context: context) }
         }
         var tasks: [String: TaskGraphNode] = [:]
+        var live: [String: TaskRecord] = [:]
         for record in records.sorted(by: { $0.id < $1.id }) {
             let owned = try await scanAll { try await storage.scanConversations(.init(ownerTaskId: record.id), limit: 256, cursor: $0, context: context) }
-            tasks[String(record.id.rawValue)] = TaskGraphNode(record: record, conversations: owned.map(\.id).sorted())
+            tasks[String(record.id.rawValue)] = TaskGraphNode(record: record, conversations: owned.map(\.id).sorted(),
+                                                              blocked: blocking.blocked(record))
+            live[String(record.id.rawValue)] = record
         }
-        return TaskGraph(tasks: tasks)
+        return (TaskGraph(tasks: tasks), live)
     }
     private func advance(_ publication: CommitPublication, _ context: ChordContext) {
         guard let mount = state.withLock({ $0.mount }) else { return }
+        // Derived outside the mount's lock: the scheduler reads its own state.
+        var reasons: [TaskID: TaskBlockedReason?] = [:]
+        for change in publication.changes {
+            if case .task(let record) = change, record.state.status != "terminal" { reasons[record.id] = blocking.blocked(record) }
+        }
         let frame = mount.storage.withLock { state -> (TaskGraph, [Delta.Op], [TaskGraphObserver])? in
             var tasks = state.value.tasks
             var ops: [Delta.Op] = []
@@ -252,9 +310,12 @@ internal final class TaskGraphView: Sendable {
                 guard case .task(let record) = change else { continue }
                 let key = String(record.id.rawValue)
                 if record.state.status == "terminal" {
+                    state.records.removeValue(forKey: key)
                     if tasks.removeValue(forKey: key) != nil { ops.append(.delete(["tasks", .key(key)])) }
                 } else {
-                    let next = TaskGraphNode(record: record, conversations: tasks[key]?.conversations ?? [])
+                    state.records[key] = record
+                    let next = TaskGraphNode(record: record, conversations: tasks[key]?.conversations ?? [],
+                                             blocked: reasons[record.id] ?? nil)
                     if next != tasks[key] { tasks[key] = next; ops.append(.set(["tasks", .key(key)], next.json)) }
                 }
             }

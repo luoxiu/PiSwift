@@ -67,7 +67,7 @@ extension Session {
             let revision = ObservationRevision(version: loaded.valueVersion, value: loaded.tracker.value.objectValue!)
             let subscriptions = ObservationSubscriptions()
             let watch = CommittedWatch<Value?>(value: value, replacement: { _ in revision.tree }, detach: { subscriptions.release() },
-                                               report: { [hooks] in hooks.report($0) })
+                                               report: { [hooks] in hooks.report($0, info: .listener) })
             do {
                 try attachObservation(loaded, revision: revision, subscriptions: subscriptions,
                     advance: { change, ops, context in
@@ -115,7 +115,7 @@ extension Session {
                             source.advance(value: value, ops: ops, context: context, retired: change.value == nil)
                         } catch { source.closeSession() }
                     }, close: { source.closeSession() })
-                let state = try replicatedState(source, onError: { [hooks] in hooks.report($0) })
+                let state = try replicatedState(source, onError: { [hooks] in hooks.report($0, info: .listener) })
                 do { try context.abortSignal?.throwIfAborted() }
                 catch { state.dispose(); throw error }
                 return state

@@ -183,7 +183,7 @@ private func expectRuntimeEnded<Value>(_ operation: () async throws -> Value) as
         }
         let registry = Registry(); try registry.install(Extension(name: "task", tasks: [AnyTaskDefinition(definition)]))
         let harness = try await Harness.open(storage: MemoryStorage(), options: .init(models: FakeDurableModels(), registry: registry,
-            now: { 1234 }, onReport: { reports.append(String(describing: $0)) }), context: .background)
+            now: { 1234 }, onReport: { error, _ in reports.append(String(describing: error)) }), context: .background)
         let root = try await harness.root(context: .background)
         for count in [1, 2] {
             try await root.commit({ tx in

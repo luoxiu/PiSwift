@@ -549,12 +549,15 @@ public struct TaskRecord: Sendable, Equatable, Codable {
     public let startedAt: Double?
     /// The time at which task execution ended, in milliseconds.
     public let endedAt: Double?
+    /// How many times in a row a crash or close cut the task off while it ran, without the task changing its state since
+    /// (open counts them). At `HarnessSettings.restartLimit` the task is parked as blocked until `Harness.retryTask()`.
+    public let restarts: Int?
     /// The durable task memos used to avoid repeated effects.
     public let memos: JSONObject?
     /// Unknown JSON members retained by upstream record copies.
     public let extensionFields: JSONObject
     /// Creates a complete stored task record, including ownership and execution state.
-    public init(id: TaskID, conversationId: ConversationID, kind: String, version: Double, input: JSONValue, state: TaskState, owner: TaskID? = nil, background: Bool = false, abortRequested: Bool = false, abortReason: TaskAbortReason? = nil, abandonOnRestart: Bool = false, startedAt: Double? = nil, endedAt: Double? = nil, memos: JSONObject? = nil, extensionFields: JSONObject = [:]) {
+    public init(id: TaskID, conversationId: ConversationID, kind: String, version: Double, input: JSONValue, state: TaskState, owner: TaskID? = nil, background: Bool = false, abortRequested: Bool = false, abortReason: TaskAbortReason? = nil, abandonOnRestart: Bool = false, startedAt: Double? = nil, endedAt: Double? = nil, restarts: Int? = nil, memos: JSONObject? = nil, extensionFields: JSONObject = [:]) {
         self.id = id
         self.conversationId = conversationId
         self.kind = kind
@@ -568,6 +571,7 @@ public struct TaskRecord: Sendable, Equatable, Codable {
         self.abandonOnRestart = abandonOnRestart
         self.startedAt = startedAt
         self.endedAt = endedAt
+        self.restarts = restarts
         self.memos = memos
         self.extensionFields = extensionFields
     }
@@ -587,9 +591,10 @@ public struct TaskRecord: Sendable, Equatable, Codable {
         abandonOnRestart = try recordOptional(object, "abandonOnRestart", as: Bool.self) ?? false
         startedAt = try recordOptional(object, "startedAt")
         endedAt = try recordOptional(object, "endedAt")
+        restarts = try recordOptional(object, "restarts")
         memos = try recordOptional(object, "memos")
         if state.status == "completing" || state.status == "terminal" { try recordForbid(object, ["memos"]) }
-        extensionFields = recordExtensions(object, excluding: ["id", "conversationId", "kind", "version", "input", "state", "owner", "background", "abortRequested", "abortReason", "abandonOnRestart", "startedAt", "endedAt", "memos"])
+        extensionFields = recordExtensions(object, excluding: ["id", "conversationId", "kind", "version", "input", "state", "owner", "background", "abortRequested", "abortReason", "abandonOnRestart", "startedAt", "endedAt", "restarts", "memos"])
     }
     /// Encodes this value with the durable JSON representation.
     public func encode(to encoder: any Encoder) throws {
@@ -610,6 +615,7 @@ public struct TaskRecord: Sendable, Equatable, Codable {
         if abandonOnRestart { object["abandonOnRestart"] = .bool(true) }
         try recordSetOptional(&object, "startedAt", startedAt)
         try recordSetOptional(&object, "endedAt", endedAt)
+        try recordSetOptional(&object, "restarts", restarts)
         try recordSetOptional(&object, "memos", memos)
         try object.encode(to: encoder)
     }

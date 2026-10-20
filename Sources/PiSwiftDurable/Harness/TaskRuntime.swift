@@ -15,7 +15,12 @@ public struct HookRunner: Sendable {
             for registration in agentHooks(agent, taskName: runtime.taskKind) {
                 guard let handlers = registration.handlers(as: type) else { continue }
                 do { try await invoke(handlers) }
-                catch { if runtime.signal.aborted || context.abortSignal?.aborted == true { throw error }; runtime.scheduler.report(error) }
+                catch {
+                    if runtime.signal.aborted || context.abortSignal?.aborted == true { throw error }
+                    let info = runtime.scheduler.taskInfo(runtime.invocation)
+                    runtime.scheduler.report(error, ReportInfo(source: .extension, taskId: info.taskId, taskKind: info.taskKind,
+                                                               conversationId: info.conversationId))
+                }
             }
         }
     }
@@ -48,8 +53,10 @@ public final class TaskRuntime: Sendable {
     internal var taskKind: String { phase.state.withLock { $0.definition.name } }
     /// Returns the clock time in milliseconds.
     public func now() throws -> Int64 { try invocation.check(); return scheduler.now() }
-    /// Sends a nonfatal handler error to the host report callback.
-    public func report(_ error: any Error) throws { try invocation.check(); scheduler.report(error) }
+    /// Forward a non-fatal failure to `HarnessOptions.onReport`, with this task in its info.
+    public func report(_ error: any Error) throws { try invocation.check(); reportTask(error) }
+    /// `report()` without the invocation check, for work that ends with it, such as a progress commit.
+    internal func reportTask(_ error: any Error) { scheduler.report(error, scheduler.taskInfo(invocation)) }
     /// Commits state only while this invocation still owns the task. Inside the callback read only through `tx`:
     /// `snapshot`, `documentState`, `watchDoc`, `getTask`, and the other Session and runtime reads may queue on the line
     /// the callback holds, and then never return.

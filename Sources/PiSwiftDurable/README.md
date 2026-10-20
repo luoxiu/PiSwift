@@ -185,6 +185,9 @@ request, and arms a recovery heartbeat while work runs, never later than the ear
     guard wake.active else { return wake.at }
     return min(now + 60_000, wake.at ?? .max)
 }
+// A fallback before anything can throw: a process whose open or recovery fails is started again.
+let fallback = clock() + 60_000
+if alarm.current.map({ $0 > fallback }) ?? true { alarm.arm(at: fallback) }
 // A throw is reported, and the wake is offered again at the next change.
 let options = HarnessOptions(models: models, registry: registry,
     onWake: { wake in alarm.arm(at: alarmTime(wake, now: clock())) })
@@ -202,6 +205,34 @@ alarm.arm(at: alarmTime(Wake(active: true, at: try harness.wake().at), now: cloc
 let root = try await harness.root(context: context)
 _ = try await root.submit(.input(content: .text("Hello")), context: context)
 ```
+
+## When Work Keeps Failing
+
+Work that deterministically crashes its process, by exhausting memory or CPU before its next checkpoint,
+would otherwise be resumed and crash again forever. Open counts each task a crash or close cut off
+(`TaskRecord.restarts`); a state the task commits itself (a new checkpoint, a wait, a sleep, an outcome)
+starts the count over, and memos and document writes do not. Once the count reaches
+`settings.restartLimit` (default 5; `.infinity` never parks), the task is parked: `inspect()` and the task
+graph show it as blocked with reason `restartLimit`, `wake()` does not count it as active, and `onReport`
+gets it once, at the open that parks it. `harness.retryTask(id:context:)` removes the count and runs it
+again, and does nothing for a task that is not parked; `abortTask()` still runs its abort handler.
+
+Every report says where it came from: `onReport(error, info)` gets `info.source`, which is `.session` for
+the error that failed the Harness (a Storage error, often a platform reset), `.task` for a task that faulted
+(`faulted: true`), reported a failure, failed to migrate, or was parked, with `taskId`, `taskKind`, and
+`conversationId`, `.extension` for hooks and wrappers, and `.listener`, `.host`, `.timer`, or `.wake` for the
+rest. A host acts on reports outside the scheduler, and can feed task faults of one kind to its own breaker.
+
+A run that fails with a model error (`model_error` or `no_model`) leaves the inputs queued behind it waiting
+until the next input arrives. `settings.afterFailedRun` changes that, in the commit that settles the run's
+own inputs: `.continue` applies the final boundary, so the next run starts with them, as after an answer,
+and `.withdraw` settles them `unanswered` with reason `run_failed`, keeping queued writes. A run whose task
+is aborted, faults, or is orphaned keeps its inbox.
+
+Tasks blocked on a missing or unmigratable definition show their reason in the task graph too
+(`TaskGraphNode.blocked`), which follows registry changes and failed migrations, and a registry change that
+unblocks them makes `onWake` report the Session active, so a host need not poll them. A blocked task is not
+active in `wake()`: only a registry change, or `retryTask()` for a parked one, can let it run.
 
 ## Extensions and Tools
 
@@ -618,6 +649,10 @@ until a compaction produces a summary. The event snapshot carries it as
 - `CompactionSettings` repeats `CompactionPolicyOverrides`' four fields and adds `modelOverrides`, where upstream
   intersects the types. The resolved `CompactionPolicy` in `Settings` carries `modelOverrides` too, and the policy
   resolved for one model has none.
+- `onReport` takes `(error, ReportInfo)`, so a closure written for one argument becomes `{ error, _ in }`,
+  where upstream's JavaScript still calls one. `ReportInfo.faulted` is a `Bool?` set to `true`.
+  `TaskBlockedReason` serves both `inspect()` and `TaskGraphNode.blocked`. `restartLimit` is a `Double`, so
+  `.infinity` never parks. Errors carry no `cause`, so a parked task's report says so in its text and its info.
 - This library has no CLI or TUI code. PowerShell and Windows process support are outside scope.
 
 Upstream examples 00–31 have Swift integration tests with assertions for the library

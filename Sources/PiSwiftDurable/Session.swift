@@ -8,8 +8,9 @@ public protocol SessionHooks: Sendable {
     func conversationCreated(_ tx: Transaction, record: ConversationRecord) async throws
     /// Runs before the session releases its storage.
     func beforeClose() async
-    /// Receives the Session's failure, once, and errors of listeners, which never fail what ran them.
-    func report(_ error: any Error)
+    /// Receives the Session's failure, once, and errors of listeners, which never fail what ran them; `info` says where
+    /// each came from.
+    func report(_ error: any Error, info: ReportInfo)
 }
 public extension SessionHooks {
     /// Performs no initialization unless the application supplies an override.
@@ -17,7 +18,7 @@ public extension SessionHooks {
     /// Performs no action unless the application supplies an override.
     func beforeClose() async {}
     /// A plain Session drops reports.
-    func report(_ error: any Error) {}
+    func report(_ error: any Error, info: ReportInfo) {}
 }
 /// Session hooks that perform no application initialization.
 public struct DefaultSessionHooks: SessionHooks {
@@ -76,7 +77,7 @@ public final class Session: Sendable {
         let guarded = GuardedStorage(storage)
         self.guarded = guarded; self.storage = guarded; self.now = now; self.hooks = hooks
         self.documentRetentionSetting = documentRetention
-        timers = hostTimers(setTimer, report: { [hooks] error in hooks.report(error) })
+        timers = hostTimers(setTimer, report: { [hooks] error in hooks.report(error, info: ReportInfo(source: .timer)) })
         guarded.onFailure { [weak self] error in self?.failed(error) }
     }
     /// Creates a session over the supplied storage without reading persisted records. `now` is the wall clock for task
@@ -111,8 +112,11 @@ public final class Session: Sendable {
         // Seal first, so a report handler that calls back finds the Session failed. Closing runs the close listeners
         // synchronously; a failing backend close is the caller's to see, and here nobody waits.
         beginClose(cleanup: .background)
-        hooks.report(error)
+        report(error, info: ReportInfo(source: .session))
     }
+    /// Internal: the Session's failure, and errors of listeners, which never fail what ran them; `info` defaults to a
+    /// listener. A plain Session drops them.
+    internal func report(_ error: any Error, info: ReportInfo = .listener) { hooks.report(error, info: info) }
     /// Run `work`, ending the wait with `SessionFailed` the moment the Session fails; the work runs on.
     internal func untilFailed<T: Sendable>(_ work: @escaping @Sendable () async throws -> T) async throws -> T {
         let promise = HarnessPromise<T>(), id = UUID()
@@ -203,7 +207,7 @@ public final class Session: Sendable {
             do { try listener.call(publication, context) } catch { fail(error) }
         }
         for listener in listeners {
-            do { try listener.call(publication, context) } catch { hooks.report(error) }
+            do { try listener.call(publication, context) } catch { report(error) }
         }
         sweepDocuments()
         return result
@@ -274,7 +278,7 @@ public final class Session: Sendable {
                 do { try await self.storage.close(context: cleanup) }
                 catch {
                     // A Storage that cannot close is a failed one; an earlier failure stays the cause.
-                    if self.guarded.recordFailure(error) { self.hooks.report(error) }
+                    if self.guarded.recordFailure(error) { self.report(error, info: ReportInfo(source: .session)) }
                     throw error
                 }
             }
@@ -284,7 +288,7 @@ public final class Session: Sendable {
             return (task, listeners)
         }
         for listener in listeners {
-            do { try listener.call() } catch { hooks.report(error) }
+            do { try listener.call() } catch { report(error) }
         }
         begin.grant()
         return task

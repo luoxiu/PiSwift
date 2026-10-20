@@ -7,12 +7,12 @@ private struct WeakHarness: Sendable { weak var value: Harness? }
 private final class HarnessSessionHooks: SessionHooks {
     let scheduler = Mutex<TaskScheduler?>(nil)
     let app: (@Sendable (Transaction, ConversationRecord) async throws -> Void)?
-    let onReport: @Sendable (any Error) -> Void
-    init(app: (@Sendable (Transaction, ConversationRecord) async throws -> Void)?, onReport: @escaping @Sendable (any Error) -> Void) {
+    let onReport: @Sendable (any Error, ReportInfo) -> Void
+    init(app: (@Sendable (Transaction, ConversationRecord) async throws -> Void)?, onReport: @escaping @Sendable (any Error, ReportInfo) -> Void) {
         self.app = app; self.onReport = onReport
     }
     /// The Session's failure, once, and listener errors go to `onReport`, the last place an error goes.
-    func report(_ error: any Error) { onReport(error) }
+    func report(_ error: any Error, info: ReportInfo) { onReport(error, info) }
     func conversationCreated(_ tx: Transaction, record: ConversationRecord) async throws {
         _ = try await tx.doc(LiveDoc, conversationId: record.id)
         _ = try await tx.doc(InboxDoc, conversationId: record.id)
@@ -41,7 +41,8 @@ public final class Harness: Sendable {
                  tasks: TaskScheduler, submissions: Submissions) throws {
         self.session = session; self.storage = storage; self.options = options; self.tasks = tasks; self.submissions = submissions
         self.views = try ConversationViews(session: session, storage: storage)
-        self.graph = try TaskGraphView(session: session, storage: storage)
+        self.graph = try TaskGraphView(session: session, storage: storage, blocking: TaskGraphBlocking(
+            blocked: { [tasks] in tasks.blockedReason($0) }, subscribeBlocked: { [tasks] in tasks.subscribeBlocked($0) }))
     }
     /// Opens the session and restores runnable task state with scheduling paused.
     public static func open(storage rawStorage: any DurableStorage, options: HarnessOptions,
@@ -51,7 +52,7 @@ public final class Harness: Sendable {
             let snapshot = options.registry.snapshot()
             let missing = ["pi.generation", "pi.tool", "pi.compaction"].filter { snapshot.task(name: $0) == nil }
             if !missing.isEmpty { throw HarnessOpenError.missingBuiltins(missing) }
-            let report: @Sendable (any Error) -> Void = options.onReport ?? { _ in }
+            let report: @Sendable (any Error, ReportInfo) -> Void = options.onReport ?? { _, _ in }
             let hooks = HarnessSessionHooks(app: options.conversationCreated, onReport: report)
             let now = options.now ?? { Int64(Date().timeIntervalSince1970 * 1000) }
             // Read at each use, as all settings are, but only this field: it is read on every commit.
@@ -62,10 +63,12 @@ public final class Harness: Sendable {
             let settings: @Sendable () -> Settings = { options.settings?.resolve() ?? resolveSettings() }
             let reference = Mutex(WeakHarness())
             let scheduler = TaskScheduler(session: session, registry: options.registry, models: options.currentModels,
-                now: now, onWake: options.onWake, timers: hostTimers(options.setTimer, report: report), settings: settings,
+                now: now, onWake: options.onWake, timers: hostTimers(options.setTimer, report: { report($0, ReportInfo(source: .timer)) }),
+                settings: settings,
                 agent: { id, snapshot, callContext in
                     let state = try await session.snapshot(AgentDoc, conversationId: id, context: callContext)
-                    return resolveAgent(state: state, snapshot: snapshot, settings: settings(), report: report)
+                    return resolveAgent(state: state, snapshot: snapshot, settings: settings(),
+                                        report: { report($0, ReportInfo(source: .extension, conversationId: id)) })
                 }, env: { id, callContext in
                     guard let build = options.env else { return nil }
                     let cwd = try await session.snapshot(AgentDoc, conversationId: id, context: callContext)?.cwd
@@ -193,6 +196,13 @@ public final class Harness: Sendable {
             try assertOpen(); return try await tasks.abort(id: id, context: context)
         }
     }
+    /// Run a task parked by `settings.restartLimit` again: clears its restart count and enables scheduling. Does nothing
+    /// for a task that is not parked; throws for an unknown one.
+    public func retryTask(id: TaskID, context: ChordContext) async throws {
+        try await withTaskCancellationContext(context) { context in
+            try assertOpen(); try await tasks.retry(id: id, context: context)
+        }
+    }
     /// Waits for a terminal task outcome and returns its durable receipt.
     public func waitForTask(id: TaskID, context: ChordContext) async throws -> SettledTask {
         try await withTaskCancellationContext(context) { context in
@@ -226,7 +236,9 @@ public final class Harness: Sendable {
     internal func resolveConversationAgent(id: ConversationID, context: ChordContext) async throws -> Agent {
         try assertOpen(); try context.abortSignal?.throwIfAborted()
         let value = try await session.snapshot(AgentDoc, conversationId: id, context: context)
-        return resolveAgent(state: value, snapshot: options.registry.snapshot(), settings: options.settings?.resolve() ?? resolveSettings(), report: options.onReport ?? { _ in })
+        let report = options.onReport ?? { _, _ in }
+        return resolveAgent(state: value, snapshot: options.registry.snapshot(), settings: options.settings?.resolve() ?? resolveSettings(),
+                            report: { report($0, ReportInfo(source: .extension, conversationId: id)) })
     }
 }
 /// The harness cannot use the supplied registry to load its built-in tasks.

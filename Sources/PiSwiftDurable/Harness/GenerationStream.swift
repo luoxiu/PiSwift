@@ -47,7 +47,7 @@ private actor GenerationPartialThrottle {
                     try assignJSON(target: live.child("generation")!, key: "message", value: partial)
                     return nil
                 }, context: context)
-            } catch { if !runtime.signal.aborted { runtime.scheduler.report(error) } }
+            } catch { if !runtime.signal.aborted { runtime.reportTask(error) } }
             finished()
         }
     }

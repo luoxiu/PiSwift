@@ -143,13 +143,14 @@ internal func removeInboxItem(tx: Transaction, conversationId: ConversationID, i
     let values = try inbox.snapshot().decode(InboxState.self).items
     if let index = values.firstIndex(where: { $0.id == id }) { try items.splice(index, deleteCount: 1) }
 }
-/// Settles and removes queued inputs for the conversation.
-public func withdrawQueuedInputs(tx: Transaction, conversationId: ConversationID) async throws {
+/// Withdraw every queued input of a conversation, as `Conversation.abort()` and abort cascades do: each settles
+/// `unanswered` with `reason` (default `aborted`) and leaves the inbox; queued writes stay for later placement.
+public func withdrawQueuedInputs(tx: Transaction, conversationId: ConversationID, reason: String = "aborted") async throws {
     let inbox = try await tx.doc(InboxDoc, conversationId: conversationId)
     let items = try inbox.child("items")!
     let values = try inbox.snapshot().decode(InboxState.self).items
     for index in values.indices.reversed() where values[index].mode != .write {
-        try tx.settleSubmission(values[index].id, settlement: .unanswered(reason: "aborted"))
+        try tx.settleSubmission(values[index].id, settlement: .unanswered(reason: reason))
         try items.splice(index, deleteCount: 1)
     }
 }

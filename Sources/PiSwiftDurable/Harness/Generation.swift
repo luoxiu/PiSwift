@@ -186,7 +186,7 @@ private func prepareGeneration(_ checkpoint: GenerationCheckpoint, _ runtime: Ta
                             shown: Dictionary(uniqueKeysWithValues: shown.compactMap { key, value in value.stringValue.map { (key, $0) } }),
                             read: runtime.hookApi.read)
     let desired = try await renderSections(agent.sections, input: input, shown: shown,
-                                          report: { runtime.scheduler.report($0) }, context: context)
+                                          report: { runtime.reportTask($0) }, context: context)
     let entries = try planSystemEntries(view: view, desired: desired, registrations: agent.tools, timestamp: runtime.now())
     let threshold = checkpoint.compacted == nil ? try generationThresholdCompaction(view: view, planned: entries, contextWindow: model.contextWindow, policy: compactionPolicy(settings, model: ref)) : nil
     if threshold == .blocking {
@@ -253,10 +253,31 @@ private func failGeneration(_ runtime: TaskRuntime, modelError: String, context:
 }
 private func failGeneration(_ runtime: TaskRuntime, reason: String, text: String, context: ChordContext) async throws {
     try await runtime.commit({ tx, _ in
+        let failure = try await prepareFailure(tx: tx, runtime: runtime)
         let live = try await tx.doc(LiveDoc, conversationId: runtime.conversationId)
-        try endRun(tx: tx, live: live, taskId: runtime.taskId, settlement: .unanswered(reason: reason, detail: reason == "model_error" ? .string(text) : nil))
+        try await endFailedRun(tx: tx, runtime: runtime, live: live, failure: failure,
+                               settlement: .unanswered(reason: reason, detail: reason == "model_error" ? .string(text) : nil))
         return .terminal(outcome: .failed(error: TaskOutcomeError(message: text, detail: .object(["reason": .string(reason)]))))
     }, context: context)
+}
+/// What a failed run's end needs from the table, read before the commit's first table write.
+internal struct RunFailure { let policy: AfterFailedRun; var boundary: Boundary? }
+internal func prepareFailure(tx: Transaction, runtime: TaskRuntime) async throws -> RunFailure {
+    let settings = runtime.settings
+    let policy = settings.afterFailedRun
+    if policy != .continue { return RunFailure(policy: policy) }
+    return RunFailure(policy: policy, boundary: try await prepareBoundary(tx: tx, conversationId: runtime.conversationId, modes: settings))
+}
+/// End a failed run, settling its inputs with `settlement`, and do with the inputs queued behind it what
+/// `settings.afterFailedRun` says (spec §6): keep them, start the next run with them, or withdraw them.
+internal func endFailedRun(tx: Transaction, runtime: TaskRuntime, live: JSONDraft, failure: RunFailure,
+                           settlement: SubmissionSettlement) async throws {
+    let conversationId = runtime.conversationId
+    try endRun(tx: tx, live: live, taskId: runtime.taskId, settlement: settlement)
+    if failure.policy == .withdraw { try await withdrawQueuedInputs(tx: tx, conversationId: conversationId, reason: "run_failed") }
+    guard let boundary = failure.boundary else { return }
+    let applied = try await applyBoundary(tx: tx, boundary: boundary, at: .final, now: try runtime.now())
+    if !applied.users.isEmpty { try await startRun(tx: tx, conversationId: conversationId, live: live, inputs: applied.users) }
 }
 func appendGenerationAssistant(tx: Transaction, conversationId: ConversationID, message: AssistantMessage) async throws -> EntryRecord {
     try await recordUsage(tx: tx, conversationId: conversationId, bucket: .models, key: "\(message.provider)/\(message.model)", usage: message.usage)

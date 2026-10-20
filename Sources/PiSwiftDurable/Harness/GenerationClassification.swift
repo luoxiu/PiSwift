@@ -48,14 +48,17 @@ func classifyGeneration(_ runtime: TaskRuntime, request: GenerationCheckpoint, m
         baseDelayMs: Double(policy.baseDelayMs), maxAgentDelayMs: policy.maxAgentDelayMs.map(Double.init)), attempt: attempt)
     let until = retry ? try runtime.now() + Int64(delay) : 0
     try await runtime.commit({ tx, _ in
+        // Read before the first table write; only a failure uses it.
+        let failure = retry ? nil : try await prepareFailure(tx: tx, runtime: runtime)
         let live = try await tx.doc(LiveDoc, conversationId: runtime.conversationId)
         _ = try await appendGenerationAssistant(tx: tx, conversationId: runtime.conversationId, message: message)
-        if retry {
+        guard let failure else {
             try live.set("generation", JSONValue(encoding: LiveGeneration(attempt: attempt, retry: LiveRetry(at: until, error: message.errorMessage ?? ""))))
             return try generationTask.sleeping(GenerationCheckpoint(phase: .retry, attempt: attempt, compacted: request.compacted, until: until), until: until)
         }
         let text = message.errorMessage ?? "Model response ended with stop reason \(message.stopReason.rawValue)"
-        try endRun(tx: tx, live: live, taskId: runtime.taskId, settlement: .unanswered(reason: "model_error", detail: .string(text)))
+        try await endFailedRun(tx: tx, runtime: runtime, live: live, failure: failure,
+                               settlement: .unanswered(reason: "model_error", detail: .string(text)))
         return .terminal(outcome: .failed(error: TaskOutcomeError(message: text, detail: .object(["reason": .string("model_error")]))))
     }, context: context)
 }

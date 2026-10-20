@@ -73,7 +73,7 @@ internal final class ConversationViews: Sendable {
     deinit { for subscription in state.withLock({ $0.subscriptions }) { subscription.cancel() } }
 
     /// Report an observer's listener error through the Harness.
-    func report(_ error: any Error) { session.hooks.report(error) }
+    func report(_ error: any Error) { session.report(error) }
 
     /// Hydrate and register atomically, so no committed revision can be missed.
     func attach(id: ConversationID, context: ChordContext,

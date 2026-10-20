@@ -2,17 +2,21 @@ import Synchronization
 import PiSwiftChord
 import PiSwiftDurable
 
-/// Error reports from concurrent handlers.
+/// Error reports from concurrent handlers, with the `ReportInfo` of each.
 public final class HarnessReports: Sendable {
-    private let state = Mutex<[any Error]>([])
+    private let state = Mutex<[(error: any Error, info: ReportInfo)]>([])
     /// Creates an empty collection of concurrent handler reports.
     public init() {}
     /// The error reports recorded so far.
-    public var values: [any Error] { state.withLock { $0 } }
+    public var values: [any Error] { state.withLock { $0.map(\.error) } }
+    /// The info of each report recorded so far, in the same order.
+    public var infos: [ReportInfo] { state.withLock { $0.map(\.info) } }
     /// The number of values currently recorded.
     public var count: Int { state.withLock { $0.count } }
-    /// Records one error report for later test inspection.
-    public func append(_ error: any Error) { state.withLock { $0.append(error) } }
+    /// Records one error report for later test inspection; `info` defaults to a listener's.
+    public func append(_ error: any Error, info: ReportInfo = ReportInfo(source: .listener)) {
+        state.withLock { $0.append((error, info)) }
+    }
 }
 /// An opened test harness with its registry and captured error reports.
 public struct OpenHarnessResult: Sendable {
@@ -31,7 +35,7 @@ public func openHarness(storage: any DurableStorage = MemoryStorage(), registry:
     let harness = try await Harness.open(storage: storage,
         options: HarnessOptions(models: FakeDurableModels(), registry: registry, settings: settings,
                                 now: clock?.nowFunction, setTimer: clock?.setTimer,
-                                onReport: { reports.append($0) }), context: context)
+                                onReport: { reports.append($0, info: $1) }), context: context)
     return OpenHarnessResult(harness: harness, registry: registry, reports: reports)
 }
 /// Installs application tasks and opens a test harness with fake models. `clock` supplies `now` and `setTimer` together;
@@ -47,7 +51,7 @@ public func openTasks(storage: any DurableStorage = MemoryStorage(), tasks: [Any
     let harness = try await Harness.open(storage: storage,
         options: HarnessOptions(models: FakeDurableModels(), registry: registry, settings: settings,
                                 now: now ?? clock?.nowFunction, setTimer: setTimer ?? clock?.setTimer,
-                                onWake: onWake, onReport: { reports.append($0) }), context: context)
+                                onWake: onWake, onReport: { reports.append($0, info: $1) }), context: context)
     return OpenHarnessResult(harness: harness, registry: registry, reports: reports)
 }
 /// Creates a completed terminal task state with a JSON-encoded result.

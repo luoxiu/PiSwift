@@ -261,7 +261,7 @@ extension Transaction {
                                         input: value.input, state: value.state, owner: value.owner, background: value.background,
                                         abortRequested: value.abortRequested, abortReason: value.abortReason,
                                         abandonOnRestart: value.abandonOnRestart, startedAt: startedAt, endedAt: endedAt,
-                                        memos: value.memos, extensionFields: value.extensionFields)
+                                        restarts: value.restarts, memos: value.memos, extensionFields: value.extensionFields)
                 try validateTableJSON(record)
                 task.write = record
                 if state.tasks[value.id] == nil { state.taskOrder.append(value.id) }

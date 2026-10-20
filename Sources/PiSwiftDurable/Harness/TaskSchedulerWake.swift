@@ -19,7 +19,7 @@ extension TaskScheduler {
     /// When the Session next needs a process: `active` while some task can run now or is running, `at` for the earliest
     /// sleep not yet due. Synchronous, from memory; a task whose chain is not loaded yet counts as it would alone.
     func wake() -> Wake {
-        let now = now()
+        let now = now(), limit = restartLimit()
         let found = state.withLock { state -> (active: Bool, at: Int64?, unblocked: [TaskRecord]) in
             var active = !state.invocations.isEmpty
             var at: Int64?
@@ -36,6 +36,7 @@ extension TaskScheduler {
                 default: break
                 }
                 if active { continue }
+                if record.parked(limit) { continue }
                 // An abort invocation waits for the live work below it, which counts itself.
                 if record.abortRequested && !state.waitingOn(record, first: true).isEmpty { continue }
                 // A task no definition can take waits for a registry change, except an abort-marked one, which is orphaned.
@@ -80,7 +81,7 @@ extension TaskScheduler {
                 try onWake(wake)
                 // Only a delivered wake counts: after a throw, the next change or kick offers it again.
                 state.withLock { $0.lastWake = wake }
-            } catch { report(error) }
+            } catch { report(error, ReportInfo(source: .wake)) }
         }
     }
 

@@ -22,7 +22,7 @@ private func recoveryInstall(_ setup: HarnessChatSetup, tool: ToolRegistration) 
 private func recoveryOpen(_ storage: any DurableStorage, setup: HarnessChatSetup, env: HarnessEnvFactory? = nil,
                           resume: Bool = true) async throws -> OpenChatResult {
     let harness = try await Harness.open(storage: storage, options: HarnessOptions(models: setup.models,
-        registry: setup.registry, settings: setup.settingsProvider, env: env, onReport: { setup.reports.append($0) }), context: .background)
+        registry: setup.registry, settings: setup.settingsProvider, env: env, onReport: { setup.reports.append($0, info: $1) }), context: .background)
     let root = try await harness.root(options: .init(agent: AgentChange(model: .set(ModelRef(provider: "faux", modelId: "faux-1")))), context: .background)
     if resume { try harness.resume() }
     return OpenChatResult(harness: harness, root: root)

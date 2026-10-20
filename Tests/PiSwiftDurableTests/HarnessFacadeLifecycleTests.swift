@@ -33,7 +33,7 @@ import PiSwiftDurableTesting
         await base.failNextCommit(TestFailure("disk full"))
         let reports = HarnessReports()
         do {
-            _ = try await Harness.open(storage: HarnessFailingCloseStorage(base: base), options: .init(models: FakeDurableModels(), registry: createRegistry(), onReport: { reports.append($0) }), context: .background)
+            _ = try await Harness.open(storage: HarnessFailingCloseStorage(base: base), options: .init(models: FakeDurableModels(), registry: createRegistry(), onReport: { reports.append($0, info: $1) }), context: .background)
             Issue.record("Open must fail")
         } catch { #expect(String(describing: error).contains("disk full")) }
         // The storage failure that failed open is the cause; the close that fails after it adds no report.

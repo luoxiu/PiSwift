@@ -51,7 +51,7 @@ public func openChat(storage: any DurableStorage = MemoryStorage(), setup: Harne
     let harness = try await Harness.open(storage: storage,
         options: HarnessOptions(models: models ?? setup.models, registry: setup.registry,
             settings: setup.settingsProvider, now: setup.now, setTimer: setup.setTimer,
-            onReport: { setup.reports.append($0) }), context: context)
+            onReport: { setup.reports.append($0, info: $1) }), context: context)
     let root = try await harness.root(options: .init(agent: AgentChange(model: .set(ModelRef(provider: "faux", modelId: "faux-1")))), context: context)
     return OpenChatResult(harness: harness, root: root)
 }

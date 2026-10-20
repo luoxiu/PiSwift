@@ -124,6 +124,9 @@ import PiSwiftDurableTesting
             guard wake.active else { return wake.at }
             return min(now + 60_000, wake.at ?? .max)
         }
+        // A fallback before anything can throw: a process whose open or recovery fails is started again.
+        let fallback = clock() + 60_000
+        if alarm.current.map({ $0 > fallback }) ?? true { alarm.arm(at: fallback) }
         // A throw is reported, and the wake is offered again at the next change.
         let options = HarnessOptions(models: models, registry: registry,
             onWake: { wake in alarm.arm(at: alarmTime(wake, now: clock())) })
@@ -141,6 +144,7 @@ import PiSwiftDurableTesting
         let root = try await harness.root(context: context)
         _ = try await root.submit(.input(content: .text("Hello")), context: context)
         // README: end
+        #expect(alarm.times.first == 61_000)
         #expect(alarm.times.contains(61_000))
         try await root.waitForIdle(context: context)
         try await eventually { alarm.times.last == .some(nil) }
@@ -201,4 +205,6 @@ private final class ReadmeAlarm: Sendable {
     private let state = Mutex<[Int64?]>([])
     var times: [Int64?] { state.withLock { $0 } }
     func arm(at time: Int64?) { state.withLock { $0.append(time) } }
+    /// The time it is armed at, if it is.
+    var current: Int64? { state.withLock { $0.last ?? nil } }
 }
