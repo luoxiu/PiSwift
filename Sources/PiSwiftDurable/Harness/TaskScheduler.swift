@@ -40,6 +40,12 @@ internal final class RuntimePhase: Sendable {
 }
 
 /// Every decision that changes a task runs in one callback on the Session line.
+///
+/// Tasks and conversations form one ownership tree (spec §5.5): a task's parent is its owner task, or its conversation;
+/// a conversation's parent is its owner task, if any. Walks up that tree decide what reaches one task: a cancelling
+/// owner, a scope. `below` lists the tree downward around live work, so what lies below one node is a walk down from
+/// it: a task's live ordinary owned work, which holds its outcome as `completing` and delays its abort handler, a
+/// scope's tasks, a cascade's reach. No pass visits every live task; the sets in `State` hold each pass's candidates.
 internal final class TaskScheduler: Sendable {
     internal let toolServices = ToolServices()
     let session: Session
@@ -59,10 +65,41 @@ internal final class TaskScheduler: Sendable {
     struct KeptContext: Sendable { let range: ContextRange; var idleSince: Int64? }
     struct State: Sendable {
         var live: [TaskID: TaskRecord] = [:]
-        var order: [TaskID] = []
-        var nodes: [TaskID: TaskRecord] = [:]
-        // An entry with nil owner is a loaded, ownerless conversation.
-        var edges: [ConversationID: ConversationRecord] = [:]
+        /// When each live task became live; listings and reservation passes follow this order.
+        var order: [TaskID: Int] = [:]
+        var nextOrder = 0
+        // Owner task of each loaded conversation; an entry with nil owner is a loaded, ownerless conversation.
+        var edges: [ConversationID: TaskID?] = [:]
+        /// Tasks that own a loaded conversation; their nodes stay in `settled` once terminal, and with them, through
+        /// `knownChildren`, every task above them. Never cleared: about one entry per task on a subagent's chain.
+        var conversationOwners: Set<TaskID> = []
+        /// Ownership fields of terminal tasks that walks pass through: conversation owners, chain loads, owners of known
+        /// tasks, and those with nodes listed below them. `forget` drops the rest.
+        var settled: [TaskID: TaskNode] = [:]
+        /// The tree downward around live work: each node's child nodes that are live tasks or have nodes listed below
+        /// them. A conversation's parent is its owner task; ownerless ones with work are in `roots`.
+        var below: [OwnershipUp: Set<OwnershipUp>] = [:]
+        var roots: Set<ConversationID> = []
+        /// Known tasks whose chain may not be loaded; every other known task's chain is, and stays, loaded.
+        var unloaded: Set<TaskID> = []
+        /// Live tasks with cancellation intent, the sources of abort cascades (spec §5.4).
+        var intent: Set<TaskID> = []
+        /// Live tasks that are not `completing`, the candidates of a reservation pass; ones found waiting leave it.
+        var runnable: Set<TaskID> = []
+        /// `completing` tasks the next finalize pass checks: those that started holding, and holders of ended work.
+        var finalizeChecks: Set<TaskID> = []
+        /// Live waiting tasks by each task in their `on`.
+        var waiters: [TaskID: Set<TaskID>] = [:]
+        /// Terminal tasks a chain load read; kept in `settled`, so loaded chains stay loaded.
+        var pinned: Set<TaskID> = []
+        /// Per task, how many known tasks (live, or in `settled`) it owns directly. An ended task stays known while any
+        /// does, so the chain above every known task stays loaded.
+        var knownChildren: [TaskID: Int] = [:]
+        /// `failFast` waiters the next reconcile checks for a failed task in `on`: at open, when they start waiting, and
+        /// when one of their tasks fails.
+        var failFastChecks: Set<TaskID> = []
+        // Internal probe: the task nodes walks down reached, so tests can bound what a pass visits.
+        var walked = 0
         var invocations: [TaskID: TaskInvocation] = [:]
         var joining: [UUID: TaskInvocation] = [:]
         var failedMigrations: [TaskID: (UUID, any Error)] = [:]
@@ -102,7 +139,7 @@ internal final class TaskScheduler: Sendable {
         self.settleOutcome = settleOutcome; self.withdrawInputs = withdrawInputs
     }
     var closing: Bool { state.withLock { $0.closing } }
-    func records() -> [TaskRecord] { state.withLock { state in state.order.compactMap { state.live[$0] } } }
+    func records() -> [TaskRecord] { state.withLock { state in state.ordered(state.live.keys).compactMap { state.live[$0] } } }
     func current(_ id: TaskID) -> TaskRecord? { state.withLock { $0.live[id] } }
     func open(context: ChordContext) async throws {
         let commits = try session.observeCommits { [weak self] publication, _ in self?.observe(publication) }
@@ -114,10 +151,12 @@ internal final class TaskScheduler: Sendable {
             for status in [TaskStatus.pending, .running, .waiting, .completing] {
                 found += try await scanAll { cursor in try await tx.scanTasks(.init(status: status), limit: 256, cursor: cursor) }
             }
+            // No chain is loaded yet: every task starts in `unloaded`, and the first pass loads them.
             state.withLock { state in
                 for record in found {
-                    state.live[record.id] = record; state.nodes[record.id] = record; state.order.append(record.id)
+                    state.track(nil, record)
                     if record.abandonOnRestart { state.abandoned.insert(record.id) }
+                    if case .waiting(_, _, .failFast, _) = record.state { state.failFastChecks.insert(record.id) }
                 }
             }
             for record in found {
@@ -155,62 +194,63 @@ internal final class TaskScheduler: Sendable {
         if !closing && !session.isClosing { session.fail(error) }
     }
     private func observe(_ publication: CommitPublication) {
-        var aborts: [TaskInvocation] = [], settled: [TaskRecord] = [], updated: [TaskRecord] = []
-        var failed = Set<TaskID>(), repair = false, changed = false
+        var aborts: [TaskInvocation] = [], settled: [TaskRecord] = []
+        var repair = false, changed = false
         state.withLock { state in
+            // Edges first, so the tasks a commit creates in a new conversation hang from it.
             for change in publication.changes {
-                switch change {
-                case .task(let record):
-                    changed = true
-                    let previous = state.live[record.id]
-                    if record.failedOutcome && previous?.failedOutcome != true { failed.insert(record.id) }
-                    state.nodes[record.id] = record
-                    if record.state.status == "terminal" {
-                        if !state.edges.values.contains(where: { $0.owner?.taskId == record.id }) { state.nodes.removeValue(forKey: record.id) }
-                        state.live.removeValue(forKey: record.id); state.order.removeAll { $0 == record.id }
-                        state.failedMigrations.removeValue(forKey: record.id); settled.append(record); repair = true
-                    } else {
-                        if previous == nil { state.order.append(record.id) }
-                        state.live[record.id] = record; updated.append(record)
-                        if record.abortRequested && previous?.abortRequested != true {
-                            state.cascadePending = true
-                            if let invocation = state.invocations[record.id], !invocation.abort { aborts.append(invocation) }
-                        }
-                        // A request replacing a `restart` mark upgrades the marks of the work below.
-                        if previous?.abortReason != nil && record.abortReason == nil { state.cascadePending = true }
-                        if record.state.status == "completing" && previous?.state.status != "completing" {
-                            repair = true
-                            if record.abortRequested || record.failedOutcome { state.cascadePending = true }
-                        }
-                        if case .waiting(_, _, .failFast, _) = record.state, previous?.state.status != "waiting" { repair = true }
-                    }
-                case .conversation(let record): state.edges[record.id] = record
-                default: break
+                if case .conversation(let record) = change, state.edges[record.id] == nil { state.setEdge(record.id, record.owner?.taskId) }
+            }
+            var failed: [TaskID] = [], updated: [TaskRecord] = []
+            for change in publication.changes {
+                guard case .task(let record) = change else { continue }
+                changed = true
+                let previous = state.live[record.id]
+                if record.failedOutcome && previous?.failedOutcome != true { failed.append(record.id) }
+                state.track(previous, record)
+                if record.state.status == "terminal" {
+                    state.failedMigrations.removeValue(forKey: record.id); state.failFastChecks.remove(record.id)
+                    // Its owner may finalize now.
+                    settled.append(record); repair = true
+                    continue
+                }
+                if record.abortRequested && previous?.abortRequested != true {
+                    state.cascadePending = true
+                    if let invocation = state.invocations[record.id], !invocation.abort { aborts.append(invocation) }
+                }
+                // A request replacing a `restart` mark upgrades the marks of the work below.
+                if previous?.abortReason != nil && record.abortReason == nil { state.cascadePending = true }
+                if record.state.status == "completing" && previous?.state.status != "completing" {
+                    repair = true
+                    if record.cancellationIntent { state.cascadePending = true }
+                }
+                if case .waiting(_, _, .failFast, _) = record.state, previous?.state.status != "waiting" {
+                    state.failFastChecks.insert(record.id); repair = true
+                }
+                // Its owners and place never change: what is above it is checked once, when it becomes live.
+                if previous == nil { updated.append(record) }
+            }
+            for id in failed {
+                for waiter in state.waiters[id] ?? [] {
+                    if case .waiting(_, _, .failFast, _)? = state.live[waiter]?.state { state.failFastChecks.insert(waiter); repair = true }
                 }
             }
-            if !failed.isEmpty {
-                for record in state.live.values {
-                    if case .waiting(_, let on, .failFast, _) = record.state, on.contains(where: { failed.contains($0) }) { repair = true }
-                }
-            }
-        }
-        for record in updated {
-            if above(record.parent).contains(where: { if case .unknown = $0 { return true }; return false }) { repair = true }
-            else if !record.background && !record.abortRequested && belowCancelled(record.parent) {
-                state.withLock { $0.cascadePending = true }
-            }
-        }
-        for change in publication.changes {
-            if case .submission(let input) = change, input.type == "input", input.status == "queued" {
+            for change in publication.changes {
+                // A queued input below a cancelled owner is withdrawn, even after its cascade.
+                guard case .submission(let input) = change, input.type == "input", input.status == "queued" else { continue }
                 let up = OwnershipUp.conversation(input.conversationId)
-                if above(up).contains(where: { if case .unknown = $0 { return true }; return false }) || belowCancelled(up) {
-                    state.withLock { $0.cascadePending = true }
-                }
+                if !state.known(up) || state.belowCancelled(up) { state.cascadePending = true }
             }
+            for record in updated {
+                // Work created below a cancelled owner, even after its cascade, is aborted too.
+                if state.unloaded.contains(record.id) { repair = true }
+                else if !record.background && !record.abortRequested && state.belowCancelled(record.parent) { state.cascadePending = true }
+            }
+            if state.cascadePending { repair = true }
         }
         for invocation in aborts { invocation.controller.abort() }
         for record in settled { taskWaiters.resolve(record.id, value: SettledTask(record: record)) }
-        if repair || state.withLock({ $0.cascadePending }) { scheduleReconcile() }
+        if repair { scheduleReconcile() }
         if changed { settleIdle(); kick() }
     }
     /// A Task is created under the lock. It cannot enter the pump until the lock is released.
@@ -248,8 +288,12 @@ internal final class TaskScheduler: Sendable {
             let id = UUID()
             state.reconciles[id] = Task { [weak self] in
                 guard let self else { return }
-                self.state.withLock { $0.reconcileScheduled = false; $0.cascadePending = false }
-                do { try await self.reconcile() }
+                let checks = self.state.withLock { state -> Set<TaskID> in
+                    state.reconcileScheduled = false; state.cascadePending = false
+                    defer { state.failFastChecks = [] }
+                    return state.failFastChecks
+                }
+                do { try await self.reconcile(checks: checks) }
                 catch {
                     // No extension code runs in this commit: a throw is a storage failure, a host callback, or a bug.
                     // None is fixed by running the pass again, so it fails the Session, which reports it.
@@ -260,29 +304,55 @@ internal final class TaskScheduler: Sendable {
             }
         }
     }
+    /// Load the owner edges and task nodes from `start` up to its ownerless root. A known task outside `unloaded` ends the
+    /// walk, as its chain is loaded; the `unloaded` tasks passed have a loaded chain afterwards. Loading a node can reveal
+    /// a cancelled owner, so it makes the next reconcile derive cascade marks.
     func loadChain(_ start: OwnershipUp, overlay: TaskOverlay = .empty) async throws {
-        var at: OwnershipUp? = start
-        var seen = Set<OwnershipUp>()
-        while let step = at, seen.insert(step).inserted {
+        enum Known { case loaded, node(TaskNode), absent }
+        var at: OwnershipUp? = start, seen = Set<OwnershipUp>(), passed: [TaskID] = []
+        walk: while let step = at, seen.insert(step).inserted {
             switch step {
             case .task(let id):
-                var record = overlay.tasks[id] ?? state.withLock { $0.nodes[id] }
-                if record == nil {
-                    record = try await storage.task(id, context: context)
-                    if let record { state.withLock { $0.nodes[id] = record } }
+                let known = state.withLock { state -> Known in
+                    if let node = state.live[id].map(TaskNode.init) ?? state.settled[id] {
+                        return state.unloaded.contains(id) ? .node(node) : .loaded
+                    }
+                    // Created in this commit: the load from its own record covers what is above it.
+                    return overlay.tasks[id] == nil ? .absent : .loaded
                 }
-                guard let record else { return }; at = record.parent
+                let node: TaskNode
+                switch known {
+                case .loaded: break walk
+                case .node(let found): node = found
+                case .absent:
+                    guard let record = try await storage.task(id, context: context) else { return }
+                    node = TaskNode(record)
+                    if record.state.status == "terminal" { state.withLock { $0.settle(id, node) } }
+                    // A loaded node can reveal a cancelling owner: the next reconcile derives marks again.
+                    scheduleReconcile()
+                }
+                passed.append(id); at = node.parent
             case .conversation(let id):
-                var record = overlay.conversations[id] ?? state.withLock { $0.edges[id] }
-                if record == nil {
-                    record = try await storage.conversation(id, context: context)
-                    if let record { state.withLock { $0.edges[id] = record } }
+                var edge = state.withLock { $0.edge(id, overlay) }
+                if edge == nil {
+                    let owner = try await storage.conversation(id, context: context)?.owner?.taskId
+                    state.withLock { $0.setEdge(id, owner) }
+                    edge = .some(owner)
+                    // A loaded node can reveal a cancelling owner: the next reconcile derives marks again.
+                    scheduleReconcile()
                 }
-                at = record?.owner.map { .task($0.taskId) }
+                at = (edge ?? nil).map(OwnershipUp.task)
             }
         }
+        state.withLock { state in for id in passed { state.unloaded.remove(id) } }
     }
-    func loadScopes() async throws { for record in records() { try await loadChain(record.parent) } }
+    /// Load the owner chains of the tasks in `unloaded`, on the Session line.
+    func loadScopes() async throws {
+        for id in state.withLock({ Array($0.unloaded) }) {
+            // An earlier load in this loop may have passed it.
+            if state.withLock({ $0.unloaded.contains(id) }) { try await loadChain(.task(id)) }
+        }
+    }
     func loadQueuedScopes() async throws -> Set<ConversationID> {
         let submissions = try await scanAll { cursor in
             try await storage.scanSubmissions(.init(status: .queued), limit: 256, cursor: cursor, context: context)
@@ -291,117 +361,82 @@ internal final class TaskScheduler: Sendable {
         for id in ids { try await loadChain(.conversation(id)) }
         return ids
     }
-    func above(_ start: OwnershipUp, overlay: TaskOverlay = .empty) -> [OwnershipStep] {
-        state.withLock { state in
-            var result: [OwnershipStep] = [], at: OwnershipUp? = start, seen = Set<OwnershipUp>()
-            while let step = at, seen.insert(step).inserted {
-                switch step {
-                case .task(let id):
-                    guard let record = overlay.tasks[id] ?? state.nodes[id] else { result.append(.unknown); return result }
-                    result.append(.task(record)); at = record.parent
-                case .conversation(let id):
-                    result.append(.conversation(id))
-                    guard let record = overlay.conversations[id] ?? state.edges[id] else { result.append(.unknown); return result }
-                    at = record.owner.map { .task($0.taskId) }
-                }
-            }
-            return result
-        }
-    }
-    func liveRecords(_ overlay: TaskOverlay = .empty) -> [TaskRecord] {
-        var records = records().map { overlay.tasks[$0.id] ?? $0 }
-        let ids = Set(records.map(\.id))
-        records += overlay.tasks.values.filter { !ids.contains($0.id) }
-        return records.filter { $0.state.status != "terminal" }
-    }
-    func ownedWork(_ overlay: TaskOverlay = .empty) -> [TaskID: [TaskID]] {
-        var owned: [TaskID: [TaskID]] = [:]
-        for record in liveRecords(overlay) where !record.background {
-            for step in above(record.parent, overlay: overlay) {
-                if case .task(let owner) = step { owned[owner.id, default: []].append(record.id); if owner.background { break } }
-            }
-        }
-        return owned
-    }
-    func ownedLive(_ overlay: TaskOverlay = .empty) -> Set<TaskID> { Set(ownedWork(overlay).keys) }
+    func above(_ start: OwnershipUp, overlay: TaskOverlay = .empty) -> [OwnershipStep] { state.withLock { $0.above(start, overlay: overlay) } }
     func inScope(_ start: OwnershipUp, conversationId: ConversationID?, background: Bool = false) -> Bool? {
-        for step in above(start) {
-            switch step {
-            case .unknown: return nil
-            case .conversation(let id): if id == conversationId { return true }
-            case .task(let record): if record.background && !background { return false }
-            }
-        }
-        return conversationId == nil
+        state.withLock { $0.inScope(start, conversationId: conversationId, background: background) }
     }
-    func belowCancelled(_ start: OwnershipUp) -> Bool { cancellingOwner(start) != nil }
-    /// The nearest live owner above `start` whose cancellation intent reaches it, if any; see `belowCancelled`.
-    func cancellingOwner(_ start: OwnershipUp) -> TaskRecord? {
-        for step in above(start) {
-            if case .task(let record) = step {
-                if let live = current(record.id), live.abortRequested || live.failedOutcome { return live }
-                if record.background { return nil }
-            }
-        }
-        return nil
+    func belowCancelled(_ start: OwnershipUp) -> Bool { state.withLock { $0.belowCancelled(start) } }
+    func hasOwnedLive(_ owner: TaskID, overlay: inout TaskOverlay, done: Set<TaskID> = []) -> Bool {
+        state.withLock { $0.hasOwnedLive(owner, overlay: &overlay, done: done) }
     }
-    func idle(_ id: ConversationID?) -> Bool { !records().contains { !$0.background && inScope($0.parent, conversationId: id) != false } }
-    func waitingOn(_ record: TaskRecord, owned: Set<TaskID>) -> [TaskID] {
-        if record.abortRequested { return owned.contains(record.id) ? (ownedWork()[record.id] ?? []) : [] }
-        if case .waiting(_, let on, _, _) = record.state { return on.filter { current($0) != nil } }
-        return []
-    }
-    private func reconcile() async throws {
+    func idle(_ id: ConversationID?) -> Bool { state.withLock { $0.idle(id) } }
+    private func reconcile(checks: Set<TaskID>) async throws {
         try await session.commit({ tx in
             guard !closing else { return }
             try await loadScopes()
             let queued = try await loadQueuedScopes()
             // A cascade from an abandoned owner passes its `restart` reason on; any other intent marks, or upgrades a
             // `restart` mark, as a request. Collected first, so a request wins over a `restart` mark of the same pass.
-            var marks: [TaskID: (record: TaskRecord, reason: TaskAbortReason?)] = [:], order: [TaskID] = []
+            var marks: [TaskID: (record: TaskRecord, reason: TaskAbortReason?)] = [:]
             func mark(_ record: TaskRecord, _ reason: TaskAbortReason?) {
                 if let staged = marks[record.id], staged.reason == nil { return }
                 if record.abortRequested && (record.abortReason == nil || reason != nil) { return }
-                if marks[record.id] == nil { order.append(record.id) }
                 marks[record.id] = (record, reason)
             }
-            // Loading edges can reveal a cancelled owner, so marks are derived on every pass.
-            for record in records() {
-                if !record.background, let owner = cancellingOwner(record.parent) {
-                    // Only an owner abandoned after a restart, and nothing else, passes its reason on.
-                    mark(record, owner.abortReason == .restart && !owner.failedOutcome ? .restart : nil)
-                }
-                if case .waiting(_, let on, .failFast, _) = record.state {
-                    var failed = false
-                    for id in on {
-                        let found: TaskRecord?
-                        if let live = current(id) { found = live } else { found = try await storage.task(id, context: context) }
-                        if found?.failedOutcome == true { failed = true; break }
-                    }
-                    // Every other live task: the failed one keeps its own outcome.
-                    if failed { for id in on { if let live = current(id), !live.failedOutcome { mark(live, nil) } } }
-                }
+            // Derived again on every pass, as loading edges can reveal a cancelled owner.
+            for (record, reason) in state.withLock({ $0.cascades() }) { mark(record, reason) }
+            for id in state.withLock({ $0.ordered(checks) }) {
+                guard let waiter = current(id), case .waiting(_, let on, .failFast, _) = waiter.state, try await anyFailed(on) else { continue }
+                // Every other live task: the failed one keeps its own outcome.
+                for member in on { if let live = current(member), !live.failedOutcome { mark(live, nil) } }
             }
-            for id in order { let staged = marks[id]!; try tx.setTask(staged.record.withAbortMark(staged.reason)) }
+            for id in state.withLock({ $0.ordered(marks.keys) }) { let staged = marks[id]!; try tx.setTask(staged.record.withAbortMark(staged.reason)) }
             for id in queued where belowCancelled(.conversation(id)) { try await withdrawInputs(tx, id) }
-            while true {
-                let overlay = try TaskOverlay(tx), owned = ownedLive(overlay)
-                let done = liveRecords(overlay).filter { $0.state.status == "completing" && !owned.contains($0.id) }
-                if done.isEmpty { break }
-                for record in done {
-                    if let outcome = record.state.outcome {
-                        try tx.setTask(record.replacing(state: .terminal(outcome: outcome)))
-                        if outcome.status == "faulted" || outcome.status == "orphaned" { try await settleOutcome(tx, record, outcome) }
-                    }
-                }
-            }
+            try await finalize(tx)
         }, context: context)
     }
+    /// Whether any of `ids` holds or ended with an outcome other than `completed`.
+    private func anyFailed(_ ids: [TaskID]) async throws -> Bool {
+        for id in ids {
+            let found: TaskRecord?
+            if let live = current(id) { found = live } else { found = try await storage.task(id, context: context) }
+            if found?.failedOutcome == true { return true }
+        }
+        return false
+    }
+    /// Write the terminal record of every `completing` task without live ordinary owned work. A held scheduler outcome
+    /// gets its Harness cleanup here.
+    private func finalize(_ tx: Transaction) async throws {
+        // A worklist: the tasks that started holding, and the holders of work that ended. Finalizing one can free the
+        // nearest live task above it, which goes on the list. Tasks finalized here have no live work below them, so walks
+        // down skip them.
+        // In rounds: the holders the tasks of one round free are checked once, in the next, so a holder of many tasks that
+        // end together is walked once, not once per task.
+        var round = state.withLock { state in defer { state.finalizeChecks = [] }; return state.ordered(state.finalizeChecks) }
+        var done = Set<TaskID>(), overlay = try TaskOverlay(tx)
+        while !round.isEmpty {
+            var next = Set<TaskID>()
+            for id in round {
+                guard let record = overlay.tasks[id] ?? current(id), case .completing(let outcome, _) = record.state, !done.contains(id) else { continue }
+                if hasOwnedLive(id, overlay: &overlay, done: done) { continue }
+                let terminal = record.replacing(state: .terminal(outcome: outcome))
+                try tx.setTask(terminal)
+                overlay.tasks[id] = terminal; done.insert(id)
+                // Only the scheduler writes `faulted` and `orphaned` (spec §5.4); their cleanup waits for this commit.
+                if outcome.status == "faulted" || outcome.status == "orphaned" { try await settleOutcome(tx, record, outcome) }
+                let above = state.withLock { $0.nearestLiveAbove(TaskNode(record), overlay: overlay) }
+                if let above, above.state.status == "completing" { next.insert(above.id) }
+            }
+            round = state.withLock { $0.ordered(next) }
+        }
+    }
+    /// Write an outcome the scheduler decided, or one a task committed. While the task's ordinary owned work is live, judged
+    /// on the commit's candidates, it holds as `completing` and its Harness cleanup waits for the final commit (spec §5.5).
     func terminate(_ tx: Transaction, record: TaskRecord, outcome: TaskOutcome) async throws {
         try await loadScopes()
-        let overlay = try TaskOverlay(tx)
+        var overlay = try TaskOverlay(tx)
         for record in overlay.tasks.values { try await loadChain(record.parent, overlay: overlay) }
-        let held = ownedLive(overlay).contains(record.id)
+        let held = hasOwnedLive(record.id, overlay: &overlay)
         try tx.setTask(record.replacing(state: held ? .completing(outcome: outcome) : .terminal(outcome: outcome)))
         if !held && (outcome.status == "faulted" || outcome.status == "orphaned") { try await settleOutcome(tx, record, outcome) }
     }
@@ -427,9 +462,15 @@ internal final class TaskScheduler: Sendable {
                 }
                 if !pending.isEmpty { abandoned = pending; return }
                 try await loadScopes()
-                let owned = ownedLive(), snapshot = registry.snapshot()
-                for original in records() {
-                    if state.withLock({ $0.invocations[original.id] != nil }) || original.state.status == "completing" || !waitingOn(original, owned: owned).isEmpty { continue }
+                let snapshot = registry.snapshot()
+                for taskId in state.withLock({ $0.ordered($0.runnable) }) {
+                    let candidate = state.withLock { state -> TaskRecord? in
+                        guard let record = state.live[taskId], record.state.status != "completing", state.invocations[taskId] == nil,
+                              // It returns once what it waits for ends, its record changes, or the work below it ends.
+                              state.waitingOn(record, first: true).isEmpty else { state.runnable.remove(taskId); return nil }
+                        return record
+                    }
+                    guard let original = candidate else { continue }
                     // Work below an owner with cancellation intent waits for its cascade mark instead of running a phase;
                     // schedule the cascade, which may not have run yet.
                     if !original.abortRequested && !original.background && belowCancelled(original.parent) {
@@ -462,7 +503,9 @@ internal final class TaskScheduler: Sendable {
                         try tx.setTask(record.replacing(state: .running(checkpoint: checkpoint)))
                     }
                     let invocation = TaskInvocation(record, abort: record.abortRequested, context: context), id = UUID()
-                    state.withLock { $0.invocations[record.id] = invocation; $0.joining[id] = invocation }
+                    // Registered on the line, so marks and later reservations see it and close joins it; `end` makes it a
+                    // candidate again.
+                    state.withLock { $0.invocations[record.id] = invocation; $0.joining[id] = invocation; $0.runnable.remove(record.id) }
                     reservations.append(Reservation(invocation: invocation, definition: definition, snapshot: snapshot, joinID: id))
                 }
             }, context: context)
@@ -496,7 +539,11 @@ internal final class TaskScheduler: Sendable {
             let watches = Array(state.watches.values); state.watches = [:]; return watches
         }
         guard let watches else { return }
-        state.withLock { if $0.invocations[invocation.taskId] === invocation { $0.invocations.removeValue(forKey: invocation.taskId) } }
+        state.withLock { state in
+            guard state.invocations[invocation.taskId] === invocation else { return }
+            state.invocations.removeValue(forKey: invocation.taskId)
+            if state.live[invocation.taskId] != nil { state.runnable.insert(invocation.taskId) }
+        }
         for stop in watches { stop() }
         invocation.controller.abort(SessionError.message("Task \(invocation.taskId.rawValue) invocation has ended"))
     }
@@ -571,18 +618,6 @@ internal final class TaskScheduler: Sendable {
     }
 }
 
-internal enum OwnershipUp: Hashable, Sendable { case task(TaskID), conversation(ConversationID) }
-internal enum OwnershipStep: Sendable { case task(TaskRecord), conversation(ConversationID), unknown }
-internal struct TaskOverlay: Sendable {
-    let tasks: [TaskID: TaskRecord]
-    let conversations: [ConversationID: ConversationRecord]
-    static let empty = TaskOverlay(tasks: [:], conversations: [:])
-    init(tasks: [TaskID: TaskRecord], conversations: [ConversationID: ConversationRecord]) { self.tasks = tasks; self.conversations = conversations }
-    init(_ tx: Transaction) throws {
-        tasks = Dictionary(uniqueKeysWithValues: try tx.stagedTasks().map { ($0.id, $0) })
-        conversations = Dictionary(uniqueKeysWithValues: try tx.stagedConversations().map { ($0.id, $0) })
-    }
-}
 internal extension TaskState {
     var checkpoint: JSONValue? { switch self { case .pending(let value, _), .running(let value, _), .waiting(let value, _, _, _): value; default: nil } }
     var outcome: TaskOutcome? { switch self { case .completing(let value, _), .terminal(let value, _): value; default: nil } }

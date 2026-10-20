@@ -15,7 +15,7 @@ extension TaskScheduler {
             if keepRestart && record.abortReason == .restart { return (.marked, nil) }
             if invocation == nil && record.state.status != "completing" {
                 try await loadScopes()
-                if !ownedLive().contains(id), let reason = fit(record, definition: registry.snapshot().task(name: record.kind)).reason {
+                if !state.withLock({ $0.hasOwnedLive(id) }), let reason = fit(record, definition: registry.snapshot().task(name: record.kind)).reason {
                     try await terminate(tx, record: record, outcome: .orphaned(reason: reason)); return (.marked, nil)
                 }
             }
@@ -63,10 +63,16 @@ extension TaskScheduler {
         let reached: [TaskID] = try await session.commit({ tx in
             try await loadScopes()
             let queued = try await loadQueuedScopes()
+            let found = state.withLock { state -> [TaskRecord] in
+                var found: [TaskID: TaskRecord] = [:]
+                state.walkDown(.conversation(id), crossBackground: background) { _, node, live in
+                    if let live, !node.background || background { found[live.id] = live }
+                    return true
+                }
+                return state.ordered(found.keys).compactMap { found[$0] }
+            }
             var reached: [TaskID] = []
-            for record in records() {
-                if record.background && !background { continue }
-                if inScope(record.parent, conversationId: id, background: background) != true { continue }
+            for record in found {
                 reached.append(record.id)
                 if !record.abortRequested || record.abortReason != nil { try tx.setTask(record.withAbortMark()) }
             }
@@ -80,13 +86,12 @@ extension TaskScheduler {
     /// Caller runs this read on the Session line. Migration code is not called.
     func inspect(snapshot: RegistrySnapshot) async throws -> (scheduling: SchedulingState, tasks: [TaskInspection]) {
         try await loadScopes()
-        let owned = ownedLive()
         let tasks = records().map { record -> TaskInspection in
             let derived: TaskInspectionState
             if state.withLock({ $0.invocations[record.id] != nil }) { derived = .running }
             else if record.state.status == "completing" { derived = .completing }
             else {
-                let on = waitingOn(record, owned: owned)
+                let on = state.withLock { $0.waitingOn(record) }
                 if !on.isEmpty { derived = .waiting(on: on) }
                 else {
                     let definition = snapshot.task(name: record.kind), fit = fit(record, definition: definition)
@@ -114,7 +119,7 @@ extension TaskScheduler {
                 let overlay = try TaskOverlay(tx)
                 for record in overlay.tasks.values where tx.createdTaskIDs().contains(record.id) {
                     try await loadChain(record.parent, overlay: overlay)
-                    if above(record.parent, overlay: overlay).contains(where: { if case .task(let owner) = $0 { return owner.id == invocation.taskId }; return false }) {
+                    if above(record.parent, overlay: overlay).contains(where: { if case .task(let owner, _) = $0 { return owner == invocation.taskId }; return false }) {
                         throw SessionError.message("Abort handler of task \(invocation.taskId.rawValue) cannot create owned children")
                     }
                 }
@@ -127,7 +132,7 @@ extension TaskScheduler {
             if invocation.abort { throw SessionError.message("Abort handler of task \(current.id.rawValue) cannot wait") }
             let overlay = try TaskOverlay(tx)
             try await loadChain(current.parent, overlay: overlay)
-            let owners = Set(above(current.parent, overlay: overlay).compactMap { step -> TaskID? in if case .task(let record) = step { return record.id }; return nil })
+            let owners = Set(above(current.parent, overlay: overlay).compactMap { step -> TaskID? in if case .task(let owner, _) = step { return owner }; return nil })
             for id in on {
                 if id == current.id || owners.contains(id) { throw SessionError.message("Task \(current.id.rawValue) cannot wait on itself or its owner \(id.rawValue)") }
                 let record: TaskRecord?
