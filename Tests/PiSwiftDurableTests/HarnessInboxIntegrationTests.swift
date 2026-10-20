@@ -14,7 +14,7 @@ import PiSwiftDurableTesting
         let chat = try await openChat(setup: setup)
         let input = try await chat.root.submit(.input(content: .text("a")), context: .background); await first.reached.wait()
         let f1 = try await chat.root.submit(.input(content: .text("f1")), context: .background)
-        let write = try await chat.root.submit(.write(entry: EntryDraft(kind: "note", data: .string("w"))), context: .background)
+        let write = try await chat.root.submit(.write(entry: queuedNote("w")), context: .background)
         let f2 = try await chat.root.submit(.input(content: .text("f2"), whenBusy: .followUp), context: .background)
         first.release()
         let original = try await input.wait(context: .background), one = try await f1.wait(context: .background), two = try await f2.wait(context: .background)
@@ -57,7 +57,7 @@ import PiSwiftDurableTesting
         let setup = HarnessChatSetup(); let first = HarnessGatedResponse(message: chatAssistant("answer"))
         setup.models.setResponses([first.step]); let chat = try await openChat(setup: setup)
         let input = try await chat.root.submit(.input(content: .text("a")), context: .background); await first.reached.wait()
-        let write = try await chat.root.submit(.write(entry: EntryDraft(kind: "note")), context: .background)
+        let write = try await chat.root.submit(.write(entry: queuedNote("kept")), context: .background)
         let withdrawn = try await chat.root.submit(.input(content: .text("follow")), context: .background)
         #expect(try await withdrawn.abort(context: .background) == .aborted)
         #expect(try await withdrawn.wait(context: .background).reason == "aborted")
@@ -111,7 +111,7 @@ import PiSwiftDurableTesting
         let input = try await chat.root.submit(.input(content: .text("a")), context: .background); await first.reached.wait()
         var followUp: Submission?
         switch boundary {
-        case "write": _ = try await chat.root.submit(.write(entry: EntryDraft(kind: "note")), context: .background)
+        case "write": _ = try await chat.root.submit(.write(entry: queuedNote("w")), context: .background)
         case "reset": try await chat.root.reset(context: .background)
         default: followUp = try await chat.root.submit(.input(content: .text("follow")), context: .background)
         }

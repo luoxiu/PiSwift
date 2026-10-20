@@ -1,6 +1,6 @@
 import PiSwiftChord
 
-/// A queued input or write waiting for a generation boundary.
+/// A queued input, with the entry it is placed as when not `pi.user`, or an entry write waiting for a generation boundary.
 public struct InboxItem: Sendable, Equatable, Codable {
     /// The queue or execution policy selected for this operation.
     public enum Mode: String, Sendable, Codable {
@@ -19,9 +19,11 @@ public struct InboxItem: Sendable, Equatable, Codable {
     public var content: JSONValue?
     /// The queued entry draft for a write submission.
     public var entry: EntryDraft?
+    /// The kind and data a queued input is placed as, stored as its `entry`; nil places it as `pi.user`.
+    public var inputEntry: InputEntry?
     /// Pairs a queued submission with its admission mode and input or entry content.
-    public init(id: SubmissionID, mode: Mode, content: JSONValue? = nil, entry: EntryDraft? = nil) {
-        self.id = id; self.mode = mode; self.content = content; self.entry = entry
+    public init(id: SubmissionID, mode: Mode, content: JSONValue? = nil, entry: EntryDraft? = nil, inputEntry: InputEntry? = nil) {
+        self.id = id; self.mode = mode; self.content = content; self.entry = entry; self.inputEntry = inputEntry
     }
     private enum Keys: String, CodingKey { case id, mode, content, entry }
     /// Decodes this value from its durable JSON representation.
@@ -30,10 +32,20 @@ public struct InboxItem: Sendable, Equatable, Codable {
         id = try container.decode(SubmissionID.self, forKey: .id)
         mode = try container.decode(Mode.self, forKey: .mode)
         if mode == .write {
-            entry = try container.decode(EntryDraft.self, forKey: .entry); content = nil
+            entry = try container.decode(EntryDraft.self, forKey: .entry); content = nil; inputEntry = nil
         } else {
             content = try container.decode(JSONValue.self, forKey: .content); entry = nil
+            inputEntry = try container.decodeIfPresent(InputEntry.self, forKey: .entry)
         }
+    }
+    /// Encodes this value with the durable JSON representation.
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: Keys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(mode, forKey: .mode)
+        try container.encodeIfPresent(content, forKey: .content)
+        if mode == .write { try container.encodeIfPresent(entry, forKey: .entry) }
+        else { try container.encodeIfPresent(inputEntry, forKey: .entry) }
     }
 }
 /// The ordered queue stored in the conversation inbox document.
@@ -79,6 +91,19 @@ public func prepareBoundary(tx: Transaction, conversationId: ConversationID, mod
     let inbox = try await tx.doc(InboxDoc, conversationId: conversationId)
     return Boundary(conversationId: conversationId, inbox: inbox, steeringMode: modes.steeringMode, followUpMode: modes.followUpMode, head: head)
 }
+/// Appends the entry an input is placed as: `entry`'s kind and data, or `pi.user`, with the input's user message.
+internal func appendInput(tx: Transaction, conversationId: ConversationID, message: JSONValue, entry: InputEntry?) async throws -> EntryRecord {
+    try await tx.appendEntry(conversationId, value: EntryDraft(kind: entry?.kind ?? userEntry.kind, model: [message], data: entry?.data))
+}
+/// Whether a write is display-only: it has no `model`, `head`, or `edits` (present counts, even if empty), so it changes
+/// nothing the model sees and needs no boundary.
+internal func isDisplayOnly(_ entry: EntryDraft) -> Bool {
+    entry.model == nil && entry.head == nil && entry.edits == nil
+}
+/// Whether a reset (`head: .self` write) is queued; entries appended before it leave the active range when it lands.
+internal func hasQueuedReset(_ items: [InboxItem]) -> Bool {
+    items.contains { $0.mode == .write && $0.entry?.head == .self }
+}
 internal func isStale(boundary: Boundary, entry: EntryDraft) -> Bool {
     if case .entry(let head) = entry.head, let active = boundary.head { return head < active }
     return false
@@ -88,7 +113,7 @@ public func applyBoundary(tx: Transaction, boundary: Boundary, at: BoundaryPoint
     var boundary = boundary
     let values = try boundary.inbox.snapshot().decode(InboxState.self).items
     let items = try boundary.inbox.child("items")!
-    let reset = values.contains { $0.mode == .write && $0.entry?.head == .self }
+    let reset = hasQueuedReset(values)
     func pick(_ mode: InboxItem.Mode, _ queue: QueueMode) -> [Int] {
         let indexes = values.indices.filter { values[$0].mode == mode }
         return queue == .all ? indexes : Array(indexes.prefix(1))
@@ -106,7 +131,7 @@ public func applyBoundary(tx: Transaction, boundary: Boundary, at: BoundaryPoint
     for index in users {
         let item = values[index]
         let message: JSONValue = .object(["role": .string("user"), "content": item.content!, "timestamp": .number(Double(now))])
-        let entry = try await tx.appendEntry(boundary.conversationId, value: EntryDraft(kind: userEntry.kind, model: [message]))
+        let entry = try await appendInput(tx: tx, conversationId: boundary.conversationId, message: message, entry: item.inputEntry)
         try tx.placeSubmission(item.id, entry: entry.id); placed.append(item.id)
     }
     for index in (writes + users).sorted(by: >) { try items.splice(index, deleteCount: 1) }

@@ -61,7 +61,8 @@ private func advancedShow(_ conversation: Conversation, label: String) async thr
 }
 
 @Suite struct UpstreamAdvancedExamplesTests {
-    // 20-inbox.ts: reject, withdraw, queue modes, settlements, and transcript.
+    // 20-inbox.ts: reject, withdraw, queue modes, settlements, and transcript. The example still says writes queue;
+    // since e6b9a6af5 its data-only note is appended at once.
     @Test func inbox() async throws {
         let setup = HarnessChatSetup(settings: .init(followUpMode: .all))
         let firstAnswer = HarnessGatedResponse(message: chatAssistant("Answer to the first question."))
@@ -81,8 +82,9 @@ private func advancedShow(_ conversation: Conversation, label: String) async thr
         }
         #expect(try await withdrawn.abort(context: .background) == .aborted)
         let inbox = try #require(try await chat.harness.snapshot(InboxDoc, conversationId: chat.root.id, context: .background))
-        #expect(inbox.items.map(\.id) == [followUp.id, steer.id, note.id])
-        #expect(inbox.items.map(\.mode) == [.followUp, .steer, .write])
+        #expect(try await note.status(context: .background).status == "done")
+        #expect(inbox.items.map(\.id) == [followUp.id, steer.id])
+        #expect(inbox.items.map(\.mode) == [.followUp, .steer])
         firstAnswer.release()
         let settledFirst = try await first.wait(context: .background)
         let settledFollowUp = try await followUp.wait(context: .background)
@@ -95,7 +97,7 @@ private func advancedShow(_ conversation: Conversation, label: String) async thr
         #expect(try await note.wait(context: .background).status == "done")
         #expect(try await withdrawn.wait(context: .background).status == "unanswered")
         #expect(try await withdrawn.wait(context: .background).reason == "aborted")
-        #expect(try await allEntries(chat.root).map(\.kind) == ["pi.user", "pi.assistant", "app.note", "pi.user", "pi.user", "pi.assistant"])
+        #expect(try await allEntries(chat.root).map(\.kind) == ["pi.user", "app.note", "pi.assistant", "pi.user", "pi.user", "pi.assistant"])
         #expect(try await advancedTexts(chat.root, role: "assistant") == ["Answer to the first question.", "Answer to the follow-up and the steer."])
         try await chat.harness.close(context: .background)
     }

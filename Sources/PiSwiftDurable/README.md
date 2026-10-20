@@ -163,9 +163,28 @@ instead of becoming orphaned. `runtime.abortOwned` aborts an owned task and wait
 `runtime.ownedTasks` lists the live tasks a task owns directly, whichever invocation made them.
 
 Busy input defaults to a follow-up. `.steer` joins after the tool round.
-`.reject` rejects busy admission. Writes append without a model call. Example 20 checks
-steering, follow-ups, and queued withdrawal. Tasks can wait for children with `.failFast`
+`.reject` rejects busy admission. Writes append without a model call. A write of only
+`kind` and `data` changes nothing the model sees, so it is appended at once, even mid-run,
+and never queues: a chat message shows as soon as it is sent, ahead of items still queued.
+Only a queued reset holds it back, so the reset does not hide it. A write with `model`,
+`head`, or `edits` waits for the next boundary like a steer. After a failed run, queued
+items wait until the next input or queued write places them. Example 20 checks steering,
+follow-ups, and queued withdrawal. Tasks can wait for children with `.failFast`
 or `.allSettled`. Example 24 checks fail-fast, abort propagation, and restart.
+
+An input is placed as a `pi.user` entry. Give it an `entry` to place it as your kind and
+data instead. The model still sees `content` as the user message. Supply `root` and `context`:
+
+```swift
+let mention = try await root.submit(.input(content: .text("ann: can you check the build?"),
+    entry: InputEntry(kind: "chat.mention", data: ["author": "ann", "text": "can you check the build?"])),
+    context: context)
+// Placed as a chat.mention entry with that data and the user message "ann: can you check the build?".
+```
+
+It behaves like any other input: it starts a run, steers, follows up, or is rejected, and
+is answered. While queued, its inbox item carries the entry. The kind must not be empty or
+start with `pi.`.
 
 ## Watching
 
@@ -430,6 +449,8 @@ Harness's own bookkeeping, such as a scheduler commit, fails the Harness.
   is a sleeping task that keeps nothing alive. Upstream evicts only on commits where timers cannot
   be unreferenced; here that applies when the Session's internal timer declines, which only tests
   do. `PI_DURABLE_DOCUMENT_RETENTION_MS` replaces the default for the test suite's second run.
+- `InputEntry` holds only `kind` and `data`, so taking those two members of an input's entry is
+  its decoding. A queued input's entry is `InboxItem.inputEntry`, stored as upstream's `entry`.
 - This library has no CLI or TUI code. PowerShell and Windows process support are outside scope.
 
 Upstream examples 00–31 have Swift integration tests with assertions for the library

@@ -4,6 +4,11 @@ import PiSwiftAI
 import PiSwiftDurableTesting
 @testable import PiSwiftDurable
 
+/// A write that affects model context, so it queues while busy; a data-only write would be appended at once.
+func queuedNote(_ text: String) throws -> EntryDraft {
+    EntryDraft(kind: "note", model: try EntryRecord.encodeMessages([.user(UserMessage(content: .text(text), timestamp: 0))]))
+}
+
 @Suite struct HarnessInboxTests {
     private func openBusy(storage: any DurableStorage = MemoryStorage()) async throws -> (Harness, Conversation) {
         let opened = try await openHarness(storage: storage)
@@ -23,7 +28,7 @@ import PiSwiftDurableTesting
     @Test func boundariesPlaceWritesFirstAndSelectModesInIDOrder() async throws {
         let (h, root) = try await openBusy()
         let follow1 = try await root.submit(.input(content: .text("f1")), context: .background)
-        let write = try await root.submit(.write(entry: EntryDraft(kind: "note")), context: .background)
+        let write = try await root.submit(.write(entry: queuedNote("w")), context: .background)
         let steer1 = try await root.submit(.input(content: .text("s1"), whenBusy: .steer), context: .background)
         let follow2 = try await root.submit(.input(content: .text("f2")), context: .background)
         let steer2 = try await root.submit(.input(content: .text("s2"), whenBusy: .steer), context: .background)
@@ -98,12 +103,12 @@ import PiSwiftDurableTesting
         _ = try h.subscribeCommits { publication, _ in
             for change in publication.changes { if case .document(let doc) = change, doc.record.kind == "pi.inbox", !doc.ops.isEmpty { changes.append(doc) } }
         }
-        let w1 = try await root.submit(.write(entry: EntryDraft(kind: "note")), context: .background)
+        let w1 = try await root.submit(.write(entry: queuedNote("w")), context: .background)
         let f1 = try await root.submit(.input(content: .text("f1")), context: .background)
-        let w2 = try await root.submit(.write(entry: EntryDraft(kind: "note")), context: .background)
+        let w2 = try await root.submit(.write(entry: queuedNote("w")), context: .background)
         let f2 = try await root.submit(.input(content: .text("f2")), context: .background)
-        let w3 = try await root.submit(.write(entry: EntryDraft(kind: "note")), context: .background)
-        let expected = [InboxItem(id: w1.id, mode: .write, entry: EntryDraft(kind: "note")), InboxItem(id: f1.id, mode: .followUp, content: .string("f1")), InboxItem(id: w2.id, mode: .write, entry: EntryDraft(kind: "note")), InboxItem(id: f2.id, mode: .followUp, content: .string("f2")), InboxItem(id: w3.id, mode: .write, entry: EntryDraft(kind: "note"))]
+        let w3 = try await root.submit(.write(entry: queuedNote("w")), context: .background)
+        let expected = try [InboxItem(id: w1.id, mode: .write, entry: queuedNote("w")), InboxItem(id: f1.id, mode: .followUp, content: .string("f1")), InboxItem(id: w2.id, mode: .write, entry: queuedNote("w")), InboxItem(id: f2.id, mode: .followUp, content: .string("f2")), InboxItem(id: w3.id, mode: .write, entry: queuedNote("w"))]
         for index in expected.indices {
             #expect(changes.values[index].ops == [.splice([.key("items")], index: index, remove: 0, items: [try JSONValue(encoding: expected[index])])])
         }
@@ -128,7 +133,7 @@ import PiSwiftDurableTesting
     @Test func withdrawQueuedInputsRetainsPassiveWrites() async throws {
         let (h, root) = try await openBusy()
         let f = try await root.submit(.input(content: .text("follow")), context: .background)
-        let w = try await root.submit(.write(entry: EntryDraft(kind: "note")), context: .background)
+        let w = try await root.submit(.write(entry: queuedNote("w")), context: .background)
         let s = try await root.submit(.input(content: .text("steer"), whenBusy: .steer), context: .background)
         try await root.commit({ tx in try await withdrawQueuedInputs(tx: tx, conversationId: root.id) }, context: .background)
         #expect(try await f.wait(context: .background).reason == "aborted")

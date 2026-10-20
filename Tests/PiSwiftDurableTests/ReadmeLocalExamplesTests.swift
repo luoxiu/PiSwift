@@ -116,6 +116,30 @@ import PiSwiftDurableTesting
         } else { Issue.record("Expected an echo tool result") }
         try await harness.close(context: context)
     }
+    @Test func inputEntry() async throws {
+        let context = ChordContext.background
+        let models = FakeDurableModels(responses: [.message(fauxAssistantMessage(
+            content: [.text(TextContent(text: "On it."))], timestamp: 1))])
+        let harness = try await Harness.open(storage: MemoryStorage(),
+            options: .init(models: models, registry: createRegistry()), context: context)
+        let root = try await harness.root(options: .init(agent: .init(
+            model: .set(.init(provider: "faux", modelId: "faux-1")))), context: context)
+        // README: input-entry
+        let mention = try await root.submit(.input(content: .text("ann: can you check the build?"),
+            entry: InputEntry(kind: "chat.mention", data: ["author": "ann", "text": "can you check the build?"])),
+            context: context)
+        // Placed as a chat.mention entry with that data and the user message "ann: can you check the build?".
+        // README: end
+        let settled = try await mention.wait(context: context)
+        let entries = try await root.entries(order: .ascending, limit: 10, context: context).items
+        let placed = try #require(entries.first)
+        #expect(settled.status == "done")
+        #expect(entries.map(\.kind) == ["chat.mention", "pi.assistant"])
+        #expect(placed.data == ["author": "ann", "text": "can you check the build?"])
+        #expect(try textOf(placed.messages()?.first) == "ann: can you check the build?")
+        try await harness.close(context: context)
+    }
+
     @Test func codingTools() async throws {
         let directory = try readmeLocalDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }

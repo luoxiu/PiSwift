@@ -13,11 +13,12 @@ private func assistant(_ text: String, _ calls: [String] = [], reason: StopReaso
 private func result(_ id: String, _ text: String) -> Message {
     .toolResult(ToolResultMessage(toolCallId: id, toolName: "read", content: [.text(TextContent(text: text))], isError: false, timestamp: 0))
 }
-private func rangeView(_ entries: [(String, Message)], marker: String? = nil) throws -> ContextView {
+/// Builds a context view of one message per entry; an entry without a message is display-only.
+private func rangeView(_ entries: [(String, Message?)], marker: String? = nil) throws -> ContextView {
     var records: [EntryRecord] = []
     if let marker { records.append(EntryRecord(id: try EntryID(1), conversationId: rootConversationID, kind: "pi.compaction", model: try EntryRecord.encodeMessages([user(marker)]), head: try EntryID(1))) }
     records += try entries.enumerated().map { index, value in
-        EntryRecord(id: try EntryID(Int64(index + 2)), conversationId: rootConversationID, kind: value.0, model: try EntryRecord.encodeMessages([value.1]))
+        EntryRecord(id: try EntryID(Int64(index + 2)), conversationId: rootConversationID, kind: value.0, model: try EntryRecord.encodeMessages(value.1.map { [$0] } ?? []))
     }
     let contributions = try records.map { record in
         try (record.messages() ?? []).filter { message in
@@ -48,7 +49,7 @@ struct HarnessCompactionRangeTests {
     }
     // harness-compaction.test.ts:253
     @Test func longRunCutsAtAssistantAndRetainsItsResult() throws {
-        var entries: [(String, Message)] = [("pi.user", user("do it"))]
+        var entries: [(String, Message?)] = [("pi.user", user("do it"))]
         for index in 0..<5 {
             entries.append(("pi.assistant", assistant("step \(index)", ["c\(index)"])))
             entries.append(("pi.tool-result", result("c\(index)", compactionText("r\(index)", 100))))
@@ -56,6 +57,16 @@ struct HarnessCompactionRangeTests {
         let view = try rangeView(entries)
         let cut = try #require(generationSelectCut(view: view, keepRecentTokens: 150))
         #expect(cut == 9 && view.entries[cut].kind == "pi.assistant")
+    }
+    // harness-compaction.test.ts:264 at e6b9a6af5 (#10407).
+    @Test func neverCutsAtADisplayOnlyEntryWhereTheBudgetIsReached() throws {
+        let view = try rangeView([
+            ("pi.user", user(compactionText("u1", 100))), ("pi.assistant", assistant(compactionText("a1", 100))),
+            ("chat.message", nil), ("pi.assistant", assistant(compactionText("a2", 100)))
+        ])
+        // The budget is reached at a1; the display-only entry after it is skipped for the assistant a2.
+        #expect(generationSelectCut(view: view, keepRecentTokens: 150) == 1)
+        #expect(generationSelectCut(view: view, keepRecentTokens: 50) == 3)
     }
     // harness-compaction.test.ts:265
     @Test func largeLastResultStaysWithItsAssistant() throws {

@@ -20,7 +20,10 @@ public final class Conversation: Sendable {
     public func configure(change: AgentChange, context: ChordContext) async throws {
         try await commit({ tx in try await PiSwiftDurable.configure(tx: tx, conversationId: id, change: change) }, context: context)
     }
-    /// Durably admits user input or an entry write and returns its submission handle.
+    /// Durably admits user input or an entry write and returns its submission handle. A busy conversation, or one
+    /// with queued items, queues input and writes that affect model context in `pi.inbox`; `.reject` rejects input with
+    /// `ConversationBusy` instead and writes nothing. A write of only `kind` and `data` (no `model`, `head`, or `edits`)
+    /// is appended at once, even mid-run, as it changes nothing the model sees.
     public func submit(_ draft: SubmissionDraft, context: ChordContext) async throws -> Submission {
         try await withTaskCancellationContext(try bound(context)) { context in
             try harness.assertOpen()
