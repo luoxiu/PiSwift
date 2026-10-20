@@ -129,17 +129,7 @@ extension TaskScheduler {
     }
     func commitState(_ tx: Transaction, invocation: TaskInvocation, current: TaskRecord, next: TaskState) async throws {
         if case .waiting(_, let on, let policy, _) = next {
-            if invocation.abort { throw SessionError.message("Abort handler of task \(current.id.rawValue) cannot wait") }
-            let overlay = try TaskOverlay(tx)
-            try await loadChain(current.parent, overlay: overlay)
-            let owners = Set(above(current.parent, overlay: overlay).compactMap { step -> TaskID? in if case .task(let owner, _) = step { return owner }; return nil })
-            for id in on {
-                if id == current.id || owners.contains(id) { throw SessionError.message("Task \(current.id.rawValue) cannot wait on itself or its owner \(id.rawValue)") }
-                let record: TaskRecord?
-                if let found = overlay.tasks[id] ?? self.current(id) { record = found } else { record = try await storage.task(id, context: context) }
-                guard let record else { throw SessionError.message("Task \(id.rawValue) does not exist") }
-                if policy == .failFast && record.owner != current.id { throw SessionError.message("Task \(current.id.rawValue) can wait failFast only on tasks it owns; \(id.rawValue) is not one") }
-            }
+            try await validateWait(tx, invocation: invocation, current: current, on: on, policy: policy)
         }
         switch next {
         case .terminal(let outcome, _):
@@ -149,6 +139,34 @@ extension TaskScheduler {
             try await terminate(tx, record: current, outcome: outcome)
         case .running, .waiting: try tx.setTask(current.replacing(state: next))
         default: throw SessionError.message("A task handler can commit only running, waiting, or terminal state")
+        }
+    }
+    /// A wait names existing tasks, and `failFast` only tasks the waiter owns. It may not close a cycle in the wait-for
+    /// graph, whose edges run from each task to what it waits on and to its live ordinary owned work (spec §5.5); waiting
+    /// on itself or on an owner holding it are the shortest such cycles. An abort handler cannot wait.
+    ///
+    /// Invariant: the wait-for graph is acyclic. Only a wait adds an edge between existing tasks, as a new task has only
+    /// incoming edges, so checking each wait maintains it.
+    private func validateWait(_ tx: Transaction, invocation: TaskInvocation, current: TaskRecord, on: [TaskID],
+                              policy: JoinPolicy) async throws {
+        if invocation.abort { throw SessionError.message("Abort handler of task \(current.id.rawValue) cannot wait") }
+        var overlay = try TaskOverlay(tx)
+        var targets: [TaskID] = []
+        for id in on {
+            let record: TaskRecord?
+            if let found = overlay.tasks[id] ?? self.current(id) { record = found } else { record = try await storage.task(id, context: context) }
+            guard let record else { throw SessionError.message("Task \(id.rawValue) does not exist") }
+            if policy == .failFast && record.owner != current.id { throw SessionError.message("Task \(current.id.rawValue) can wait failFast only on tasks it owns; \(id.rawValue) is not one") }
+            // A live child already holds the waiter (task-owned tasks are never background): waiting on it adds no edge. A
+            // terminal task has no edges.
+            if record.state.status != "terminal" && record.owner != current.id { targets.append(id) }
+        }
+        if targets.isEmpty { return }
+        // Owned work is found by walks down, which need the chains of every live task loaded.
+        try await loadScopes()
+        if let cycle = state.withLock({ $0.waitCycle(current.id, targets, overlay: &overlay) }) {
+            let path = ([current.id] + cycle).map { String($0.rawValue) }.joined(separator: " -> ")
+            throw SessionError.message("Task \(current.id.rawValue) cannot wait on \(cycle[0].rawValue): \(path) is a wait cycle")
         }
     }
     func settleIdle() {

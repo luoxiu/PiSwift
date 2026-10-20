@@ -99,7 +99,14 @@ import PiSwiftDurableTesting
         } else { id = try await harnessStart(root, definition) }
         if mode == "abort-wait" { _ = try await harness.abortTask(id: id, context: .background) }
         let receipt = try await harness.waitForTask(id: id, context: .background)
-        #expect(receipt.outcome.status == "faulted")
+        guard case .faulted(let error, _) = receipt.outcome else { Issue.record("Must fault, got \(receipt.outcome)"); return }
+        let message = switch mode {
+        case "self", "owner": "is a wait cycle"
+        case "missing": "does not exist"
+        case "failFast-unowned": "only on tasks it owns"
+        default: "cannot wait"
+        }
+        #expect(error.message.contains(message), "\(error.message)")
         try await harness.close(context: .background)
     }
 

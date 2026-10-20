@@ -52,6 +52,12 @@ public final class TaskRuntime: Sendable {
     /// Commits state only while this invocation still owns the task. Inside the callback read only through `tx`:
     /// `snapshot`, `documentState`, `watchDoc`, `getTask`, and the other Session and runtime reads may queue on the line
     /// the callback holds, and then never return.
+    ///
+    /// A `waiting` state rejects when `on` names a missing task or closes a cycle in the wait-for graph, which no task on
+    /// it could finish first. Its edges run from each task to the tasks it waits on, unless it is abort-marked, and to
+    /// its live ordinary owned work, which holds it as `completing`. Waiting on itself or on an owner that holds it closes
+    /// the shortest such cycles; a background task may wait on the owner of its conversation. The rejection names the
+    /// cycle. Only durable waits are edges: `waitForTask` and a nested call's wait are not checked.
     public func commit(_ change: (Transaction, TaskRecord) async throws -> TaskState?,
                        context: ChordContext) async throws {
         try await withTaskCancellationContext(context) { context in

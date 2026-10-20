@@ -181,6 +181,48 @@ extension TaskScheduler.State {
         var overlay = TaskOverlay.empty
         return hasOwnedLive(owner, overlay: &overlay)
     }
+    /// The path from a member of `on` back to `task` in the wait-for graph, if the wait would close a cycle (spec §5.1).
+    /// An edge X -> Y means X cannot settle before Y: Y is in the `on` of waiting X that is not abort-marked, or Y is live
+    /// ordinary owned work of X, which holds X as `completing`. Each task is visited once and each subtree walked once, so
+    /// a check is bounded by the live work it reaches. Owner chains must be loaded.
+    mutating func waitCycle(_ task: TaskID, _ on: [TaskID], overlay: inout TaskOverlay) -> [TaskID]? {
+        var from: [TaskID: TaskID?] = [:]
+        // Upstream's `walked`; named apart from the walk probe.
+        var walkedTasks = Set<TaskID>()
+        var pending: [TaskID] = []
+        func reach(_ id: TaskID, _ via: TaskID?) {
+            if from.keys.contains(id) { return }
+            from[id] = .some(via)
+            pending.append(id)
+        }
+        func path(_ end: TaskID) -> [TaskID] {
+            var steps: [TaskID] = []
+            var at: TaskID? = end
+            while let step = at { steps.append(step); at = from[step] ?? nil }
+            return steps.reversed()
+        }
+        for id in on { reach(id, nil) }
+        while let id = pending.popLast() {
+            if id == task { return path(id) }
+            guard let record = overlay.tasks[id] ?? live[id], record.state.status != "terminal" else { continue }
+            // An abort-marked task waits only for its owned work, as abort runs bottom-up (`waitingOn`).
+            if case .waiting(_, let members, _, _) = record.state, !record.abortRequested {
+                for member in members { reach(member, id) }
+            }
+            if !walkedTasks.insert(id).inserted { continue }
+            // Below a walked task the walk does not go again: its own walk covered what lies below.
+            var found: [TaskID] = []
+            let entered = walkedTasks
+            walkDown(.task(id), overlay: &overlay, enter: { !entered.contains($0) }) { below, node, live in
+                guard live != nil, !node.background else { return true }
+                found.append(below)
+                reach(below, id)
+                return true
+            }
+            walkedTasks.formUnion(found)
+        }
+        return nil
+    }
     /// Live tasks a task waits for before its next invocation: its live ordinary owned work when abort-marked, since
     /// abort runs bottom-up, otherwise the live part of the `on` of a wait; with `first`, only the first.
     mutating func waitingOn(_ record: TaskRecord, first: Bool = false) -> [TaskID] {

@@ -557,7 +557,9 @@ private func subagentCycle(_ opened: Retention, parent: TaskID, _ n: Int) async 
         }
     }
 
-    @Test func stillRejectsWaitingOnAForgottenEndedOwner() async throws {
+    // A wait on an ended task closes no cycle (#10411), also when the ended task owns the waiter's conversation and the
+    // scheduler forgot it: the wait resumes at once.
+    @Test func letsATaskWaitOnAForgottenEndedOwner() async throws {
         try await withSqlitePath { path in
             let opened = try await open(SqliteStorage.open(path: path))
             let harness = opened.harness, tasks = opened.tasks
@@ -572,8 +574,7 @@ private func subagentCycle(_ opened: Retention, parent: TaskID, _ n: Int) async 
                 try await tx.createTask(tasks.waiter, input: .init(on: [tree.b]), options: .init(ownership: .conversation()))
             }, context: .background)
             let settled = try await harness.waitForTask(id: waiter, context: .background)
-            guard case .faulted(let error, _) = settled.outcome else { Issue.record("Waiter must fault, got \(settled.outcome)"); return }
-            #expect(error.message.contains("cannot wait on itself or its owner"))
+            #expect(settled.outcome.status == "completed", "\(settled.outcome)")
             try await harness.close(context: .background)
         }
     }

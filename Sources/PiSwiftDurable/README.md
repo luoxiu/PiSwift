@@ -183,6 +183,8 @@ Only a queued reset holds it back, so the reset does not hide it. A write with `
 items wait until the next input or queued write places them. Example 20 checks steering,
 follow-ups, and queued withdrawal. Tasks can wait for children with `.failFast`
 or `.allSettled`. Example 24 checks fail-fast, abort propagation, and restart.
+A wait that would close a cycle of waits and owners held by live work is rejected, and the
+error names the cycle. A background task may wait on the owner of its conversation.
 
 An input is placed as a `pi.user` entry. Give it an `entry` to place it as your kind and
 data instead. The model still sees `content` as the user message. Supply `root` and `context`:
