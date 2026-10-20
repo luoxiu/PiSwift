@@ -36,6 +36,15 @@ Changes go to storage before observers receive them. A transcript normally conta
 `pi.tool-result`. Built-in documents include `pi.agent`, `pi.provider`, `pi.live`,
 `pi.inbox`, and `pi.usage`.
 
+Providers take only a leading system message as the initial prompt and tool set. A run's
+input is committed before generation writes its system prompt, so context derivation moves
+the first system message to the front when only user messages precede it, or when it is
+the baseline. The baseline is the first `pi.system` entry after the head marker, unless an
+edit targets it. Without a head marker, it is the baseline only if no earlier entry carries
+a system message, even one an edit omits later. After a compaction, the baseline thus leads
+the kept history, assistant messages included. Any other system message after an assistant
+message stays in place. Stored entries and `contributions` keep the committed order.
+
 Calls take a `ChordContext`. `ChordContext.background` does not cancel.
 `ChordContextKey` carries typed values. These names replace upstream `Context` and
 `ContextKey`. PiSwiftAI already has a public `Context`. This rename is the user's choice.

@@ -20,6 +20,17 @@ private func h6SameView(_ left: ContextView, _ right: ContextView) throws -> Boo
     let rightContributions = try right.contributions.map(EntryRecord.encodeMessages)
     return left.head == right.head && left.entries == right.entries && leftMessages == rightMessages && leftContributions == rightContributions
 }
+private func h6System(_ key: String, kind: String = "message") throws -> EntryDraft {
+    EntryDraft(kind: kind, model: try EntryRecord.encodeMessages([.system(SystemMessage(content: .text(""), sections: .init([(key, key)]), timestamp: 1))]))
+}
+private func h6Describe(_ message: Message) -> String {
+    switch message {
+    case .user(let user): if case .text(let text) = user.content { return "user:\(text)" }; return "user"
+    case .assistant(let assistant): return "assistant:\(assistant.content.compactMap { if case .text(let text) = $0 { text.text } else { nil } }.joined())"
+    case .system(let system): return "system:\(system.sections?.entries.map(\.name).joined(separator: ",") ?? "")"
+    case .toolResult(let result): return "result:\(result.toolCallId)"
+    }
+}
 private func h6ContextSetup(settings: HarnessSettings = .init(), clock: any DurableClock = SystemDurableClock()) async throws -> (Harness, Registry, Conversation, H6CountingStorage, EntryRecord) {
     let storage = H6CountingStorage(), registry = Registry()
     let harness = try await Harness.open(storage: storage,
@@ -86,6 +97,69 @@ private func h6ContextSetup(settings: HarnessSettings = .init(), clock: any Dura
         try registry.install(Extension(name: "range", tasks: [AnyTaskDefinition(definition)]))
         #expect(try await harness.waitForTask(id: harnessStart(root, definition), context: .background).outcome == .completed(result: 1))
         #expect(rows.values == [4, 2, 0])
+        try await harness.close(context: .background)
+    }
+
+    // upstream harness-context.test.ts, #10904.
+    @Test func extendedReadFindsTheBaselineAmongAddedEntries() async throws {
+        let (harness, registry, root, storage, first) = try await h6ContextSetup()
+        let definition = harnessOneStep("test.h6-context-baseline") { _, runtime, context in
+            func append(_ conversation: ConversationID, _ draft: EntryDraft) async throws -> EntryRecord {
+                let added = Mutex<EntryRecord?>(nil)
+                try await runtime.commit({ tx, _ in
+                    let entry = try await tx.appendEntry(conversation, value: draft)
+                    added.withLock { $0 = entry }
+                    return nil
+                }, context: context)
+                return try #require(added.withLock { $0 })
+            }
+            func read(_ conversation: Conversation) async throws -> (messages: [String], rows: Int) {
+                let before = storage.rows
+                let view = try await runtime.context(conversation.id, context: context)
+                let rows = storage.rows - before
+                #expect(try h6SameView(view, await conversation.context(context: context)))
+                return (view.messages.map(h6Describe), rows)
+            }
+            // The cached range has answers and no system message; the baseline arrives in a later read.
+            #expect(try await read(root).messages.first == "user:first")
+            _ = try await append(root.id, h6System("plan", kind: "pi.system"))
+            var extended = try await read(root)
+            // One bounds probe and the added entry: the range was extended, not derived again.
+            #expect(extended.rows == 2)
+            #expect(Array(extended.messages.prefix(3)) == ["system:plan", "user:first", "assistant:old 0"])
+
+            // A system message the cached range already has keeps a later first `pi.system` entry in place.
+            let fork = try await root.fork(at: first.id, options: .init(ownership: .ownerless()), context: context)
+            _ = try await append(fork.id, h6Assistant("answer")); _ = try await append(fork.id, h6System("note", kind: "host.system"))
+            #expect(try await read(fork).messages == ["user:first", "assistant:answer", "system:note"])
+            _ = try await append(fork.id, h6System("note", kind: "pi.system"))
+            extended = try await read(fork)
+            #expect(extended.rows == 2)
+            #expect(extended.messages == ["user:first", "assistant:answer", "system:note", "system:note"])
+
+            // An omitted system message still rules out a later baseline; the extended read keeps that.
+            let omitted = try await root.fork(at: first.id, options: .init(ownership: .ownerless()), context: context)
+            _ = try await append(omitted.id, h6Assistant("answer"))
+            let host = try await append(omitted.id, h6System("legacy", kind: "host.system"))
+            _ = try await append(omitted.id, EntryDraft(kind: "edit", edits: [.omit(target: host.id)]))
+            #expect(try await read(omitted).messages == ["user:first", "assistant:answer"])
+            _ = try await append(omitted.id, h6System("legacy", kind: "pi.system"))
+            extended = try await read(omitted)
+            #expect(extended.rows == 2)
+            #expect(extended.messages == ["user:first", "assistant:answer", "system:legacy"])
+
+            // A first `pi.system` entry without a system message leaves no baseline for a later one to take.
+            let empty = try await root.fork(at: first.id, options: .init(ownership: .ownerless()), context: context)
+            _ = try await append(empty.id, EntryDraft(kind: "pi.system")); _ = try await append(empty.id, h6Assistant("answer"))
+            #expect(try await read(empty).messages == ["user:first", "assistant:answer"])
+            _ = try await append(empty.id, h6System("s", kind: "pi.system"))
+            extended = try await read(empty)
+            #expect(extended.rows == 2)
+            #expect(extended.messages == ["user:first", "assistant:answer", "system:s"])
+            try await runtime.commit({ _, _ in try completed(1) }, context: context)
+        }
+        try registry.install(Extension(name: "baseline", tasks: [AnyTaskDefinition(definition)]))
+        #expect(try await harness.waitForTask(id: harnessStart(root, definition), context: .background).outcome == .completed(result: 1))
         try await harness.close(context: .background)
     }
 
@@ -208,9 +282,12 @@ private func h6ContextSetup(settings: HarnessSettings = .init(), clock: any Dura
     // upstream harness-context.test.ts:396. A fixed sequence includes edits, heads, cutoffs, and forks.
     @Test func incrementalReadsMatchWholeReadsThroughMixedTranscriptChanges() async throws {
         let (harness, registry, root, _, _) = try await h6ContextSetup()
+        let seen = Mutex<[String: Int]>([:])
         let definition = harnessOneStep("test.h6-mixed-context") { _, runtime, context in
+            func count(_ category: String) { seen.withLock { $0[category, default: 0] += 1 } }
             var written: [EntryRecord] = []
-            var seed: UInt32 = 7
+            // Seed 8 leads with a baseline past an assistant message at least once (#10904); seed 7 never did.
+            var seed: UInt32 = 8
             func random(_ maximum: Int) -> Int {
                 seed = seed &* 1_664_525 &+ 1_013_904_223
                 return Int((UInt64(seed) * UInt64(maximum)) >> 32)
@@ -225,7 +302,10 @@ private func h6ContextSetup(settings: HarnessSettings = .init(), clock: any Dura
                 case 5...7:
                     draft = EntryDraft(kind: "message", model: try EntryRecord.encodeMessages([.toolResult(ToolResultMessage(toolCallId: "c\(index - 1)", toolName: "tool", content: [.text(TextContent(text: "result"))], isError: false, timestamp: 1))]))
                 case 8:
-                    draft = EntryDraft(kind: "message", model: try EntryRecord.encodeMessages([.system(SystemMessage(content: .text(""), sections: .init([("s", "v\(index)")]), timestamp: 1))]))
+                    // `pi.system` entries can be the baseline that leads the context (#10904).
+                    let kind = random(2) == 0 ? "pi.system" : "message"
+                    count(kind == "pi.system" ? "baseline system" : "system")
+                    draft = EntryDraft(kind: kind, model: try EntryRecord.encodeMessages([.system(SystemMessage(content: .text(""), sections: .init([("s", "v\(index)")]), timestamp: 1))]))
                 case 9: draft = EntryDraft(kind: "note")
                 case 10...11 where !written.isEmpty:
                     let target = written[random(written.count)].id
@@ -238,7 +318,14 @@ private func h6ContextSetup(settings: HarnessSettings = .init(), clock: any Dura
                     _ = try await tx.appendEntry(root.id, value: draft); return nil
                 }, context: context)
                 let view = try await runtime.context(root.id, context: context)
-                #expect(try h6SameView(view, await root.context(context: context)))
+                let whole = try await root.context(context: context)
+                #expect(try h6SameView(view, whole))
+                let contributed = whole.contributions.flatMap { $0 }
+                if let first = contributed.firstIndex(where: { $0.role == "system" }), first > 0,
+                   try EntryRecord.encodeMessages([whole.messages[0]]) == EntryRecord.encodeMessages([contributed[first]]),
+                   contributed[..<first].contains(where: { $0.role == "assistant" }) {
+                    count("baseline past assistant")
+                }
                 written = try await allEntries(root, context: context)
                 if index.isMultiple(of: 10) {
                     let at = written[random(written.count)].id
@@ -257,6 +344,7 @@ private func h6ContextSetup(settings: HarnessSettings = .init(), clock: any Dura
         }
         try registry.install(Extension(name: "mixed", tasks: [AnyTaskDefinition(definition)]))
         _ = try await harness.waitForTask(id: harnessStart(root, definition), context: .background)
+        for category in ["system", "baseline system", "baseline past assistant"] { #expect(seen.withLock { $0[category] ?? 0 } > 0, "\(category)") }
         try await harness.close(context: .background)
     }
 

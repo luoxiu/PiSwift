@@ -89,6 +89,97 @@ private struct ContextTranscript {
         _ = try transcript.append(contextSystem("preamble"))
         #expect(try transcript.view().messages.map(contextDescription) == ["system:preamble", "user:handoff"])
     }
+    // #10904
+    @Test("leads with the baseline after a compaction that keeps assistant messages")
+    func baselineAfterCompaction() throws {
+        var transcript = ContextTranscript()
+        _ = try transcript.append(contextUser("old"))
+        let kept = try transcript.append(contextUser("kept"))
+        _ = try transcript.append(contextAssistant("calling", calls: ["a"])); _ = try transcript.append(contextResult("a"))
+        _ = try transcript.append(contextAssistant("answer"))
+        _ = try transcript.append(contextUser("summary"), kind: "summary", head: kept.id.rawValue)
+        _ = try transcript.append(contextUser("next"))
+        _ = try transcript.append(contextSystem("preamble"), kind: "pi.system")
+        #expect(try transcript.view().messages.map(contextDescription) == [
+            "system:preamble", "user:summary", "user:kept", "assistant:calling", "result:a:result a", "assistant:answer", "user:next",
+        ])
+        // Later system messages stay in place.
+        _ = try transcript.append(contextAssistant("done")); _ = try transcript.append(contextSystem("cwd"), kind: "pi.system")
+        let messages = try transcript.view().messages.map(contextDescription)
+        #expect(Array(messages.prefix(2)) == ["system:preamble", "user:summary"])
+        #expect(Array(messages.suffix(2)) == ["assistant:done", "system:cwd"])
+    }
+    // #10904
+    @Test("leads with a baseline written after the first answers, when the agent had no section or tool before")
+    func baselineAfterFirstAnswers() throws {
+        var transcript = ContextTranscript()
+        _ = try transcript.append(contextUser("first"), kind: "pi.user"); _ = try transcript.append(contextAssistant("answer"), kind: "pi.assistant")
+        _ = try transcript.append(contextUser("next"), kind: "pi.user"); _ = try transcript.append(contextSystem("plan"), kind: "pi.system")
+        #expect(try transcript.view().messages.map(contextDescription) == ["system:plan", "user:first", "assistant:answer", "user:next"])
+    }
+    // #10904
+    @Test("keeps system messages other than the baseline in place once an assistant message precedes them")
+    func otherSystemMessagesStay() throws {
+        var transcript = ContextTranscript()
+        _ = try transcript.append(contextUser("first")); _ = try transcript.append(contextAssistant("answer"))
+        // Another kind's system message is positional; the baseline after it is not the first system message.
+        _ = try transcript.append(contextSystem("note"), kind: "host.note"); _ = try transcript.append(contextSystem("preamble"), kind: "pi.system")
+        #expect(try transcript.view().messages.map(contextDescription) == ["user:first", "assistant:answer", "system:note", "system:preamble"])
+        // After a compaction that keeps the other kind's system message, the new baseline does not move ahead of it.
+        let kept = try transcript.append(contextUser("kept"))
+        _ = try transcript.append(contextAssistant("kept answer")); _ = try transcript.append(contextSystem("mode"), kind: "host.note")
+        _ = try transcript.append(contextUser("summary"), kind: "summary", head: kept.id.rawValue)
+        _ = try transcript.append(contextUser("next")); _ = try transcript.append(contextSystem("preamble"), kind: "pi.system")
+        #expect(try transcript.view().messages.map(contextDescription) == [
+            "user:summary", "user:kept", "assistant:kept answer", "system:mode", "user:next", "system:preamble",
+        ])
+    }
+    // #10904
+    @Test("does not lead with a first system entry written after another system message, even once that is omitted")
+    func earlierSystemMessageRulesOutBaseline() throws {
+        var transcript = ContextTranscript()
+        let host = try transcript.append(contextSystem("legacy"), kind: "host.system")
+        _ = try transcript.append(contextUser("first")); _ = try transcript.append(contextAssistant("answer"))
+        // Generation wrote this entry against the host's message: it only removes a section, so it is no baseline.
+        _ = try transcript.append(contextSystem("legacy"), kind: "pi.system")
+        _ = try transcript.append(kind: "edit", edits: [.omit(target: host.id)])
+        #expect(try transcript.view().messages.map(contextDescription) == ["user:first", "assistant:answer", "system:legacy"])
+        // The same holds for a system message an edit put before it.
+        var other = ContextTranscript()
+        let first = try other.append(contextUser("first"))
+        _ = try other.append(kind: "edit", edits: [.replace(target: first.id, messages: EntryRecord.encodeMessages([contextUser("first"), contextSystem("note")]))])
+        _ = try other.append(contextAssistant("answer")); _ = try other.append(contextSystem("note"), kind: "pi.system")
+        _ = try other.append(kind: "edit", edits: [.replace(target: first.id, messages: EntryRecord.encodeMessages([contextUser("first")]))])
+        #expect(try other.view().messages.map(contextDescription) == ["user:first", "assistant:answer", "system:note"])
+    }
+    // #10904
+    @Test("does not lead with a retained, edited, or later system entry in place of the baseline")
+    func retainedEditedOrLaterSystemEntries() throws {
+        var transcript = ContextTranscript()
+        let kept = try transcript.append(contextUser("kept"))
+        _ = try transcript.append(contextAssistant("answer"))
+        let retained = try transcript.append(contextSystem("cwd"), kind: "pi.system")
+        // Before generation writes the baseline after the head marker, a retained system entry stays in place.
+        _ = try transcript.append(contextUser("summary"), kind: "summary", head: kept.id.rawValue)
+        _ = try transcript.append(contextUser("next"))
+        #expect(try transcript.view().messages.map(contextDescription) == ["user:summary", "user:kept", "assistant:answer", "system:cwd", "user:next"])
+        // The baseline omits the retained entry, as generation writes it, and leads.
+        let baseline = try transcript.append(contextSystem("preamble"), kind: "pi.system", edits: [.omit(target: retained.id)])
+        _ = try transcript.append(contextAssistant("done")); _ = try transcript.append(contextSystem("preamble"), kind: "pi.system")
+        #expect(try transcript.view().messages.map(contextDescription) == [
+            "system:preamble", "user:summary", "user:kept", "assistant:answer", "user:next", "assistant:done", "system:preamble",
+        ])
+        // An omitted baseline leaves no message to lead; the delta after it is not a baseline and stays in place.
+        _ = try transcript.append(kind: "edit", edits: [.omit(target: baseline.id)])
+        #expect(try transcript.view().messages.map(contextDescription) == [
+            "user:summary", "user:kept", "assistant:answer", "user:next", "assistant:done", "system:preamble",
+        ])
+        // A replacement of the baseline is not one either.
+        _ = try transcript.append(kind: "edit", edits: [.replace(target: baseline.id, messages: EntryRecord.encodeMessages([contextSystem("other")]))])
+        #expect(try transcript.view().messages.map(contextDescription) == [
+            "user:summary", "user:kept", "assistant:answer", "user:next", "system:other", "assistant:done", "system:preamble",
+        ])
+    }
     @Test("synthesizes missing tool results after a fork and drops results cut from their call")
     func missing() throws {
         var transcript = ContextTranscript()

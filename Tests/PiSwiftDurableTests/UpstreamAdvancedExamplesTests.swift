@@ -616,7 +616,10 @@ extension UpstreamAdvancedExamplesTests {
             }), context: .background)
         let root = try await harness.root(options: .init(agent: .init(model: .set(.init(provider: "faux", modelId: "tiny")))), context: .background)
         // The lines use the upstream show() format. The counts and lines equal the
-        // upstream script's output at v1.1.0, run in Node through the fixture mirror.
+        // upstream script's output at v1.1.0, run in Node through the fixture mirror,
+        // except that since 5713c9507 (#10904) the baseline written after a compaction
+        // leads the context: the system line moves from after the new input to the front.
+        // Upstream's script prints these lines without asserting them; not rerun in Node.
         let summaryLine = "  user      The conversation history before this point was compacted into the foll"
         let systemLine = "  system    (system prompt)"
         let stayLine = "  assistant A detailed answer to \"Where should we stay?\": details details details "
@@ -639,20 +642,20 @@ extension UpstreamAdvancedExamplesTests {
                 "  user      Which day trips?", tripsLine],
             "Any museums?": [
                 "after \"Any museums?\" (answered): 7 messages in context, 10 entries stored",
-                "  (threshold compaction summary first)", summaryLine, eatLine,
-                "  user      Which day trips?", tripsLine, "  user      Any museums?", systemLine, museumsLine],
+                "  (threshold compaction summary first)", systemLine, summaryLine, eatLine,
+                "  user      Which day trips?", tripsLine, "  user      Any museums?", museumsLine],
             "Nightlife?": [
                 "after \"Nightlife?\" (answered): 5 messages in context, 14 entries stored",
-                "  (threshold compaction summary first)", summaryLine, museumsLine,
-                "  user      Nightlife?", systemLine, nightlifeLine],
+                "  (threshold compaction summary first)", systemLine, summaryLine, museumsLine,
+                "  user      Nightlife?", nightlifeLine],
             "What should we pack?": [
                 "after \"What should we pack?\" (answered): 7 messages in context, 20 entries stored",
-                "  (manual compaction summary first)", summaryLine, nightlifeLine,
-                "  user      How do we get around?", aroundLine, "  user      What should we pack?", systemLine, packLine],
+                "  (manual compaction summary first)", systemLine, summaryLine, nightlifeLine,
+                "  user      How do we get around?", aroundLine, "  user      What should we pack?", packLine],
             "Summarize the plan for my partner": [
                 "after \"Summarize the plan for my partner\" (model_error): 4 messages in context, 24 entries stored",
-                "  (threshold compaction summary first)", summaryLine, packLine,
-                "  user      Summarize the plan for my partner", systemLine]
+                "  (threshold compaction summary first)", systemLine, summaryLine, packLine,
+                "  user      Summarize the plan for my partner"]
         ]
         func ask(_ question: String, expectedStatus: String = "done", expectedReason: String? = nil) async throws -> ContextView {
             let record = try await root.submit(.input(content: .text(question)), context: .background).wait(context: .background)

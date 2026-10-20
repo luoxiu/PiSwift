@@ -33,10 +33,11 @@ struct HarnessCompactionManualTests {
         #expect(request.options?.cacheRetention == CacheRetention.none && request.options?.maxTokens == 800 && request.options?.sessionId == provider.sessionId && request.options?.deferred == nil)
         #expect(try await compactionInputUsage(chat) > usageBefore)
         try await compactionTurn(chat, "next", "done")
+        // The next request: one complete system baseline leading the summary, the kept turn, and the new input (#10904).
         let agent = try #require(chat.script.agentRequests.last).messages
-        #expect(agent.map(\.role) == ["user", "user", "assistant", "user", "system"])
-        if case .system(let system) = agent[4] { #expect(system.sections?["preamble"] == "You are helpful.") }
-        else { Issue.record("The last message must be the system baseline") }
+        #expect(agent.map(\.role) == ["system", "user", "user", "assistant", "user"])
+        if case .system(let system) = agent[0] { #expect(system.sections?["preamble"] == "You are helpful.") }
+        else { Issue.record("The first message must be the system baseline") }
         try await chat.harness.close(context: .background)
     }
     // harness-compaction.test.ts:416
@@ -79,7 +80,10 @@ struct HarnessCompactionManualTests {
         chat.script.appendSummary([.message(chatAssistant("SUMMARY"))])
         _ = try await compactionOutcome(chat, chat.root.compact(context: .background)); gate.release()
         #expect(try await input.wait(context: .background).status == "done")
-        #expect(compactionFirstUser(try #require(chat.script.agentRequests.last).messages).contains("<summary>\nSUMMARY\n</summary>"))
+        // The continuation request starts with the new baseline, then the summary, ahead of the kept tool call (#10904).
+        let continuation = try #require(chat.script.agentRequests.last).messages
+        #expect(continuation.first?.role == "system")
+        #expect(continuation.count > 1 && (textOf(continuation[1]) ?? "").contains("<summary>\nSUMMARY\n</summary>"))
         #expect(try await compactionKinds(chat.root).suffix(4) == ["pi.tool-result", "pi.compaction", "pi.system", "pi.assistant"])
         try await chat.harness.close(context: .background)
     }
