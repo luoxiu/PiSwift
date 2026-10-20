@@ -36,7 +36,8 @@ extension TaskScheduler {
     func retry(id: TaskID, context: ChordContext) async throws {
         try await session.commit({ tx in
             guard let current = try await tx.task(id) else { throw SessionError.message("Task \(id.rawValue) does not exist") }
-            if !current.parked(restartLimit()) { return }
+            let status = current.state.status
+            if status == "terminal" || status == "completing" || !current.parked(restartLimit()) { return }
             try tx.setTask(current.progressed())
         }, context: context)
         resume()
@@ -87,16 +88,19 @@ extension TaskScheduler {
         return !abortRequested && Double(restarts) >= restartLimit()
     }
     /// The report info of a task's failure, with the extension that installed its definition: the code that failed is
-    /// that extension's. Built-in tasks have none.
-    func taskInfo(taskId: TaskID, kind: String, conversationId: ConversationID, faulted: Bool? = nil,
-                  blocked: TaskBlockedReason? = nil) -> ReportInfo {
-        let snapshot = registry.snapshot()
-        let installer = snapshot.task(name: kind).flatMap { installerOf(snapshot, $0) }
+    /// that extension's. Built-in tasks have none. `extension`: the installer of the definition whose code ran (an
+    /// invocation's); nil: the current one's.
+    func taskInfo(taskId: TaskID, kind: String, conversationId: ConversationID, extension known: String?? = nil,
+                  faulted: Bool? = nil, blocked: TaskBlockedReason? = nil) -> ReportInfo {
+        let installer: String?
+        if let known { installer = known }
+        else { let snapshot = registry.snapshot(); installer = installerOf(snapshot, snapshot.task(name: kind)) }
         return ReportInfo(source: .task, taskId: taskId, taskKind: kind, conversationId: conversationId,
                           extension: installer, faulted: faulted, blocked: blocked)
     }
     func taskInfo(_ invocation: TaskInvocation, faulted: Bool? = nil) -> ReportInfo {
-        taskInfo(taskId: invocation.taskId, kind: invocation.kind, conversationId: invocation.conversationId, faulted: faulted)
+        taskInfo(taskId: invocation.taskId, kind: invocation.kind, conversationId: invocation.conversationId,
+                 extension: .some(invocation.extension), faulted: faulted)
     }
     /// The info of a report a task's runtime makes: the task's own failure names the task's extension; any other names
     /// whose code failed, if anyone's.

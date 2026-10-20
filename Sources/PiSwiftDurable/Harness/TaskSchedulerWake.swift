@@ -22,9 +22,9 @@ extension TaskScheduler {
     func wake() -> Wake {
         let now = now(), limit = restartLimit()
         let found = state.withLock { state -> (active: Bool, at: Int64?, unblocked: [TaskRecord]) in
-            // A reconcile pass scheduled or underway is work too: it may finalize held outcomes and mark cascades, at open
-            // as recovery. A process that dies before it lands must be woken again.
-            var active = !state.invocations.isEmpty || state.reconcileScheduled || state.reconciling > 0
+            // A reconcile pass with work to do is work too: it finalizes held outcomes and marks cascades, at open as
+            // recovery. A process that dies before it lands must be woken again. A pass with nothing to do is not.
+            var active = !state.invocations.isEmpty || state.reconcilingWork > 0 || state.reconcileWork
             var at: Int64?
             // The records to check against the registry, outside the lock: `fit` reads the scheduler's state.
             var unblocked: [TaskRecord] = []

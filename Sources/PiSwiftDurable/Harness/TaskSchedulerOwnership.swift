@@ -270,6 +270,8 @@ extension TaskScheduler.State {
 
     /// Bring the indexes in line with a task's committed record. A task that ended may free the nearest live task above
     /// it: one holding its outcome finalizes, an abort-marked one runs its abort handler; its waiters may run.
+    /// Whether a reconcile pass would have work: a cascade to derive, held outcomes to check, or `failFast` waits.
+    var reconcileWork: Bool { cascadePending || !finalizeChecks.isEmpty || !failFastChecks.isEmpty }
     mutating func track(_ previous: TaskRecord?, _ record: TaskRecord) {
         let id = record.id
         if case .waiting(_, let on, _, _)? = previous?.state { for task in on { deleteFrom(&waiters, task, id) } }

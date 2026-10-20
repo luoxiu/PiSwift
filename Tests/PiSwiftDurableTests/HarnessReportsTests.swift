@@ -57,6 +57,35 @@ private func reportsOf(_ reports: HarnessReports) -> [Report] {
         try await harness.close(context: .background)
     }
 
+    @Test func nameTheExtensionWhoseDefinitionRanAlsoAfterAnotherOneReplacedIt() async throws {
+        let gate = SessionTestGate(), started = SessionTestGate()
+        func definition(_ name: String) -> ReportTask {
+            ReportTask(name: "test.replaced", version: 1, initial: { _ in ReportCheckpoint() }, phase: { _, _, _ in
+                started.release()
+                await gate.wait()
+                throw TestFailure("broken in \(name)")
+            }, abort: { _, _, _ in })
+        }
+        let old = definition("old")
+        let (harness, registry, reports) = try await open([])
+        let oldExtension = Extension(name: "old-extension", tasks: [AnyTaskDefinition(old)])
+        try registry.install(oldExtension)
+        let root = try await harness.root(context: .background)
+        let id = try await root.commit({ tx in try await tx.createTask(old, input: .null, options: .init(ownership: .conversation())) },
+                                       context: .background)
+        try harness.resume()
+        await started.wait()
+        registry.uninstall(oldExtension)
+        try registry.install(Extension(name: "new-extension", tasks: [AnyTaskDefinition(definition("new"))]))
+        gate.release()
+        _ = try await harness.waitForTask(id: id, context: .background)
+        try await eventually { reports.infos.contains { $0.faulted == true } }
+        let faulted = reportsOf(reports).first { $0.info.faulted == true }
+        #expect(faulted?.message == "broken in old")
+        #expect(faulted?.info.extension == "old-extension")
+        try await harness.close(context: .background)
+    }
+
     @Test func nameTheExtensionOfAFailingSectionOrHookAndTellThemFromAFailingEnvironmentBuilder() async throws {
         let setup = HarnessChatSetup()
         setup.models.setResponses([.message(chatAssistant("answer"))])

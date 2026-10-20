@@ -112,6 +112,27 @@ private final class KillableStorage: DurableStorage, Sendable {
     func close(context: ChordContext) async throws { await alive(); try await base.close(context: context) }
 }
 
+/// Storages of killed Harnesses, never closed by them: closed after each test.
+private final class KilledStorages: Sendable {
+    @TaskLocal static var current: KilledStorages?
+    private let state = Mutex<[any DurableStorage]>([])
+    func add(_ storage: any DurableStorage) { state.withLock { $0.append(storage) } }
+    func closeAll() async {
+        for storage in state.withLock({ $0 }) { try? await storage.close(context: .background) }
+    }
+}
+/// Closes the storages of the Harnesses a test killed once it ends (upstream's `afterEach`).
+private struct ClosesKilledStorages: SuiteTrait, TestTrait, TestScoping {
+    var isRecursive: Bool { true }
+    func provideScope(for test: Test, testCase: Test.Case?, performing function: @Sendable () async throws -> Void) async throws {
+        guard testCase != nil else { return try await function() }
+        let killed = KilledStorages()
+        do { try await KilledStorages.$current.withValue(killed) { try await function() } }
+        catch { await killed.closeAll(); throw error }
+        await killed.closeAll()
+    }
+}
+
 /// Settings whose `restartLimit` a test changes while the Harness runs.
 private final class LiveLimit: Sendable {
     private let state: Mutex<Double?>
@@ -126,7 +147,10 @@ private struct Opened {
     let reports: HarnessReports
     let storage: KillableStorage
     /// A crash: every later call of its storage hangs.
-    func kill() { storage.kill() }
+    func kill() {
+        storage.kill()
+        KilledStorages.current?.add(storage.base)
+    }
 }
 
 private func openWith(_ path: String, _ registry: Registry, restartLimit: Double? = nil) async throws -> Opened {
@@ -197,7 +221,7 @@ private func blockedState(_ harness: Harness, _ id: TaskID) async throws -> Task
     }
 }
 
-@Suite struct HarnessBlockedTests {
+@Suite(ClosesKilledStorages()) struct HarnessBlockedTests {
     @Test func parksATaskCutOffRestartLimitTimesInARowShowsWhyAndRunsItAgainOnRetryTask() async throws {
         let path = try sqlitePath()
         let state = CrashState(crashing: true)
@@ -259,6 +283,38 @@ private func blockedState(_ harness: Harness, _ id: TaskID) async throws -> Task
         try await opened.harness.close(context: .background)
     }
 
+    @Test func keepsAnAbortMarkAdmittedBeforeCloseInTheRecordCloseWritesBack() async throws {
+        let path = try sqlitePath()
+        let state = CrashState(crashing: true)
+        let registry = createRegistry()
+        let loop = crashLoop(state)
+        try registry.install(Extension(name: "loop", tasks: [AnyTaskDefinition(loop)]))
+        let harness = try await openWith(path, registry).harness
+        let root = try await harness.root(context: .background)
+        let id = try await create(harness, loop)
+        try harness.resume()
+        try await eventually { state.started == 1 }
+        // Hold the line; the abort mark is admitted behind it, then close begins.
+        let gate = SessionTestGate(), entered = SessionTestGate()
+        let holding = Task { try await root.commit({ _ in entered.release(); await gate.wait() }, context: .background) }
+        await entered.wait()
+        let aborting = Task { try await harness.abortTask(id: id, context: .background) }
+        try await eventually { harness.session.line.queuedCount > 0 }
+        let closing = Task { try await harness.close(context: .background) }
+        try await eventually { harness.tasks.closing }
+        // The invocation ends while the line is held; its write-back waits behind the abort mark.
+        try await settle()
+        gate.release()
+        try await holding.value
+        #expect(try await aborting.value == .marked)
+        try await closing.value
+        let raw = try await SqliteStorage.open(path: path)
+        let record = try await raw.task(id, context: .background)
+        #expect(record?.abortRequested == true)
+        #expect(record?.state.status == "pending")
+        try await raw.close(context: .background)
+    }
+
     @Test func faultsATaskWhoseAbortHandlerIsCutOffRestartLimitTimes() async throws {
         let path = try sqlitePath()
         let aborts = Mutex(0)
@@ -279,9 +335,11 @@ private func blockedState(_ harness: Harness, _ id: TaskID) async throws -> Task
         try await eventually { aborts.withLock { $0 } == 1 }
         opened.kill() // a crash in the abort handler
         opened = try await openWith(path, registry, restartLimit: 1)
-        let outcome = try await outcomeOf(opened.harness, id)
-        guard case .faulted(let error, _) = outcome else { Issue.record("The task must fault"); return }
+        let settled = try await opened.harness.waitForTask(id: id, context: .background)
+        guard case .faulted(let error, _) = settled.outcome else { Issue.record("The task must fault"); return }
         #expect(error.detail == .object(["reason": .string("restart_limit")]))
+        // The receipt keeps no restart count.
+        #expect(settled.record.restarts == nil)
         #expect(aborts.withLock { $0 } == 1)
         let reports = opened.reports
         try await eventually { reports.count > 0 }

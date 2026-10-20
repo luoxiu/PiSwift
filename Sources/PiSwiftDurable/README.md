@@ -223,17 +223,23 @@ runs one again, and does nothing for a task that is not parked. A parked run kee
 `abortTask()` starts the count over and still runs the abort handler; an abort handler cut off that many times
 is not run again, and the task ends `faulted` with detail `{ reason: "restart_limit" }`.
 
-**Reports.** `onReport(error, info)` says where a failure came from: `info.source` is `.session` for the error
-that failed the Harness (a Storage error, often a platform reset), `.task` for a task that faulted
-(`faulted: true`), reported a failure, failed to migrate, or was parked or faulted by the restart limit
-(`blocked: .restartLimit`), with `taskId`, `taskKind`, `conversationId`, and the name of the extension that
-installed the task in `info.extension` (built-in tasks have none), `.extension` for hooks, wrappers, system
-prompt sections, and a tool's invalid structured output, with the name of the extension whose code failed
-when it is known (the hook's or wrapper's, or the last selected extension that provides or wraps the section
-or tool), and `.listener`, `.host` (the environment builder, model provider calls such as cancelling a
-deferred response), `.timer`, or `.wake` for the rest. A task's `runtime.report(error, from:)` says whose
-code failed: its own (default), `.extension(name)`, or `.host`. A host acts on reports outside the scheduler,
-and can feed task faults of one kind to its own breaker.
+**Reports.** `onReport(error, info)` says where a failure came from; `info.source` is one of:
+
+- `.session`: the error that failed the Harness (a Storage error, often a platform reset, or the Session's own
+  bookkeeping);
+- `.task`: a task's phase that faulted (`faulted: true`), a task's `runtime.report()`, a failed migration, or a
+  task parked or faulted by the restart limit (`blocked: .restartLimit`), with `taskId`, `taskKind`, and
+  `conversationId`;
+- `.extension`: hooks, wrappers, system prompt sections, and a tool's invalid structured output;
+- `.listener`; `.host` for the environment builder and model provider calls such as cancelling a deferred
+  response; `.timer` for `setTimer`; and `.wake` for `onWake`.
+
+`info.extension` names the extension whose code failed, when known. A `.task` report names the extension that
+installed the definition the task ran, as of its reservation; built-in tasks have none. An `.extension` report
+names the hook's or the wrapper's extension, or the last selected extension that provides or wraps the section or
+tool. A task's `runtime.report(error, from:)` says whose code failed: its own (default), `.extension(name)`, or
+`.host`. A host acts on reports outside the scheduler, for example counting faults of one task kind toward a
+breaker.
 
 **Queued inputs after a failed run.** A run that fails with a model error (`model_error` or `no_model`) leaves
 the inputs queued behind it waiting until the next input arrives. `settings.afterFailedRun` changes that, in

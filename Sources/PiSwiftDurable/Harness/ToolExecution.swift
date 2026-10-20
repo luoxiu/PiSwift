@@ -163,7 +163,8 @@ private func finalToolResult(_ runtime: TaskRuntime, _ input: ToolTaskInput, _ c
             harness.append(ToolDiagnostic(severity: .error, message: broken, code: "invalid_structured_output"))
         } else {
             // The model never sees structured output, so its call stands; the host learns of the broken tool.
-            let extensionName = toolExtension(try await runtime.agent(context: context), name: tool.name)
+            // Only names the extension: a failed resolution leaves the report without the name.
+            let extensionName = (try? await runtime.agent(context: context)).flatMap { toolExtension($0, name: tool.name) }
             try runtime.report(ToolStructuredOutputError(message: broken), from: .extension(extensionName))
         }
     }

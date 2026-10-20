@@ -9,6 +9,8 @@ internal struct InvocationBinding: Sendable {
 internal final class TaskInvocation: Sendable {
     let taskId: TaskID
     let kind: String
+    /// The extension that installed the definition this invocation runs, as of its reservation; none for a built-in.
+    let `extension`: String?
     let conversationId: ConversationID
     let abort: Bool
     let controller = AbortController()
@@ -22,8 +24,8 @@ internal final class TaskInvocation: Sendable {
         var timers: [UUID: @Sendable () -> Void] = [:]
     }
     let state = Mutex(State())
-    init(_ record: TaskRecord, abort: Bool, context: ChordContext) {
-        taskId = record.id; kind = record.kind; conversationId = record.conversationId; self.abort = abort
+    init(_ record: TaskRecord, abort: Bool, extension: String?, context: ChordContext) {
+        taskId = record.id; kind = record.kind; self.extension = `extension`; conversationId = record.conversationId; self.abort = abort
         self.context = context.withoutAbortSignal().withAbortSignal(controller.signal)
     }
     func check() throws {
@@ -123,9 +125,8 @@ internal final class TaskScheduler: Sendable {
         /// abort-marks them with reason `restart`, so nothing of them or below them runs a phase again.
         var abandoned: Set<TaskID> = []
         var reconcileScheduled = false
-        /// Reconcile passes underway (they may overlap): their commits finalize held outcomes and mark cascades, recovery
-        /// work.
-        var reconciling = 0
+        /// Reconcile passes underway with work (they may overlap): their commits finalize held outcomes and mark cascades.
+        var reconcilingWork = 0
         /// Tasks a pass left out as parked; each pass checks them again, as `settings.restartLimit` may have risen.
         var parkedTasks: Set<TaskID> = []
         var sweepScheduled = false
@@ -223,14 +224,16 @@ internal final class TaskScheduler: Sendable {
         for invocation in invocations { _ = try? await invocation.done.value() }
         await worker?.value
         for work in reconciles { await work.value }
-        // A close is not a crash: a task it stopped is `pending` again, so the next open counts no restart for it.
-        let released = invocations.compactMap { invocation -> TaskRecord? in
-            guard let record = current(invocation.taskId), case .running(let checkpoint, _) = record.state else { return nil }
-            return record.replacing(state: .pending(checkpoint: checkpoint))
+        if invocations.isEmpty { return }
+        // A close is not a crash: a task it stopped is `pending` again, so the next open counts no restart for it. Read
+        // on the line after commits admitted before the seal, such as an abort mark, so the write keeps them. A failure
+        // leaves them `running`, counted as if cut off; the Storage guard fails the Session and reports it.
+        try? await session.writeAtClose { [self] in
+            invocations.compactMap { invocation -> StorageWrite? in
+                guard let record = current(invocation.taskId), case .running(let checkpoint, _) = record.state else { return nil }
+                return .task(value: record.replacing(state: .pending(checkpoint: checkpoint)))
+            }
         }
-        if released.isEmpty { return }
-        // A failure leaves them `running`, counted as if cut off; the Storage guard fails the Session and reports it.
-        try? await session.writeAtClose(released.map { .task(value: $0) })
     }
     /// Close listener: runs synchronously once admission is sealed, before `join()`, or when the Session fails.
     private func seal() {
@@ -348,10 +351,13 @@ internal final class TaskScheduler: Sendable {
             let id = UUID()
             state.reconciles[id] = Task { [weak self] in
                 guard let self else { return }
-                let checks = self.state.withLock { state -> Set<TaskID> in
-                    state.reconcileScheduled = false; state.cascadePending = false; state.reconciling += 1
+                let (checks, work) = self.state.withLock { state -> (Set<TaskID>, Bool) in
+                    state.reconcileScheduled = false
+                    let work = state.reconcileWork
+                    if work { state.reconcilingWork += 1 }
+                    state.cascadePending = false
                     defer { state.failFastChecks = [] }
-                    return state.failFastChecks
+                    return (state.failFastChecks, work)
                 }
                 do { try await self.reconcile(checks: checks) }
                 catch {
@@ -359,7 +365,7 @@ internal final class TaskScheduler: Sendable {
                     // None is fixed by running the pass again, so it fails the Session, which reports it.
                     self.failSession(error)
                 }
-                self.state.withLock { $0.reconciling -= 1 }
+                if work { self.state.withLock { $0.reconcilingWork -= 1 } }
                 self.scheduleWake()
                 self.settleIdle()
                 _ = self.state.withLock { $0.reconciles.removeValue(forKey: id) }
@@ -601,7 +607,8 @@ internal final class TaskScheduler: Sendable {
                             // Blocked now without a commit: the graph and the host's wake must hear it.
                             notifyBlocked()
                             scheduleWake()
-                            report(error, taskInfo(taskId: record.id, kind: record.kind, conversationId: record.conversationId))
+                            report(error, taskInfo(taskId: record.id, kind: record.kind, conversationId: record.conversationId,
+                                                   extension: .some(installerOf(snapshot, definition))))
                             resolution = ("migration_failed", error, false)
                         }
                     }
@@ -616,7 +623,8 @@ internal final class TaskScheduler: Sendable {
                     if original.state.status != "running" || resolution.migrates {
                         try tx.setTask(record.replacing(state: .running(checkpoint: checkpoint)))
                     }
-                    let invocation = TaskInvocation(record, abort: record.abortRequested, context: context), id = UUID()
+                    let invocation = TaskInvocation(record, abort: record.abortRequested, extension: installerOf(snapshot, definition),
+                                                    context: context), id = UUID()
                     // Registered on the line, so marks and later reservations see it and close joins it; `end` makes it a
                     // candidate again.
                     state.withLock { $0.invocations[record.id] = invocation; $0.joining[id] = invocation; $0.runnable.remove(record.id) }
@@ -733,7 +741,8 @@ internal final class TaskScheduler: Sendable {
                     }
                     if shouldReport {
                         report(TaskHandoverError(taskId: current.id, kind: current.kind, cause: next == nil ? .missingTask : .incompatibleTask),
-                               taskInfo(taskId: current.id, kind: current.kind, conversationId: current.conversationId))
+                               taskInfo(taskId: current.id, kind: current.kind, conversationId: current.conversationId,
+                                        extension: .some(invocation.extension)))
                     }
                 }
                 return .proceed
@@ -775,7 +784,8 @@ internal extension TaskRecord {
         return TaskRecord(id: id, conversationId: conversationId, kind: kind, version: version ?? self.version,
                           input: input ?? self.input, state: next, owner: owner, background: background,
                           abortRequested: abortRequested ?? self.abortRequested, abortReason: abortReason,
-                          abandonOnRestart: abandonOnRestart, startedAt: startedAt, endedAt: endedAt, restarts: restarts,
+                          abandonOnRestart: abandonOnRestart, startedAt: startedAt, endedAt: endedAt,
+                          restarts: next.outcome == nil ? restarts : nil,
                           memos: next.outcome == nil ? (memos ?? self.memos) : nil, extensionFields: extensionFields)
     }
     /// The record with an abort mark: `restart` for an abandonment; without a reason, a request, which replaces
