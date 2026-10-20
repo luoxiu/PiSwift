@@ -558,4 +558,58 @@ private func trackerReplay(_ prepared: Delta.Prepared) throws {
         #expect(try change.prepare().ops.isEmpty)
     }
 
+
+    // tracker.test.ts "delta tracker piece arrays" at 091bcc099.
+    @Test func emitsOneInsertForAnAppendToALongArray() throws {
+        let tracker = try Delta.track(["values": .array((0..<10_000).map { .number(Double($0)) })])
+        let change = tracker.beginChange()
+        try trackerChild(change.state, "values").append(-1)
+        let prepared = try change.prepare()
+        #expect(prepared.ops == [.splice(["values"], index: 10_000, remove: 0, items: [-1])])
+        try tracker.adopt(prepared)
+        #expect(tracker.value["values"]?.arrayValue?.last == -1)
+        #expect(tracker.value["values"]?.arrayValue?.count == 10_001)
+    }
+
+    @Test func emitsRemovalsFromTheEndBackwardsThenInsertsWhenKeptElementsKeepTheirOrder() throws {
+        let tracker = try Delta.track(["values": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
+        let change = tracker.beginChange()
+        let values = try trackerChild(change.state, "values")
+        _ = try values.popFirst() // gap before the first kept element
+        try values.splice(1, deleteCount: 2, insert: [20]) // gap between kept elements, with an insert
+        try values.splice(5, deleteCount: 1) // another gap
+        _ = try values.popLast() // gap after the last kept element
+        try values.append(30)
+        let prepared = try change.prepare()
+        #expect(prepared.value == ["values": [1, 20, 4, 5, 6, 8, 30]])
+        #expect(prepared.ops == [
+            .splice(["values"], index: 9, remove: 1, items: []),
+            .splice(["values"], index: 7, remove: 1, items: []),
+            .splice(["values"], index: 2, remove: 2, items: []),
+            .splice(["values"], index: 0, remove: 1, items: []),
+            .splice(["values"], index: 1, remove: 0, items: [20]),
+            .splice(["values"], index: 6, remove: 0, items: [30]),
+        ])
+        try trackerReplay(prepared)
+    }
+
+    // Upstream also sorts the draft; Swift drafts have no sort, so a reversal and a hand-made reordering stand in.
+    @Test func emitsAPermutationWhenKeptElementsChangeOrder() throws {
+        let reorder: [(JSONDraft) throws -> Void] = [
+            { try $0.reverse() },
+            { values in
+                let odd = try values.splice(1, deleteCount: 1, insert: [])
+                try values.splice(2, deleteCount: 0, insert: odd)
+                try values.reverse()
+            },
+        ]
+        for mutate in reorder {
+            let tracker = try Delta.track(["values": [0, 1, 2, 3, 4]])
+            let change = tracker.beginChange()
+            try mutate(try trackerChild(change.state, "values"))
+            let prepared = try change.prepare()
+            #expect(prepared.ops.contains { if case .move = $0 { true } else { false } })
+            try trackerReplay(prepared)
+        }
+    }
 }

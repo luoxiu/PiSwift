@@ -331,4 +331,42 @@ import PiSwiftChord
         #expect(payload["nested"]?["value"] == 1)
         #expect(base["placed"] == .null)
     }
+
+    // delta-apply-immutable.test.ts at 091bcc099. Swift values have no identity, so "sharing everything else" is not
+    // observable; the copy-on-write array copies once into a buffer with room for the appended items. A Swift index
+    // cannot be 1.5, so that invalid path has no counterpart.
+    @Test func appendsToAnArrayNotYetCopiedKeepingTheBaseAndFailingInvalidPathsAsBefore() throws {
+        let entries: [JSONValue] = (0..<1_000).map { ["index": .number(Double($0))] }
+        let base: JSONValue = ["log": ["entries": .array(entries), "meta": ["count": 1_000]], "other": ["value": 1]]
+        let result = try #require(try Delta.applyImmutable(base, [
+            .splice(["log", "entries"], index: 1_000, remove: 0, items: [["index": 1_000]]),
+            .splice(["log", "entries"], index: 1_001, remove: 0, items: [["index": 1_001]]),
+        ]))
+        #expect(result["log"]?["entries"]?.arrayValue?.count == 1_002)
+        #expect(result["log"]?["entries"]?.arrayValue?.suffix(2) == [["index": 1_000], ["index": 1_001]])
+        #expect(base["log"]?["entries"]?.arrayValue?.count == 1_000)
+        #expect(result["log"]?["meta"] == base["log"]?["meta"] && result["other"] == base["other"])
+
+        let rootArray: JSONValue = [1, 2]
+        #expect(try Delta.applyImmutable(rootArray, [.splice([], index: 2, remove: 0, items: [3])]) == [1, 2, 3])
+        #expect(rootArray == [1, 2])
+        // An appended item that is itself an array stays one element.
+        #expect(try Delta.applyImmutable(rootArray, [.splice([], index: 2, remove: 0, items: [[3, 4]])]) == [1, 2, [3, 4]])
+        let document: JSONValue = ["values": [], "list": [[1]], "text": "a"]
+        let invalid: [(Delta.Path, DeltaError)] = [
+            (["values", "missing"], .unresolvablePath(["values", "missing"])),
+            (["missing"], .unresolvablePath(["missing"])),
+            (["values", 0], .unresolvablePath(["values", 0])),
+            (["__proto__"], .unsafeSegment("__proto__")),
+            (["list", "x"], .unresolvablePath(["list", "x"])),
+            (["text"], .unresolvablePath(["text"])),
+            (["list", -1], .unsafeSegment(-1)),
+            (["list", 0, "constructor"], .unsafeSegment("constructor")),
+        ]
+        for (path, error) in invalid {
+            #expect(throws: error, "\(path)") { try Delta.applyImmutable(document, [.splice(path, index: 0, remove: 0, items: [])]) }
+        }
+        // An insert that is not at the end.
+        #expect(try Delta.applyImmutable(rootArray, [.splice([], index: 1, remove: 0, items: [9])]) == [1, 9, 2])
+    }
 }

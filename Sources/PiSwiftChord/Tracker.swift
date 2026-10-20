@@ -871,46 +871,68 @@ private extension DraftState {
             let items = node.slots[(node.head + region.start)..<(node.head + region.start + region.length)].map { snapshotRef($0.ref) }
             ops.append(.splice(path, index: region.start, remove: region.length, items: items))
         }
-        var locations: [Int: Int] = [:]
-        for index in 0..<node.count { locations[node.slots[node.head + index].id] = index }
         if node.structural {
-            var retained = [Bool](repeating: false, count: base.count)
+            // One pass over the slots: the kept base elements in their new order, and the runs of inserted ones.
             var targetBase: [Int] = []
-            for slot in node.slots[node.head...] {
-                if let index = slot.baseIndex { retained[index] = true; targetBase.append(index) }
+            var inserts: [Range<Int>] = []
+            var index = 0
+            while index < node.count {
+                if let baseIndex = node.slots[node.head + index].baseIndex { targetBase.append(baseIndex); index += 1; continue }
+                let start = index
+                while index < node.count && node.slots[node.head + index].baseIndex == nil { index += 1 }
+                inserts.append(start..<index)
             }
-            var end = base.count
-            while end > 0 {
-                if retained[end - 1] { end -= 1; continue }
-                var start = end - 1
-                while start > 0 && !retained[start - 1] { start -= 1 }
-                if ops.count > 4096 { return }
-                ops.append(.splice(path, index: start, remove: end - start, items: []))
-                end = start
-            }
-            let kept = retained.indices.filter { retained[$0] }
-            if kept != targetBase {
+            if let removals = orderedRemovals(targetBase, baseCount: base.count) {
+                for (start, length) in removals {
+                    if ops.count > 4096 { return }
+                    ops.append(.splice(path, index: start, remove: length, items: []))
+                }
+            } else {
+                // Base elements moved: the plan from a walk over every base element, then the permutation.
+                var retained = [Bool](repeating: false, count: base.count)
+                for index in targetBase { retained[index] = true }
+                var end = base.count
+                while end > 0 {
+                    if retained[end - 1] { end -= 1; continue }
+                    var start = end - 1
+                    while start > 0 && !retained[start - 1] { start -= 1 }
+                    if ops.count > 4096 { return }
+                    ops.append(.splice(path, index: start, remove: end - start, items: []))
+                    end = start
+                }
+                let kept = retained.indices.filter { retained[$0] }
                 let ranks = Dictionary(uniqueKeysWithValues: kept.enumerated().map { ($0.element, $0.offset) })
                 ops.append(.move(path, permutation: targetBase.map { ranks[$0]! }))
             }
-            var index = 0
-            while index < node.count {
-                if node.slots[node.head + index].baseIndex != nil { index += 1; continue }
-                let start = index
-                var items: [JSONValue] = []
-                while index < node.count && node.slots[node.head + index].baseIndex == nil {
-                    items.append(snapshotRef(node.slots[node.head + index].ref)); index += 1
-                }
+            for run in inserts {
+                let items = node.slots[(node.head + run.lowerBound)..<(node.head + run.upperBound)].map { snapshotRef($0.ref) }
                 if ops.count > 4096 { return }
-                ops.append(.splice(path, index: start, remove: 0, items: items))
+                ops.append(.splice(path, index: run.lowerBound, remove: 0, items: items))
             }
         }
+        guard !node.overrideOrder.isEmpty else { return }
+        var locations: [Int: Int] = [:]
+        for index in 0..<node.count { locations[node.slots[node.head + index].id] = index }
         for slotID in node.overrideOrder {
             if ops.count > 4096 { return }
             guard let index = locations[slotID], !contains(regions, index) else { continue }
             let slot = node.slots[node.head + index]
             changed(path + [.index(index)], base[slot.baseIndex!], snapshotRef(slot.ref), &ops)
         }
+    }
+    /// The removals when the kept base elements keep their order, the common case of inserts and removals: the gaps
+    /// before, between, and after them as `(start, length)`, from the end backwards, found from the kept indices alone
+    /// without a walk over every base element. nil when base elements moved.
+    func orderedRemovals(_ kept: [Int], baseCount: Int) -> [(Int, Int)]? {
+        var removals: [(Int, Int)] = []
+        var end = baseCount
+        for index in kept.reversed() {
+            if index >= end { return nil }
+            if end > index + 1 { removals.append((index + 1, end - index - 1)) }
+            end = index
+        }
+        if end > 0 { removals.append((0, end)) }
+        return removals
     }
     func changed(_ path: Delta.Path, _ before: JSONValue?, _ after: JSONValue, _ ops: inout [Delta.Op]) {
         if before == after { return }
