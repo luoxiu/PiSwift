@@ -270,18 +270,12 @@ func appendLifetime(_ at: DocumentPoint, params: inout [SqliteValue]) -> String 
 enum SqliteStorageFailure: Error, CustomStringConvertible {
     case metadataMissing
     case invalidColumn(String)
-    case invalidPrefix(String)
-    case reservedPrefix(String)
     var description: String {
         switch self {
         case .metadataMissing: "Durable SQLite metadata is missing"
         case .invalidColumn(let name): "Invalid SQLite column: \(name)"
-        case .invalidPrefix(let prefix): "Invalid SQLite schema prefix \(quoted(prefix))"
-        case .reservedPrefix(let prefix): "SQLite schema prefix \(quoted(prefix)) is reserved"
         }
     }
-    /// The prefix as `JSON.stringify` writes it in upstream's message.
-    private func quoted(_ prefix: String) -> String { (try? JSONValue.string(prefix).jsonText()) ?? "\"\(prefix)\"" }
 }
 extension SqliteRow {
     func sqliteText(_ key: String) throws -> String {

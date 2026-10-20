@@ -33,24 +33,6 @@ extension SqliteStorage {
     fileprivate func rejectNextSettlement() { (db as? RejectingSettlementExecutor)?.reject = true }
 }
 
-private actor TransactionProbe {
-    let database: AppleSqliteDatabase
-    init() throws {
-        database = try AppleSqliteDatabase(path: ":memory:")
-        try database.exec("CREATE TABLE transaction_queue (value INTEGER)")
-    }
-    func insert(_ value: Int64) throws {
-        try database.transaction { handle in
-            try handle.run("INSERT INTO transaction_queue (value) VALUES (?)", [.integer(value)])
-            #expect(try handle.get("SELECT count(*) AS count FROM transaction_queue")?["count"]?.integerValue == value)
-        }
-    }
-    func values() throws -> [Int64] {
-        try database.all("SELECT value FROM transaction_queue ORDER BY value").compactMap { $0["value"]?.integerValue }
-    }
-    func close() throws { try database.close() }
-}
-
 @Suite("PiSwiftDurableTests.SqliteFacade")
 struct SqliteFacadeTests {
     @Test func preparesStatementsOnceAcrossStorageTransactions() async throws {
@@ -67,26 +49,8 @@ struct SqliteFacadeTests {
         try await storage.close(context: .background)
     }
 
-    @Test func commitsThroughHandleAndClosesIdempotently() throws {
-        let database = try AppleSqliteDatabase(path: ":memory:")
-        try database.transaction { transaction in
-            try transaction.exec("CREATE TABLE probe (value INTEGER)")
-            try transaction.run("INSERT INTO probe (value) VALUES (?)", [.integer(1)])
-        }
-        #expect(try database.get("SELECT value FROM probe") == ["value": .integer(1)])
-        try database.close()
-        try database.close()
-    }
-
-    @Test func serializesTransactionsInActor() async throws {
-        let probe = try TransactionProbe()
-        // Actor calls have no suspension inside their SQL transaction.
-        let first = Task { try await probe.insert(1) }
-        try await first.value
-        let second = Task { try await probe.insert(2) }
-        try await second.value
-        #expect(try await probe.values() == [1, 2])
-        try await probe.close()
+    // The storage half of upstream's "runs operations in call order"; the driver half is in PiSwiftChordTests.
+    @Test func serializesStorageCommitsInActor() async throws {
         let storage = try await SqliteStorage.open(path: ":memory:")
         let sequences = try await withThrowingTaskGroup(of: Seq.self) { group in
             for _ in 0..<32 { group.addTask { try await storage.commit([], context: .background) } }
@@ -96,43 +60,6 @@ struct SqliteFacadeTests {
         }
         #expect(sequences.map(\.rawValue).sorted() == Array(1...32).map(Int64.init))
         try await storage.close(context: .background)
-    }
-
-    @Test func rejectsStaleTransactionHandle() throws {
-        let database = try AppleSqliteDatabase(path: ":memory:")
-        defer { try? database.close() }
-        try database.exec("CREATE TABLE stale_probe (value INTEGER)")
-        var handle: (any SqliteExecutor)?
-        try database.transaction { transaction in
-            handle = transaction
-            try transaction.run("INSERT INTO stale_probe (value) VALUES (?)", [.integer(1)])
-        }
-        let stale = try #require(handle)
-        #expect(throws: SqliteFacadeError.inactiveTransaction) { try stale.exec("INSERT INTO stale_probe (value) VALUES (2)") }
-        #expect(throws: SqliteFacadeError.inactiveTransaction) { try stale.run("INSERT INTO stale_probe (value) VALUES (?)", [.integer(3)]) }
-        #expect(throws: SqliteFacadeError.inactiveTransaction) { _ = try stale.get("SELECT value FROM stale_probe") }
-        #expect(throws: SqliteFacadeError.inactiveTransaction) { _ = try stale.all("SELECT value FROM stale_probe") }
-        #expect(try database.all("SELECT value FROM stale_probe") == [["value": .integer(1)]])
-    }
-
-    @Test func failedRollbackDoesNotPreserveCallbackError() throws {
-        let database = try AppleSqliteDatabase(path: ":memory:")
-        defer { try? database.close() }
-        try database.exec("CREATE TABLE rollback_probe (value INTEGER)")
-        do {
-            try database.transaction { transaction in
-                try transaction.exec("INSERT INTO rollback_probe (value) VALUES (1)")
-                try transaction.exec("COMMIT")
-                throw SettlementRejection(message: "rejected after an escaped commit")
-            }
-            Issue.record("Rollback failure accepted")
-        } catch {
-            let rollback = try #require(error as? SqliteRollbackError)
-            #expect(rollback.transactionError as? SettlementRejection == SettlementRejection(message: "rejected after an escaped commit"))
-            #expect(rollback.rollbackError is SqliteError)
-            #expect(!(error is SettlementRejection))
-        }
-        #expect(try database.get("SELECT value FROM rollback_probe") == ["value": .integer(1)])
     }
 
     @Test func adoptsIDsOnlyAfterSuccessfulSettlement() async throws {
@@ -178,19 +105,5 @@ struct SqliteFacadeTests {
             #expect(stored?.value == ["value": 1] || stored?.value == ["value": 2])
             try await storage.close(context: .background)
         }
-    }
-
-    @Test func bindsAllSQLiteValueKindsAndRejectsAllOperationsAfterClose() throws {
-        let database = try AppleSqliteDatabase(path: ":memory:")
-        try database.exec("CREATE TABLE bindings (n, i, r, t, b)")
-        let values: [SqliteValue] = [.null, .integer(4), .real(2.5), .text("a\0b"), .blob(Data([0, 1, 255]))]
-        try database.run("INSERT INTO bindings VALUES (?, ?, ?, ?, ?)", values)
-        #expect(try database.get("SELECT n, i, r, t, b FROM bindings") == ["n": values[0], "i": values[1], "r": values[2], "t": values[3], "b": values[4]])
-        try database.close()
-        #expect(throws: SqliteFacadeError.closed) { try database.exec("SELECT 1") }
-        #expect(throws: SqliteFacadeError.closed) { try database.run("SELECT 1") }
-        #expect(throws: SqliteFacadeError.closed) { _ = try database.get("SELECT 1") }
-        #expect(throws: SqliteFacadeError.closed) { _ = try database.all("SELECT 1") }
-        #expect(throws: SqliteFacadeError.closed) { _ = try database.transaction { _ in 1 } }
     }
 }

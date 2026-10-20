@@ -1,8 +1,4 @@
-/// One immutable step in the durable SQLite schema history.
-internal struct SqliteMigration: Sendable {
-    let version: Int
-    let statements: [String]
-}
+import PiSwiftChord
 
 /// Immutable, ordered schema history rendered for one set of SQLite identifiers. These SQL strings match
 /// `createSqliteMigrations()` in migrations.ts, including its names, checks, and whitespace.
@@ -117,30 +113,6 @@ internal func applySqliteMigrations(
     schema: SqliteSchema = .default,
     migrations: [SqliteMigration]? = nil
 ) throws {
-    let migrations = migrations ?? createSqliteMigrations(schema)
-    let durableSchema = schema.tables.durableSchema
-    for (index, migration) in migrations.enumerated() {
-        guard migration.version == index + 1 else { throw SqliteFacadeError.invalidMigrations }
-    }
-    try database.transaction { transaction in
-        try transaction.exec(
-#"""
-CREATE TABLE IF NOT EXISTS \#(durableSchema) (
-			singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-			version INTEGER NOT NULL CHECK (version >= 0)
-		) STRICT
-"""#
-        )
-        try transaction.run("INSERT OR IGNORE INTO \(durableSchema) (singleton, version) VALUES (1, 0)")
-        guard let row = try transaction.get("SELECT version FROM \(durableSchema) WHERE singleton = 1"),
-              let version = row["version"]?.integerValue else { throw SqliteFacadeError.missingSchema }
-        let currentVersion = migrations.last?.version ?? 0
-        guard version <= currentVersion else {
-            throw SqliteFacadeError.newerSchema(found: Int(version), supported: currentVersion)
-        }
-        for migration in migrations where migration.version > version {
-            for statement in migration.statements { try transaction.exec(statement) }
-            try transaction.run("UPDATE \(durableSchema) SET version = ? WHERE singleton = 1", [.integer(Int64(migration.version))])
-        }
-    }
+    try PiSwiftChord.applySqliteMigrations(database, migrations: migrations ?? createSqliteMigrations(schema),
+                                           table: schema.tables.durableSchema)
 }

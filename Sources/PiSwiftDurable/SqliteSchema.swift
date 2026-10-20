@@ -1,3 +1,5 @@
+import PiSwiftChord
+
 /// The table and index names of the durable SQLite schema, all under one prefix. Migrations and runtime queries render
 /// their SQL from these names, as upstream's `schema.ts` does. The unprefixed names are an immutable history: never
 /// change or remove one; a rename adds a new name so historical migrations keep rendering their original objects.
@@ -43,17 +45,6 @@ internal struct SqliteSchema: Sendable, Equatable {
             documentsByScope: p + "documents_by_scope", documentsByScopeKind: p + "documents_by_scope_kind",
             documentRevisionsByKind: p + "document_revisions_by_kind")
     }
-}
-
-/// Validate a prefix before using it as part of a SQLite identifier: ASCII letters, digits, and `_`, not starting with
-/// a digit, and not SQLite's reserved `sqlite_` in any case.
-internal func validateSqliteSchemaPrefix(_ prefix: String) throws {
-    let bytes = Array(prefix.utf8)
-    func letter(_ byte: UInt8) -> Bool { (65...90).contains(byte) || (97...122).contains(byte) || byte == 95 }
-    guard let first = bytes.first, letter(first), bytes.allSatisfy({ letter($0) || (48...57).contains($0) }) else {
-        throw SqliteStorageFailure.invalidPrefix(prefix)
-    }
-    if prefix.lowercased().hasPrefix("sqlite_") { throw SqliteStorageFailure.reservedPrefix(prefix) }
 }
 
 /// Options for `SqliteStorage.open(path:options:)`.

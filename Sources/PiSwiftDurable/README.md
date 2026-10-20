@@ -5,8 +5,9 @@
 PiSwiftDurable ports the library core of `@earendil-works/pi-durable` at
 [v1.1.0](https://github.com/earendil-works/pi/tree/v1.1.0/packages/durable),
 plus the later upstream commits that `FLEET_FORK.md` lists as ported.
-It uses PiSwiftAI for model types and PiSwiftChord for JSON state, observation, and
-bounded output (`OutputBuffer` and `Progress`, upstream's `@earendil-works/chord/output`).
+It uses PiSwiftAI for model types and PiSwiftChord for JSON state, observation,
+bounded output (`OutputBuffer` and `Progress`, upstream's `@earendil-works/chord/output`), and
+the SQLite driver and migration runner (upstream's `@earendil-works/chord/sqlite`).
 The package requires macOS 15 or iOS 18. It uses Swift 6 strict concurrency.
 
 ## Concepts
@@ -264,7 +265,9 @@ prefix in a shared SQLite file. Two storages that open a new file at the same ti
 `database is locked`, so open one before the others.
 There is no cross-process lock. Keep commits serialized through Session.
 Preparation alone does not reserve a future commit. SQLite uses the Apple SDK library
-and requires SQLite 3.37 or later. The port reads the upstream SQLite schema.
+and requires SQLite 3.37 or later. The port reads the upstream SQLite schema, and a file either
+side wrote opens on the other, prefixed or not. The driver and the migration runner, which
+records each schema's version in its own table, live in PiSwiftChord.
 JSONL shares the valid format-1 files with TypeScript. JSON text bytes can differ.
 It holds full state in memory and replays `main.jsonl` on open, so its memory grows with the
 history. Use SQLite for long-running agents. Open can repair file tails.
@@ -522,6 +525,11 @@ until a compaction produces a summary. The event snapshot carries it as
 - `ListFilesOptions.timeout` is a Duration, for upstream's `timeoutMs`. A negative bound is invalid;
   a fractional millisecond is not. An environment without `listFiles` gets the protocol's default,
   which fails with `notSupported`, where upstream leaves the method out.
+- PiSwiftChord's SQLite driver (`AppleSqliteDatabase` for upstream's Node driver), `SqliteExecutor`,
+  `applySqliteMigrations(_:migrations:table:)`, and `validateSqliteSchemaPrefix` have package access, where
+  upstream exports them from `@earendil-works/chord/sqlite` and Durable re-exports them: a host opens storage
+  with `SqliteStorage.open(path:options:)`, which opens its own file. The driver is synchronous, so a call on
+  the database inside its own transaction throws instead of queueing. There is no Durable Object driver.
 - `ShellOutputSkip` is a type alias of PiSwiftChord's `OutputSkip`, where upstream declares the same shape
   twice. `Progress` takes a `ProgressClock`, which `DurableClock` refines, so a Harness clock paces it.
   A file that also imports Foundation names it `PiSwiftChord.Progress`.

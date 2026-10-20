@@ -18,7 +18,8 @@ public struct SqliteError: Error, Equatable, CustomStringConvertible {
     public var description: String { message }
 }
 
-/// The linked SQLite library cannot create the STRICT tables in the durable schema.
+/// The linked SQLite library cannot create STRICT tables, which the migration runner's metadata table and the
+/// durable schema use.
 public struct SqliteVersionError: Error, Equatable, CustomStringConvertible {
     /// The SQLite schema version stored in the database.
     public let foundVersion: Int32
@@ -26,7 +27,7 @@ public struct SqliteVersionError: Error, Equatable, CustomStringConvertible {
     public let foundVersionText: String
     /// Text that describes this value or error to the caller.
     public var description: String {
-        "Durable SQLite requires SQLite 3.37.0 or newer; found \(foundVersionText) (\(foundVersion))"
+        "SQLite 3.37.0 or newer is required; found \(foundVersionText) (\(foundVersion))"
     }
 }
 
@@ -40,50 +41,58 @@ public struct SqliteRollbackError: Error, CustomStringConvertible {
     public var description: String { "SQLite transaction failed and rollback failed" }
 }
 
-internal enum SqliteFacadeError: Error, Equatable, CustomStringConvertible {
+package enum SqliteFacadeError: Error, Equatable, CustomStringConvertible {
     case closed
     case inactiveTransaction
     case transactionHandleRequired
     case invalidMigrations
     case missingSchema
     case newerSchema(found: Int, supported: Int)
+    case invalidPrefix(String)
+    case reservedPrefix(String)
 
-    var description: String {
+    package var description: String {
         switch self {
         case .closed: "SQLite database is closed"
         case .inactiveTransaction: "SQLite transaction handle is no longer active"
         case .transactionHandleRequired: "SQLite operations inside a transaction must use its handle"
-        case .invalidMigrations: "Durable SQLite migrations must have contiguous versions starting at 1"
-        case .missingSchema: "Durable SQLite schema metadata is missing"
+        case .invalidMigrations: "SQLite migrations must have contiguous versions starting at 1"
+        case .missingSchema: "SQLite schema metadata is missing"
         case let .newerSchema(found, supported):
-            "Durable SQLite schema version \(found) is newer than supported version \(supported)"
+            "SQLite schema version \(found) is newer than supported version \(supported)"
+        case .invalidPrefix(let prefix): "Invalid SQLite schema prefix \(quoted(prefix))"
+        case .reservedPrefix(let prefix): "SQLite schema prefix \(quoted(prefix)) is reserved"
         }
     }
+    /// The prefix as `JSON.stringify` writes it in upstream's message.
+    private func quoted(_ prefix: String) -> String { (try? JSONValue.string(prefix).jsonText()) ?? "\"\(prefix)\"" }
 }
 
-internal enum SqliteValue: Equatable, Sendable {
+/// Values the SQLite driver binds and returns.
+package enum SqliteValue: Equatable, Sendable {
     case null
     case integer(Int64)
     case real(Double)
     case text(String)
     case blob(Data)
 
-    var textValue: String? {
+    package var textValue: String? {
         guard case let .text(value) = self else { return nil }
         return value
     }
 
-    var integerValue: Int64? {
+    package var integerValue: Int64? {
         guard case let .integer(value) = self else { return nil }
         return value
     }
 }
 
-internal typealias SqliteRow = [String: SqliteValue]
+package typealias SqliteRow = [String: SqliteValue]
 
-/// Synchronous access to one connection. The storage actor owns this non-Sendable object.
+/// Synchronous access to one connection, upstream's `SqliteDatabase` and `SqliteExecutor` in one protocol. Its owner,
+/// such as Durable's storage actor, keeps this non-Sendable object in one isolation domain.
 /// Transaction callbacks must use their handle. The handle expires before commit or rollback.
-internal protocol SqliteExecutor: AnyObject {
+package protocol SqliteExecutor: AnyObject {
     func exec(_ sql: String) throws
     func run(_ sql: String, _ params: [SqliteValue]) throws
     func get(_ sql: String, _ params: [SqliteValue]) throws -> SqliteRow?
@@ -92,21 +101,23 @@ internal protocol SqliteExecutor: AnyObject {
     func close() throws
 }
 
-internal extension SqliteExecutor {
+package extension SqliteExecutor {
     func run(_ sql: String) throws { try run(sql, []) }
     func get(_ sql: String) throws -> SqliteRow? { try get(sql, []) }
     func all(_ sql: String) throws -> [SqliteRow] { try all(sql, []) }
 }
 
-/// Apple SQLite3 implementation. Its pointer and statement cache stay inside the storage actor.
-internal final class AppleSqliteDatabase: SqliteExecutor {
+/// Apple SQLite3 implementation, upstream's Node driver. Its pointer and statement cache stay with its owner.
+package final class AppleSqliteDatabase: SqliteExecutor {
     private var connection: OpaquePointer?
     private var statements: [String: OpaquePointer] = [:]
     private var transactionActive = false
     /// Test hook: count successful prepares by SQL text, including cache misses only.
-    private(set) var prepareCounts: [String: Int] = [:]
+    package private(set) var prepareCounts: [String: Int] = [:]
 
-    init(path: String, walAutoCheckpointPages: Int = 1_000, busyTimeoutMilliseconds: Int32 = 5_000) throws {
+    /// Opens or creates the file, and its directory, with WAL, `synchronous = NORMAL`, the auto-checkpoint threshold,
+    /// and the busy timeout.
+    package init(path: String, walAutoCheckpointPages: Int = 1_000, busyTimeoutMilliseconds: Int32 = 5_000) throws {
         let version = sqlite3_libversion_number()
         guard version >= 3_037_000 else {
             throw SqliteVersionError(foundVersion: version, foundVersionText: String(cString: sqlite3_libversion()))
@@ -139,27 +150,27 @@ internal final class AppleSqliteDatabase: SqliteExecutor {
         if let connection { sqlite3_close_v2(connection) }
     }
 
-    func exec(_ sql: String) throws {
+    package func exec(_ sql: String) throws {
         try requireOutsideTransaction()
         try execute(sql)
     }
 
-    func run(_ sql: String, _ params: [SqliteValue]) throws {
+    package func run(_ sql: String, _ params: [SqliteValue]) throws {
         try requireOutsideTransaction()
         try executeRun(sql, params)
     }
 
-    func get(_ sql: String, _ params: [SqliteValue]) throws -> SqliteRow? {
+    package func get(_ sql: String, _ params: [SqliteValue]) throws -> SqliteRow? {
         try requireOutsideTransaction()
         return try executeGet(sql, params)
     }
 
-    func all(_ sql: String, _ params: [SqliteValue]) throws -> [SqliteRow] {
+    package func all(_ sql: String, _ params: [SqliteValue]) throws -> [SqliteRow] {
         try requireOutsideTransaction()
         return try executeAll(sql, params)
     }
 
-    func transaction<T>(_ body: (any SqliteExecutor) throws -> T) throws -> T {
+    package func transaction<T>(_ body: (any SqliteExecutor) throws -> T) throws -> T {
         try requireOutsideTransaction()
         try execute("BEGIN IMMEDIATE")
         transactionActive = true
@@ -181,7 +192,7 @@ internal final class AppleSqliteDatabase: SqliteExecutor {
         }
     }
 
-    func close() throws {
+    package func close() throws {
         guard let connection else { return }
         try requireOutsideTransaction()
         for statement in statements.values { sqlite3_finalize(statement) }

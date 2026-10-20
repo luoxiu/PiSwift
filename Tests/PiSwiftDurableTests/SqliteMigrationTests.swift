@@ -24,20 +24,6 @@ struct SqliteMigrationTests {
         catch { #expect(String(describing: error).contains("is newer than supported version")) }
     }
 
-    @Test func rollsBootstrapAndAllPendingMigrationsBackTogether() throws {
-        let db = try AppleSqliteDatabase(path: ":memory:")
-        defer { try? db.close() }
-        let first = SqliteMigration(version: 1, statements: ["CREATE TABLE migration_first (value TEXT) STRICT", "INSERT INTO migration_first (value) VALUES ('retained')"])
-        let second = SqliteMigration(version: 2, statements: ["CREATE TABLE migration_second (value TEXT) STRICT"])
-        #expect(throws: (any Error).self) {
-            try applySqliteMigrations(db, migrations: [first, SqliteMigration(version: 2, statements: second.statements + ["THIS IS NOT SQL"])])
-        }
-        #expect(try db.get("SELECT count(*) AS count FROM sqlite_schema WHERE name IN ('durable_schema', 'migration_first', 'migration_second')") == ["count": .integer(0)])
-        try applySqliteMigrations(db, migrations: [first, second])
-        #expect(try db.get("SELECT version FROM durable_schema WHERE singleton = 1") == ["version": .integer(2)])
-        #expect(try db.get("SELECT value FROM migration_first") == ["value": .text("retained")])
-    }
-
     @Test func preservesDataForMigrationRetry() async throws {
         let directory = try sqliteTestDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -59,12 +45,5 @@ struct SqliteMigrationTests {
         else { Issue.record("Missing retained record") }
         #expect(row["commit_seq"] == .integer(1))
         #expect(try db.get("SELECT next_id, next_seq FROM durable_metadata WHERE singleton = 1") == ["next_id": .text("3"), "next_seq": .integer(2)])
-    }
-
-    @Test func rejectsNoncontiguousVersionsBeforeSQL() throws {
-        let db = try AppleSqliteDatabase(path: ":memory:")
-        defer { try? db.close() }
-        #expect(throws: (any Error).self) { try applySqliteMigrations(db, migrations: [SqliteMigration(version: 2, statements: [])]) }
-        #expect(try db.get("SELECT count(*) AS count FROM sqlite_schema WHERE name = 'durable_schema'") == ["count": .integer(0)])
     }
 }
