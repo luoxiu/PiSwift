@@ -71,10 +71,10 @@ public struct ToolExecutionResult: Sendable {
 public struct NestedToolExecutionResult: Sendable, Equatable, Codable {
     /// The nested call's tool task.
     public var taskId: TaskID
-    /// The value for programs. A tool with `structuredOutputSchema`: its validated `structuredOutput`, absent on an error
-    /// result that has none. A tool without: its bounded output, success or error, as a string for one text item, an
-    /// `ImageContent` object for one image, `""` for none, and the content list otherwise. Absent on an error result the
-    /// Harness wrote itself (unavailable, invalid, blocked, interrupted, aborted); `diagnostics` say what went wrong.
+    /// The value for programs. A tool with `structuredOutputSchema`: its validated `structuredOutput`. A tool without, and
+    /// an error result without `structuredOutput`: its bounded output, as a string for one text item, an `ImageContent`
+    /// object for one image, `""` for none, and the content list otherwise. Absent on an error result the Harness wrote
+    /// itself (unavailable, invalid, blocked, interrupted, aborted); `diagnostics` say what went wrong.
     public var structuredOutput: JSONValue?
     /// Whether the nested call ended with an error result.
     public var isError: Bool

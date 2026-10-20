@@ -123,8 +123,8 @@ private func codes(_ diagnostics: [ToolDiagnostic]?) -> [String?] { (diagnostics
             try installHarnessTool(try returning(name, result, schema: schema ? countSchema : nil), setup: setup)
             let received = try await nested(setup, name)
             #expect(received.isError)
-            // The broken value is dropped; a schema-less tool's error result still carries its output, here none.
-            if schema { #expect(received.structuredOutput == nil) } else { #expect(received.structuredOutput == "") }
+            // The broken value is dropped; the error result carries the bounded output instead, here none.
+            #expect(received.structuredOutput == "")
             #expect(codes(received.diagnostics) == ["invalid_structured_output"])
             #expect(received.diagnostics.first?.message.contains(message) == true, "\(received.diagnostics)")
 
@@ -151,12 +151,29 @@ private func codes(_ diagnostics: [ToolDiagnostic]?) -> [String?] { (diagnostics
         #expect(received.structuredOutput == nil)
     }
 
-    @Test func letsAnErrorResultOfASchemaToolOmitStructuredOutputAndKeepsNoneOfItsOutput() async throws {
+    @Test func givesCallersTheOutputOfASchemaToolsErrorResultWithoutStructuredOutput() async throws {
         let setup = HarnessChatSetup()
         try installHarnessTool(try returning("fails", .init(output: [.text(TextContent(text: "nope"))], isError: true), schema: countSchema), setup: setup)
+        // Its text reaches the caller: what a code mode script's rejection carries.
         let received = try await nested(setup, "fails")
         #expect(received.isError && received.diagnostics.isEmpty)
-        #expect(received.structuredOutput == nil)
+        #expect(received.structuredOutput == "nope")
+
+        // A thrown error's message is in its tool_error diagnostic, not in the output.
+        let thrown = HarnessChatSetup()
+        try installHarnessTool(try nestedTool("throws", structuredOutputSchema: countSchema) { _, _, _ in
+            throw TestFailure("permission denied")
+        }, setup: thrown)
+        let failed = try await nested(thrown, "throws")
+        #expect(failed.isError && failed.structuredOutput == "")
+        #expect(failed.diagnostics.map(\.code) == ["tool_error"] && failed.diagnostics.first?.message == "permission denied")
+
+        // An error result that has structured output keeps it.
+        let kept = HarnessChatSetup()
+        try installHarnessTool(try returning("fails", .init(output: [.text(TextContent(text: "nope"))], structuredOutput: ["count": 0],
+            isError: true), schema: countSchema), setup: kept)
+        let value = try await nested(kept, "fails")
+        #expect(value.isError && value.structuredOutput == ["count": 0])
     }
 
     @Test func keepsStructuredOutputWhenAfterToolReplacesTheOutputAndValidatesOneAfterToolReplaces() async throws {

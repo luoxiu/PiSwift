@@ -166,8 +166,10 @@ private func finalToolResult(_ runtime: TaskRuntime, _ input: ToolTaskInput, _ c
             try runtime.report(ToolStructuredOutputError(message: broken))
         }
     }
-    // Without a schema, programs get the output itself; the model reads only `output`, so model-issued calls skip it.
-    if nested && tool.structuredOutputSchema == nil { final.structuredOutput = try nestedOutputValue(bounded.content) }
+    // Without a schema, or for an error result without structured output, programs get the output itself, so they get
+    // the error's text; the model reads only `output`, so model-issued calls skip it.
+    let schemaValue = tool.structuredOutputSchema != nil && !(final.isError == true && final.structuredOutput == nil)
+    if nested && !schemaValue { final.structuredOutput = try nestedOutputValue(bounded.content) }
     final.output = bounded.content; final.diagnostics = (final.diagnostics ?? []) + harness
     return final
 }

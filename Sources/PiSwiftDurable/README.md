@@ -137,9 +137,12 @@ A result has three channels: `output` for the model, `structuredOutput` for prog
 call the tool, and `details` for UIs. A tool that declares `structuredOutputSchema` returns
 a matching `structuredOutput`, which the Harness validates. Programs that call a tool without
 a schema get its bounded output: one text item as a string, one image as its JSON, nothing
-as `""`, and anything else as the content list. The transcript stores only `output` and
+as `""`, and anything else as the content list. They get the same for a schema tool's error
+result without `structuredOutput`, so they still see the text of a returned error. A thrown
+error's message is in its `tool_error` diagnostic. The transcript stores only `output` and
 `details`. A broken `structuredOutput` gives a nested call an `invalid_structured_output`
-error result. A model-issued call only loses it, and `onReport` gets the break.
+error result, with its bounded output instead. A model-issued call only loses it, and
+`onReport` gets the break.
 
 A tool calls another tool with `api.executeTool(_:arguments:options:context:)`. The nested
 call is its own `pi.tool` task, owned by the caller. It is validated, runs the tool hooks,
