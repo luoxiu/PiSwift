@@ -1,3 +1,5 @@
+import PiSwiftTelemetry
+
 /// A typed key. Two keys with the same description have separate identities.
 public final class ChordContextKey<Value: Sendable>: Sendable {
     /// The diagnostic name of this key; it does not determine key identity.
@@ -41,14 +43,17 @@ private final class ContextNode: Sendable {
 /// | `withContextValue` | `withValue(_:for:)` |
 /// | `withAbortSignal` | `withAbortSignal(_:)` |
 /// | `withoutAbortSignal` | `withoutAbortSignal()` |
+/// | `withTelemetry` | `withTelemetry(_:)` |
+/// | `traceIn` | `traceIn(_:_:)` |
 /// | `withCancel` | `withCancel()` |
 /// | `awaitWithContext` | `awaitWithContext(_:_:)` |
 public struct ChordContext: Sendable, CustomStringConvertible {
-    /// A context with no values and no cancellation signal.
+    /// A context with no values, no cancellation signal, and no-op telemetry.
     public static let background = ChordContext(node: ContextNode(name: "[Context BACKGROUND_CONTEXT]"))
     /// A context for a caller that has not yet supplied its own context.
     public static let todo = ChordContext(node: ContextNode(name: "[Context TODO_CONTEXT]"))
     private static let abortSignalKey = ChordContextKey<AbortSignal>("chord.abortSignal")
+    private static let telemetryKey = ChordContextKey<any TelemetryContext>("chord.telemetry")
 
     private let node: ContextNode
 
@@ -67,6 +72,10 @@ public struct ChordContext: Sendable, CustomStringConvertible {
     /// The effective cancellation signal, or nil if cancellation is absent or masked.
     public var abortSignal: AbortSignal? { value(Self.abortSignalKey) }
 
+    /// The explicit telemetry parent of work in this context. It is never absent: by default it is
+    /// `noopTelemetryContext`.
+    public var telemetry: any TelemetryContext { value(Self.telemetryKey) ?? noopTelemetryContext }
+
     /// Adds or replaces a value. A nil value masks the parent's value.
     public func withValue<Value>(_ value: Value?, for key: ChordContextKey<Value>) -> ChordContext {
         ChordContext(node: ContextNode(parent: node, key: key, value: value))
@@ -81,6 +90,22 @@ public struct ChordContext: Sendable, CustomStringConvertible {
     /// Keeps all values and masks cancellation. Intended for mandatory cleanup only.
     public func withoutAbortSignal() -> ChordContext {
         withValue(nil, for: Self.abortSignalKey)
+    }
+
+    /// Derives an explicit telemetry parent without changing cancellation or application values.
+    public func withTelemetry(_ telemetry: any TelemetryContext) -> ChordContext {
+        withValue(telemetry, for: Self.telemetryKey)
+    }
+
+    /// Runs `body` in a child span of `telemetry`, with a derived context whose telemetry member is that span.
+    /// Values, cancellation, the result, and the thrown error are preserved.
+    nonisolated(nonsending) public func traceIn<T, E: Error>(
+        _ options: SpanOptions,
+        _ body: (ChordContext) async throws(E) -> T
+    ) async throws(E) -> T {
+        try await telemetry.startSpan(options) { (span) async throws(E) -> T in
+            try await body(withTelemetry(span))
+        }
     }
 
     /// Creates a child context with an independent cancellation controller.

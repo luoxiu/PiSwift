@@ -1,4 +1,5 @@
 import PiSwiftChord
+import PiSwiftTelemetry
 
 /// Whether the harness is paused, running, or closing.
 public enum SchedulingState: String, Sendable {
@@ -126,6 +127,9 @@ public struct EnvTarget: Sendable {
 public typealias HarnessEnvFactory = @Sendable (EnvTarget, ChordContext) async throws -> (any ExecutionEnv)?
 /// Host services and live settings required to open a harness.
 public struct HarnessOptions: Sendable {
+    /// The host-owned telemetry adapter. It may also implement `TelemetryPropagation` and `TelemetryMetrics`. Durable
+    /// instrumentation is not yet emitted.
+    public var telemetry: (any TelemetryContext)?
     /// Model access used by generation, compaction, hooks, and tools: the supplied service, or the current return value
     /// of the supplied function, called at each use, so a host can replace its model configuration without reopening
     /// the Harness.
@@ -165,9 +169,10 @@ public struct HarnessOptions: Sendable {
                 now: (@Sendable () -> Int64)? = nil, setTimer: SetTimer? = nil,
                 onWake: (@Sendable (Wake) throws -> Void)? = nil,
                 conversationCreated: (@Sendable (Transaction, ConversationRecord) async throws -> Void)? = nil,
-                onReport: (@Sendable (any Error, ReportInfo) -> Void)? = nil) {
+                onReport: (@Sendable (any Error, ReportInfo) -> Void)? = nil,
+                telemetry: (any TelemetryContext)? = nil) {
         self.init(models: { models }, registry: registry, settings: settings, env: env, now: now, setTimer: setTimer,
-                  onWake: onWake, conversationCreated: conversationCreated, onReport: onReport)
+                  onWake: onWake, conversationCreated: conversationCreated, onReport: onReport, telemetry: telemetry)
     }
     /// Supplies a function returning the current model service, called at each use, with the other host services.
     public init(models: @escaping @Sendable () -> any DurableModels, registry: any RegistryReader,
@@ -175,9 +180,10 @@ public struct HarnessOptions: Sendable {
                 now: (@Sendable () -> Int64)? = nil, setTimer: SetTimer? = nil,
                 onWake: (@Sendable (Wake) throws -> Void)? = nil,
                 conversationCreated: (@Sendable (Transaction, ConversationRecord) async throws -> Void)? = nil,
-                onReport: (@Sendable (any Error, ReportInfo) -> Void)? = nil) {
+                onReport: (@Sendable (any Error, ReportInfo) -> Void)? = nil,
+                telemetry: (any TelemetryContext)? = nil) {
         self.currentModels = models; self.registry = registry; self.settings = settings; self.env = env
         self.now = now; self.setTimer = setTimer; self.onWake = onWake
-        self.conversationCreated = conversationCreated; self.onReport = onReport
+        self.conversationCreated = conversationCreated; self.onReport = onReport; self.telemetry = telemetry
     }
 }

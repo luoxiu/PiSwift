@@ -1,5 +1,5 @@
-// Ports the contract half of upstream `packages/telemetry/src/index.ts` at 482c1381a.
-// The schema half is in `TelemetrySchema.swift`.
+// Ports the contract half of upstream `packages/telemetry/src/index.ts` at 48909d987.
+// The schema half is in `TelemetrySchema.swift`, metrics are in `Metrics.swift`.
 
 /// An attribute value: a string, number, or boolean, or an array of one of them.
 public enum AttributeValue: Sendable, Hashable {
@@ -34,17 +34,48 @@ extension AttributeValue: ExpressibleByBooleanLiteral {
 /// An open attribute bag. A nil value is ignored, as upstream ignores `undefined`.
 public typealias SpanAttributes = [String: AttributeValue?]
 
-/// The span name and its start attributes.
+/// Opaque, JSON-serializable propagation data. The adapter owns its format.
+public typealias TelemetryCarrier = [String: String]
+
+/// Optional transport capability, implemented by the application's telemetry adapter.
+/// Both methods are synchronous, passive, and do not throw.
+public protocol TelemetryPropagation: AnyObject, Sendable {
+    /// Returns a detached carrier for a context the adapter knows, or nil for roots, no-op contexts, and
+    /// contexts it does not support.
+    func inject(_ context: any TelemetryContext) -> TelemetryCarrier?
+    /// Returns a parent owned by this adapter. An absent, invalid, or unknown carrier gives the adapter's root,
+    /// so incoming work is still recorded.
+    func extract(_ carrier: TelemetryCarrier?) -> any TelemetryContext
+}
+
+/// Relates a span to another context without changing its parent.
+public struct SpanLink: Sendable {
+    /// The target: a span or an extracted remote parent.
+    public var context: any TelemetryContext
+    /// Attributes of the link.
+    public var attributes: SpanAttributes?
+
+    /// Creates a link to `context`.
+    public init(context: any TelemetryContext, attributes: SpanAttributes? = nil) {
+        self.context = context
+        self.attributes = attributes
+    }
+}
+
+/// The span name, its start attributes, and its initial links.
 public struct SpanOptions: Sendable {
     /// The span name.
     public var name: String
     /// Attributes known when the span starts.
     public var attributes: SpanAttributes?
+    /// Links known when the span starts.
+    public var links: [SpanLink]?
 
     /// Creates options for one span.
-    public init(name: String, attributes: SpanAttributes? = nil) {
+    public init(name: String, attributes: SpanAttributes? = nil, links: [SpanLink]? = nil) {
         self.name = name
         self.attributes = attributes
+        self.links = links
     }
 }
 
@@ -90,6 +121,8 @@ public protocol TelemetryContext: AnyObject, Sendable {
 /// Records attributes, events, and status. A span is also the parent context of its child spans.
 /// Recording methods are synchronous and passive. Calls after settlement have no effect.
 public protocol TelemetrySpan: TelemetryContext {
+    /// Appends a link. A settled span ignores it; so does a link to a root, no-op, or unsupported context.
+    func addLink(_ link: SpanLink)
     /// Records an event at this point in the span.
     func addEvent(_ name: String, attributes: SpanAttributes?)
     /// Merges attributes. A later value replaces an earlier one, and a nil value is ignored.

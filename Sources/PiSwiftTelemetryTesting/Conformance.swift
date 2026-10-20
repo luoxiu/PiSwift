@@ -1,5 +1,6 @@
-// Ports upstream `packages/telemetry/src/testing/conformance.ts` at 482c1381a.
+// Ports upstream `packages/telemetry/src/testing/conformance.ts` at 48909d987.
 
+import Foundation
 import PiSwiftTelemetry
 import Synchronization
 
@@ -79,6 +80,37 @@ private func rejectsWithSameValue(
     throw TelemetryConformanceFailure("Expected operation to reject", file: file, line: line)
 }
 
+/// A carrier sent through JSON, as a transport would.
+private func throughJSON(_ carrier: TelemetryCarrier, file: String = #filePath, line: UInt = #line) throws -> TelemetryCarrier {
+    do {
+        return try JSONDecoder().decode(TelemetryCarrier.self, from: JSONEncoder().encode(carrier))
+    } catch {
+        throw TelemetryConformanceFailure("Expected the carrier to survive JSON: \(error)", file: file, line: line)
+    }
+}
+
+/// Runs `body` with a further fresh fixture and disposes it afterwards, also after a failed check
+/// (upstream `await using`).
+private func withFixture(
+    _ factory: TelemetryAdapterFixtureFactory,
+    _ body: (TelemetryAdapterFixture) async throws -> Void
+) async throws {
+    let fixture = try await factory()
+    let outcome: Result<Void, any Error>
+    do {
+        try await body(fixture)
+        outcome = .success(())
+    } catch {
+        outcome = .failure(error)
+    }
+    do {
+        try await fixture.dispose()
+    } catch {
+        if case .success = outcome { throw error }
+    }
+    try outcome.get()
+}
+
 /// The current task, so a case can tell whether a callback ran in the caller's task.
 private func currentTaskHash() -> Int? {
     withUnsafeCurrentTask { $0?.hashValue }
@@ -114,6 +146,143 @@ public func createTelemetryAdapterConformance(
     _ factory: @escaping TelemetryAdapterFixtureFactory
 ) -> [TelemetryAdapterConformanceCase] {
     [
+        createCase(factory, "metrics", "records ordered measurements and optional histogram exemplars") { fixture in
+            guard let metrics = fixture.metrics else { return }
+            guard let getMetrics = fixture.getMetrics else {
+                throw TelemetryConformanceFailure("Metrics fixtures require a normalized measurement reader")
+            }
+            metrics.counter("bytes", options: InstrumentOptions(description: "Encoded bytes", unit: "By"))
+                .add(12, attributes: ["direction": "out"])
+            let active = metrics.upDownCounter("active")
+            active.add(1)
+            active.add(-1)
+            let histogram = metrics.histogram("duration", options: HistogramOptions(unit: "ms", boundaries: [1, 10]))
+            await fixture.context.startSpan(SpanOptions(name: "measured")) { span in
+                histogram.record(5, attributes: ["method": "read"], context: span)
+            }
+            let measurements = try await getMetrics()
+            try ok(measurements.map { "\($0.kind.rawValue) \($0.name) \($0.value)" } == [
+                "counter bytes 12.0", "upDownCounter active 1.0", "upDownCounter active -1.0", "histogram duration 5.0",
+            ], "Expected the four measurements in order; got \(measurements)")
+            try strictEqual(measurements[0].attributes, ["direction": "out"])
+            try strictEqual(measurements[0].description, "Encoded bytes")
+            try strictEqual(measurements[0].unit, "By")
+            try strictEqual(measurements[3].boundaries, [1, 10])
+            try strictEqual(measurements[3].context, try findSpan(try await fixture.getSpans(), "measured").context)
+        },
+
+        // Swift: upstream also passes Proxy attributes and options that throw on read. Swift values cannot.
+        createCase(factory, "metrics", "copies inputs and suppresses invalid measurements atomically") { fixture in
+            guard let metrics = fixture.metrics else { return }
+            guard let getMetrics = fixture.getMetrics else {
+                throw TelemetryConformanceFailure("Metrics fixtures require a normalized measurement reader")
+            }
+            var boundaries: [Double] = [1, 10]
+            var options = HistogramOptions(description: "Original", boundaries: boundaries)
+            let histogram = metrics.histogram("snapshot", options: options)
+            boundaries.append(100)
+            options.description = "Changed"
+            var attributes: SpanAttributes = ["tags": .stringArray(["original"])]
+            histogram.record(-1, attributes: attributes)
+            attributes["tags"] = .stringArray(["original", "changed"])
+            let counter = metrics.counter("invalid")
+            for value in [Double.nan, .infinity, -.infinity, -1] { counter.add(value) }
+            metrics.histogram("bad-boundaries", options: HistogramOptions(boundaries: [2, 1])).record(1)
+            let measurements = try await getMetrics()
+            try strictEqual(measurements.count, 1)
+            try strictEqual(measurements.first?.attributes, ["tags": .stringArray(["original"])])
+            try strictEqual(measurements.first?.boundaries, [1, 10])
+            try strictEqual(measurements.first?.description, "Original")
+            try strictEqual(measurements.first?.context, nil)
+        },
+
+        createCase(factory, "links", "records initial and late links without changing parents") { fixture in
+            var target: (any TelemetrySpan)?
+            await fixture.context.startSpan(SpanOptions(name: "target")) { span in target = span }
+            guard let targetSpan = target else { throw TelemetryConformanceFailure("Expected target span") }
+            var attributes: SpanAttributes = ["reason": .stringArray(["initial"])]
+            await fixture.context.startSpan(SpanOptions(
+                name: "linked", links: [SpanLink(context: targetSpan, attributes: attributes)]
+            )) { span in
+                attributes["reason"] = .stringArray(["initial", "mutated"])
+                span.addLink(SpanLink(context: targetSpan, attributes: ["reason": "late"]))
+                span.addLink(SpanLink(context: noopTelemetryContext))
+            }
+            let spans = try await fixture.getSpans()
+            let linked = try findSpan(spans, "linked")
+            try strictEqual(linked.parentId, nil)
+            try strictEqual(linked.parentContext, nil)
+            let targetContext = try findSpan(spans, "target").context
+            try strictEqual(linked.links, [
+                RecordedTelemetryLink(context: targetContext, attributes: ["reason": .stringArray(["initial"])]),
+                RecordedTelemetryLink(context: targetContext, attributes: ["reason": "late"]),
+            ])
+        },
+
+        // Swift: upstream also adds links and link attributes that throw on read, which Swift values cannot.
+        createCase(factory, "links", "suppresses malformed links atomically and ignores settled sources") { fixture in
+            var source: (any TelemetrySpan)?
+            await fixture.context.startSpan(SpanOptions(name: "link-source")) { span in source = span }
+            guard let sourceSpan = source else { throw TelemetryConformanceFailure("Expected source span") }
+            sourceSpan.addLink(SpanLink(context: sourceSpan))
+            try strictEqual(try findSpan(try await fixture.getSpans(), "link-source").links, [])
+        },
+
+        createCase(factory, "propagation", "roundtrips parent identity through JSON without retaining the carrier") { fixture in
+            guard let propagation = fixture.propagation else { return }
+            try await fixture.context.startSpan(SpanOptions(name: "sender")) { span in
+                guard let carrier = propagation.inject(span) else {
+                    throw TelemetryConformanceFailure("Expected a carrier for the sender span")
+                }
+                var wire = try throughJSON(carrier)
+                let parent = propagation.extract(wire)
+                for key in wire.keys { wire[key] = "mutated" }
+                _ = await parent.startSpan(SpanOptions(name: "receiver")) { _ in 42 }
+                try strictEqual(propagation.inject(span), carrier)
+            }
+            let spans = try await fixture.getSpans()
+            try strictEqual(try findSpan(spans, "receiver").parentContext, try findSpan(spans, "sender").context)
+        },
+
+        // Swift: upstream also extracts a carrier that throws on read, which a Swift dictionary cannot.
+        createCase(factory, "propagation", "unknown and unreadable carriers produce recorded roots") { fixture in
+            guard let propagation = fixture.propagation else { return }
+            try strictEqual(propagation.inject(noopTelemetryContext), nil)
+            let carriers: [TelemetryCarrier?] = [nil, [:], ["unknown": "format"]]
+            for (index, carrier) in carriers.enumerated() {
+                var result = 0
+                await propagation.extract(carrier).startSpan(SpanOptions(name: "fallback-\(index)")) { _ in result = 42 }
+                try strictEqual(result, 42)
+            }
+            for span in try await fixture.getSpans() { try strictEqual(span.parentContext, nil) }
+        },
+
+        createCase(factory, "propagation", "propagates across fresh adapters and multiple hops") { fixture in
+            guard let propagation = fixture.propagation else { return }
+            try await withFixture(factory) { receiver in
+                try await withFixture(factory) { worker in
+                    guard let receiverPropagation = receiver.propagation, let workerPropagation = worker.propagation else {
+                        throw TelemetryConformanceFailure("Expected propagation on each fixture")
+                    }
+                    var senderCarrier: TelemetryCarrier?
+                    await fixture.context.startSpan(SpanOptions(name: "sender")) { span in
+                        senderCarrier = propagation.inject(span)
+                    }
+                    guard let sent = senderCarrier else { throw TelemetryConformanceFailure("Expected a sender carrier") }
+                    var receiverCarrier: TelemetryCarrier?
+                    await receiverPropagation.extract(try throughJSON(sent)).startSpan(SpanOptions(name: "receiver")) { span in
+                        receiverCarrier = receiverPropagation.inject(span)
+                    }
+                    guard let received = receiverCarrier else {
+                        throw TelemetryConformanceFailure("Expected a receiver carrier")
+                    }
+                    await workerPropagation.extract(try throughJSON(received)).startSpan(SpanOptions(name: "worker")) { _ in }
+                    try strictEqual(try findSpan(try await receiver.getSpans(), "receiver").parentContext, sent)
+                    try strictEqual(try findSpan(try await worker.getSpans(), "worker").parentContext, received)
+                }
+            }
+        },
+
         createCase(factory, "callback lifecycle", "admits once synchronously and preserves the result") { fixture in
             var calls = 0
             var callbackTask: Int?

@@ -1,4 +1,4 @@
-// Ports upstream `packages/telemetry/test/conformance.test.ts` at 482c1381a.
+// Ports upstream `packages/telemetry/test/conformance.test.ts` at 48909d987.
 
 import Testing
 import PiSwiftTelemetry
@@ -6,7 +6,8 @@ import PiSwiftTelemetryTesting
 
 private let inMemoryConformance = createTelemetryAdapterConformance {
     let context = InMemoryTelemetryContext()
-    return TelemetryAdapterFixture(context: context, getSpans: { context.getSpans() })
+    return TelemetryAdapterFixture(context: context, propagation: context, metrics: context,
+                                   getMetrics: { context.getMetrics() }, getSpans: { context.getSpans() })
 }
 
 @Suite("PiSwiftTelemetryTests.InMemoryTelemetryContext conformance")
@@ -44,6 +45,13 @@ struct InMemoryTelemetryConformanceTests {
         // Upstream's two "passivity" cases and "recording: ignores failed attribute calls atomically"
         // pass Proxy values that throw on read. Swift values cannot, so those three are not ported.
         #expect(inMemoryConformance.map(\.description) == [
+            "metrics: records ordered measurements and optional histogram exemplars",
+            "metrics: copies inputs and suppresses invalid measurements atomically",
+            "links: records initial and late links without changing parents",
+            "links: suppresses malformed links atomically and ignores settled sources",
+            "propagation: roundtrips parent identity through JSON without retaining the carrier",
+            "propagation: unknown and unreadable carriers produce recorded roots",
+            "propagation: propagates across fresh adapters and multiple hops",
             "callback lifecycle: admits once synchronously and preserves the result",
             "callback lifecycle: preserves synchronous and asynchronous rejection values",
             "status: uses last explicit status without automatic overwrite",

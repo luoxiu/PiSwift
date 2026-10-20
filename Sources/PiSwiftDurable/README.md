@@ -53,10 +53,15 @@ a system message, even one an edit omits later. After a compaction, the baseline
 the kept history, assistant messages included. Any other system message after an assistant
 message stays in place. Stored entries and `contributions` keep the committed order.
 
-Calls take a `ChordContext`. `ChordContext.background` does not cancel.
+Calls take a `ChordContext`, which carries cancellation and explicit telemetry.
+`ChordContext.background` does not cancel and uses no-op telemetry.
 `ChordContextKey` carries typed values. These names replace upstream `Context` and
 `ContextKey`. PiSwiftAI already has a public `Context`. This rename is the user's choice.
 Cancellation of a submission wait cancels that wait. It does not withdraw the submission.
+
+`HarnessOptions.telemetry` takes a host-owned `TelemetryContext` adapter from PiSwiftTelemetry,
+which may also implement `TelemetryPropagation` and `TelemetryMetrics`. It reserves the adapter
+setting: Durable emits no spans or metrics yet and persists no carriers.
 
 ## Quick Start
 

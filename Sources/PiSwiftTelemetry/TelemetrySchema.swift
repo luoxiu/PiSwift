@@ -1,4 +1,4 @@
-// Ports the schema half of upstream `packages/telemetry/src/index.ts` at 482c1381a.
+// Ports the schema half of upstream `packages/telemetry/src/index.ts` at 48909d987.
 // Upstream infers exact TypeScript types from schema data. Swift cannot, so only the data
 // and the runtime behavior of the typed starter are ported.
 
@@ -205,17 +205,20 @@ public struct TelemetrySpanDefinition: Sendable, Hashable, Codable {
     }
 }
 
-/// A versioned set of span definitions.
+/// A versioned set of span and metric definitions.
 public struct TelemetrySchemaDefinition: Sendable, Hashable, Codable {
     /// The schema version.
     public var version: Int
     /// The spans, by name.
     public var spans: [String: TelemetrySpanDefinition]
+    /// The metric instruments, by name.
+    public var metrics: [String: TelemetryMetricDefinition]?
 
     /// Creates a schema.
-    public init(version: Int, spans: [String: TelemetrySpanDefinition]) {
+    public init(version: Int, spans: [String: TelemetrySpanDefinition], metrics: [String: TelemetryMetricDefinition]? = nil) {
         self.version = version
         self.spans = spans
+        self.metrics = metrics
     }
 }
 

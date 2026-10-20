@@ -1,4 +1,4 @@
-// Ports upstream `packages/telemetry/src/testing/types.ts` at 482c1381a.
+// Ports upstream `packages/telemetry/src/testing/types.ts` at 48909d987.
 
 import PiSwiftTelemetry
 
@@ -6,6 +6,12 @@ import PiSwiftTelemetry
 public struct TelemetryAdapterFixture: Sendable {
     /// The adapter's context.
     public let context: any TelemetryContext
+    /// The adapter's propagation, if it has one; the propagation cases run only with it.
+    public let propagation: (any TelemetryPropagation)?
+    /// The adapter's metrics, if it has them; the metrics cases run only with them and `getMetrics`.
+    public let metrics: (any TelemetryMetrics)?
+    /// Returns the recorded measurements as normalized snapshots.
+    public let getMetrics: (@Sendable () async throws -> [RecordedTelemetryMeasurement])?
     /// Returns the finished spans as normalized snapshots. It may flush an asynchronous exporter first.
     public let getSpans: @Sendable () async throws -> [RecordedTelemetrySpan]
     /// Releases the adapter. Each case calls it once, also after a failed check.
@@ -14,10 +20,16 @@ public struct TelemetryAdapterFixture: Sendable {
     /// Creates a fixture.
     public init(
         context: any TelemetryContext,
+        propagation: (any TelemetryPropagation)? = nil,
+        metrics: (any TelemetryMetrics)? = nil,
+        getMetrics: (@Sendable () async throws -> [RecordedTelemetryMeasurement])? = nil,
         getSpans: @escaping @Sendable () async throws -> [RecordedTelemetrySpan],
         dispose: @escaping @Sendable () async throws -> Void = {}
     ) {
         self.context = context
+        self.propagation = propagation
+        self.metrics = metrics
+        self.getMetrics = getMetrics
         self.getSpans = getSpans
         self.dispose = dispose
     }

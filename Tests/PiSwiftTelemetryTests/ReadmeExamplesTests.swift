@@ -1,5 +1,7 @@
-// Runs the Swift code blocks of `Sources/PiSwiftTelemetry/README.md`.
+// Runs the Swift code blocks of `Sources/PiSwiftTelemetry/README.md`. The `TelemetryPropagation` block is the
+// declaration in `Telemetry.swift`.
 
+import Foundation
 import Testing
 import PiSwiftTelemetry
 import PiSwiftTelemetryTesting
@@ -17,6 +19,8 @@ func readAccount(_ id: String) async throws -> Account? { id == "123" ? Account(
 private func readAccounts() async throws -> [Account] { [Account(id: "1"), Account(id: "2")] }
 private func readProjects() async throws -> [String] { ["p"] }
 private func save() async throws -> SaveResult { SaveResult(ok: false, reason: "disk full") }
+private func handleRequest(_ span: any TelemetrySpan) async throws { span.addEvent("handled") }
+private func activate() async throws {}
 
 // README: core-context
 func loadAccount(_ accountId: String, telemetry: any TelemetryContext = noopTelemetryContext) async throws -> Account? {
@@ -33,7 +37,9 @@ func loadAccount(_ accountId: String, telemetry: any TelemetryContext = noopTele
 // README: conformance
 private let cases = createTelemetryAdapterConformance {
     let adapter = InMemoryTelemetryContext()
-    return TelemetryAdapterFixture(context: adapter, getSpans: { adapter.getSpans() }, dispose: {})
+    return TelemetryAdapterFixture(context: adapter, propagation: adapter, metrics: adapter,
+                                   getMetrics: { adapter.getMetrics() }, getSpans: { adapter.getSpans() },
+                                   dispose: {})
 }
 
 @Test(arguments: cases)
@@ -42,14 +48,20 @@ func telemetryAdapterConformance(_ testCase: TelemetryAdapterConformanceCase) as
 }
 // README: end
 
+/// The in-memory carrier of span `id`: the recorder's scope, which every span of `spans` shares, and the span ID.
+func memoryCarrier(_ spans: [RecordedTelemetrySpan], _ id: Int) -> TelemetryCarrier {
+    ["pi-memory-scope": spans.first?.context["pi-memory-scope"] ?? "", "pi-memory-span": String(id)]
+}
+
 @Suite("PiSwiftTelemetryTests.README examples")
 struct ReadmeExamplesTests {
     @Test func coreContext() async throws {
         let telemetry = InMemoryTelemetryContext()
         #expect(try await loadAccount("123", telemetry: telemetry) == Account(id: "123"))
         #expect(try await loadAccount("9") == nil)
-        #expect(telemetry.getSpans() == [RecordedTelemetrySpan(
-            id: 1, parentId: nil, name: "example.account.load",
+        let spans = telemetry.getSpans()
+        #expect(spans == [RecordedTelemetrySpan(
+            id: 1, parentId: nil, context: memoryCarrier(spans, 1), name: "example.account.load",
             attributes: ["example.account.id": "123", "example.account.found": true],
             settled: true, endSequence: 1)])
     }
@@ -78,11 +90,99 @@ struct ReadmeExamplesTests {
         }
         print(telemetry.getSpans())
         // README: end
-        #expect(telemetry.getSpans() == [RecordedTelemetrySpan(
-            id: 1, parentId: nil, name: "example.operation",
+        let spans = telemetry.getSpans()
+        #expect(spans == [RecordedTelemetrySpan(
+            id: 1, parentId: nil, context: memoryCarrier(spans, 1), name: "example.operation",
             attributes: ["input": "demo", "output_count": 3],
             events: [RecordedTelemetryEvent(name: "example.started")],
             settled: true, endSequence: 1)])
+    }
+
+    @Test func propagation() async throws {
+        // README: propagation
+        let caller = InMemoryTelemetryContext()
+        let provider = InMemoryTelemetryContext()
+        try await caller.startSpan(SpanOptions(name: "rpc.client")) { span in
+            let wire = try JSONEncoder().encode(caller.inject(span))
+            let carrier = try JSONDecoder().decode(TelemetryCarrier?.self, from: wire)
+            try await provider.extract(carrier).startSpan(SpanOptions(name: "rpc.server")) { serverSpan in
+                try await handleRequest(serverSpan)
+            }
+        }
+        // README: end
+        let server = try #require(provider.getSpans().first)
+        #expect(server.parentContext == caller.getSpans().first?.context)
+        #expect(server.parentId == nil)
+        #expect(server.events == [RecordedTelemetryEvent(name: "handled")])
+    }
+
+    @Test func links() async throws {
+        let telemetry = InMemoryTelemetryContext()
+        var getters: [any TelemetrySpan] = []
+        for name in ["first", "later"] {
+            await telemetry.startSpan(SpanOptions(name: "\(name).getter")) { span in getters.append(span) }
+        }
+        let firstGetter = getters[0], laterGetter = getters[1]
+        // README: links
+        try await telemetry.startSpan(SpanOptions(
+            name: "activation", links: [SpanLink(context: firstGetter, attributes: ["reason": "trigger"])]
+        )) { activation in
+            laterGetter.addLink(SpanLink(context: activation))
+            try await activate()
+        }
+        // README: end
+        let spans = telemetry.getSpans()
+        #expect(spans[2].links == [RecordedTelemetryLink(context: spans[0].context, attributes: ["reason": "trigger"])])
+        // The later getter had settled, so it ignores the link.
+        #expect(spans[1].links.isEmpty)
+    }
+
+    @Test func metrics() async {
+        let telemetry = InMemoryTelemetryContext()
+        let encodedSize = 64, elapsedMs = 12.5
+        await telemetry.startSpan(SpanOptions(name: "call")) { currentSpan in
+            // README: metrics
+            let bytes = telemetry.counter("network.bytes", options: InstrumentOptions(
+                description: "Encoded WebSocket bytes", unit: "By"))
+            bytes.add(Double(encodedSize), attributes: ["direction": "out"])
+
+            let active = telemetry.upDownCounter("calls.active")
+            active.add(1)
+            active.add(-1)
+
+            let duration = telemetry.histogram("call.duration", options: HistogramOptions(
+                unit: "ms", boundaries: [1, 10, 100, 1000]))
+            duration.record(elapsedMs, attributes: ["method": "read"], context: currentSpan)
+            // README: end
+        }
+        #expect(telemetry.getMetrics() == [
+            RecordedTelemetryMeasurement(kind: .counter, name: "network.bytes", description: "Encoded WebSocket bytes",
+                                         unit: "By", value: 64, attributes: ["direction": "out"]),
+            RecordedTelemetryMeasurement(kind: .upDownCounter, name: "calls.active", value: 1),
+            RecordedTelemetryMeasurement(kind: .upDownCounter, name: "calls.active", value: -1),
+            RecordedTelemetryMeasurement(kind: .histogram, name: "call.duration", unit: "ms", boundaries: [1, 10, 100, 1000],
+                                         value: 12.5, attributes: ["method": "read"],
+                                         context: telemetry.getSpans().first?.context),
+        ])
+    }
+
+    @Test func typedMetrics() {
+        let telemetry = InMemoryTelemetryContext()
+        let encodedSize = 64
+        // README: typed-metrics
+        let schema = defineTelemetrySchema(TelemetrySchemaDefinition(version: 1, spans: [:], metrics: [
+            "network.bytes": .counter(description: "Encoded bytes", unit: "By", attributes: [
+                "direction": .init(.string(values: ["in", "out"]), description: "Direction", required: true,
+                                   cardinality: .low),
+            ]),
+        ]))
+
+        let metrics = createTypedMetrics(telemetry, [schema])
+        metrics.counter("network.bytes").add(Double(encodedSize), attributes: ["direction": "out"])
+        // README: end
+        #expect(telemetry.getMetrics() == [RecordedTelemetryMeasurement(
+            kind: .counter, name: "network.bytes", description: "Encoded bytes", unit: "By", value: 64,
+            attributes: ["direction": "out"])])
     }
 
     @Test func typedSchemas() async throws {
@@ -122,14 +222,16 @@ struct ReadmeExamplesTests {
         }
         // README: end
         #expect(accounts.count == 2)
-        #expect(telemetry.getSpans() == [
+        let spans = telemetry.getSpans()
+        #expect(spans == [
             RecordedTelemetrySpan(
-                id: 1, parentId: nil, name: "example.read",
+                id: 1, parentId: nil, context: memoryCarrier(spans, 1), name: "example.read",
                 attributes: ["example.resource": "account", "example.item_count": 2],
                 events: [RecordedTelemetryEvent(name: "example.cache", attributes: ["example.cache.hit": true])],
                 settled: true, endSequence: 2),
             RecordedTelemetrySpan(
-                id: 2, parentId: 1, name: "example.read",
+                id: 2, parentId: 1, context: memoryCarrier(spans, 2), parentContext: memoryCarrier(spans, 1),
+                name: "example.read",
                 attributes: ["example.resource": "project", "example.item_count": 1],
                 settled: true, endSequence: 1),
         ])
