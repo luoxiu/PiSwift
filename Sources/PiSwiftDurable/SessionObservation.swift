@@ -1,7 +1,7 @@
 import PiSwiftChord
 import Synchronization
 
-/// Release both Session subscriptions, including a subscription installed after release.
+/// Release the Session subscriptions and the document pin, including one installed after release.
 private final class ObservationSubscriptions: Sendable {
     private struct State {
         var released = false
@@ -69,7 +69,7 @@ extension Session {
             let watch = CommittedWatch<Value?>(value: value, replacement: { _ in revision.tree }, detach: { subscriptions.release() },
                                                report: { [hooks] in hooks.report($0) })
             do {
-                try attachObservation(recordID: loaded.record.id, revision: revision, subscriptions: subscriptions,
+                try attachObservation(loaded, revision: revision, subscriptions: subscriptions,
                     advance: { change, ops, context in
                         do {
                             let value = try change.value.map { try JSONValue.object($0).decode(Value.self) }
@@ -108,7 +108,7 @@ extension Session {
             let subscriptions = ObservationSubscriptions()
             let source = CommittedStateSource<Value?>(value: value, release: { subscriptions.release() })
             do {
-                try attachObservation(recordID: loaded.record.id, revision: revision, subscriptions: subscriptions,
+                try attachObservation(loaded, revision: revision, subscriptions: subscriptions,
                     advance: { change, ops, context in
                         do {
                             let value = try change.value.map { try JSONValue.object($0).decode(Value.self) }
@@ -127,17 +127,24 @@ extension Session {
         }
     }
 
+    /// Attached, the incarnation stays cached; once its last observer detaches, or it retires, it is idle again.
     private func attachObservation(
-        recordID: DocumentID, revision: ObservationRevision, subscriptions: ObservationSubscriptions,
+        _ loaded: LoadedDocument, revision: ObservationRevision, subscriptions: ObservationSubscriptions,
         advance: @escaping @Sendable (DocumentCommitChange, [Delta.Op], ChordContext) -> Void,
         close: @escaping @Sendable () -> Void
     ) throws {
+        let recordID = loaded.record.id
+        let pin = pinDocument(loaded.address, recordID: recordID)
+        subscriptions.add(SessionSubscription { pin.unpin() })
         subscriptions.add(try observeCommits { publication, context in
             for change in publication.changes {
                 guard case .document(let document) = change,
                       document.source == nil, document.record.id == recordID else { continue }
                 let ops = revision.operations(document)
-                if !ops.isEmpty { advance(document, ops, context.withoutAbortSignal()) }
+                guard !ops.isEmpty else { continue }
+                // A retired incarnation never changes again: its observers keep their last value but pin nothing.
+                if document.value == nil { pin.unpin() }
+                advance(document, ops, context.withoutAbortSignal())
             }
         })
         subscriptions.add(try subscribeClose(close))

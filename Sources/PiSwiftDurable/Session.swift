@@ -25,7 +25,12 @@ public struct DefaultSessionHooks: SessionHooks {
     public init() {}
 }
 
-/// One mutation line over one storage backend.
+/// One mutation line over one storage backend, the loaded document tracker cache, and committed publication.
+///
+/// The cache is bounded by use: a document with no watch or document state attached leaves it once it was not read or
+/// written for the retention period (`DocumentRetention`), and the next access loads it from Storage. Eviction runs on
+/// the mutation line, after each commit and when a timer for the next expiry fires, so no transaction ever holds a
+/// tracker that leaves.
 ///
 /// Storage failures are final. Every Storage call goes through one guard: the first error a Storage method throws, other
 /// than for an invalid read or a cancelled caller, fails the Session, as does a commit it cannot adopt. That call gets the
@@ -53,7 +58,7 @@ public final class Session: Sendable {
         var internalCommits: [CommitListener] = []
         var commits: [CommitListener] = []
         var closes: [CloseListener] = []
-        var documents: [[UInt8]: LoadedDocument] = [:]
+        var cache = SessionDocumentCache()
         /// Waits that end with `SessionFailed` the moment the Session fails, before work underway has ended.
         var failureWaits: [UUID: @Sendable (any Error) -> Void] = [:]
     }
@@ -61,18 +66,26 @@ public final class Session: Sendable {
     private let ended = HarnessPromise<SessionEnd>()
     // Capture cached revisions atomically with all adoption, eviction, and installation.
     private let committedRead = Mutex(())
-    private init(storage: any DurableStorage, now: @escaping @Sendable () -> Int64, hooks: any SessionHooks) {
+    private let documentRetentionSetting: @Sendable () -> DocumentRetention?
+    private let timer: SessionTimer
+    /// `documentRetention` is read at each use; nil means the default. `timer` arms the eviction timer.
+    internal init(storage: any DurableStorage, now: @escaping @Sendable () -> Int64, hooks: any SessionHooks = DefaultSessionHooks(),
+                  documentRetention: @escaping @Sendable () -> DocumentRetention? = { nil },
+                  timer: @escaping SessionTimer = sessionTaskTimer) {
         let guarded = GuardedStorage(storage)
         self.guarded = guarded; self.storage = guarded; self.now = now; self.hooks = hooks
+        self.documentRetentionSetting = documentRetention; self.timer = timer
         guarded.onFailure { [weak self] error in self?.failed(error) }
     }
     /// Creates a session over the supplied storage without reading persisted records. The first error a Storage method
-    /// throws fails the Session (`SessionFailed`).
+    /// throws fails the Session (`SessionFailed`). `documentRetentionMs` bounds the document cache; nil means the default,
+    /// ten minutes.
     public static func open(storage: any DurableStorage,
                             now: @escaping @Sendable () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) },
+                            documentRetentionMs: DocumentRetention? = nil,
                             hooks: any SessionHooks = DefaultSessionHooks(),
                             context: ChordContext) async throws -> Session {
-        Session(storage: storage, now: now, hooks: hooks)
+        Session(storage: storage, now: now, hooks: hooks, documentRetention: { documentRetentionMs })
     }
     /// Settles once the Session has closed, Storage included: after `close()`, or after the first failed Storage call,
     /// which closes the Session itself. A failed Session is reopened from Storage; nothing else is left to clean up.
@@ -146,9 +159,14 @@ public final class Session: Sendable {
             // A callback that caught a failed read must not commit, nor succeed as if it had.
             try assertHealthy()
         }
-        catch { await tx.settleFailure(); throw error }
-        let writes = try await tx.settleSuccess()
-        if writes.isEmpty { tx.discard(); return result }
+        catch { await tx.settleFailure(); sweepDocuments(); throw error }
+        let writes: [StorageWrite]
+        do { writes = try await tx.settleSuccess() }
+        catch {
+            // Settlement aborted every change already.
+            sweepDocuments(); throw error
+        }
+        if writes.isEmpty { tx.discard(); sweepDocuments(); return result }
         let seq: Seq
         do { seq = try await storage.commit(writes, context: context.withoutAbortSignal()) }
         catch {
@@ -162,6 +180,7 @@ public final class Session: Sendable {
             // Storage already committed; a failed adoption leaves memory behind durable state.
             fail(error); throw error
         }
+        touchDocuments(documents.map { Array(documentAddressID(DocumentAddress(kind: $0.record.kind, scope: $0.record.scope, key: $0.record.key)).utf8) })
         var changes: [CommitChange] = []
         for write in writes {
             switch write {
@@ -182,6 +201,7 @@ public final class Session: Sendable {
         for listener in listeners {
             do { try listener.call(publication, context) } catch { hooks.report(error) }
         }
+        sweepDocuments()
         return result
     }
     internal func readOnLine<T>(_ job: () async throws -> T) async throws -> T {
@@ -196,7 +216,7 @@ public final class Session: Sendable {
         let ticket = line.reserve()
         await ticket.wait()
         defer { line.release() }
-        state.withLock { $0.documents.removeAll() }
+        state.withLock { $0.cache.documents.removeAll(); $0.cache.idle.removeAll() }
     }
     /// The listener runs on the line after adoption. It must not block or call Session operations; a throw is reported.
     public func subscribeCommits(_ listener: @escaping @Sendable (CommitPublication, ChordContext) throws -> Void) throws -> SessionSubscription {
@@ -243,7 +263,10 @@ public final class Session: Sendable {
                 let ticket = self.line.reserve()
                 await ticket.wait()
                 defer { self.line.release() }
-                self.state.withLock { $0.commits.removeAll(); $0.internalCommits.removeAll(); $0.documents.removeAll() }
+                self.state.withLock { state in
+                    state.commits.removeAll(); state.internalCommits.removeAll()
+                    state.cache.documents.removeAll(); state.cache.idle.removeAll(); state.cache.attached.removeAll()
+                }
                 do { try await self.storage.close(context: cleanup) }
                 catch {
                     // A Storage that cannot close is a failed one; an earlier failure stays the cause.
@@ -252,6 +275,7 @@ public final class Session: Sendable {
                 }
             }
             state.closing = task
+            state.cache.sweep?.cancel?(); state.cache.sweep = nil
             let listeners = state.closes; state.closes.removeAll()
             return (task, listeners)
         }
@@ -263,9 +287,11 @@ public final class Session: Sendable {
     }
     internal func loadDocument(_ definition: DocumentDefinition, address: DocumentAddress,
                                context: ChordContext) async throws -> LoadedDocument? {
-        if let cached = cachedDocument(address) {
-            if cached.valueVersion == definition.version { return cached }
-            evictDocument(address, recordID: cached.record.id)
+        let key = Array(documentAddressID(address).utf8)
+        // A tracker serves only tokens of the version its value was materialized for; others reload from Storage.
+        if let cached = state.withLock({ $0.cache.documents[key] }) {
+            if cached.valueVersion == definition.version { touchDocuments([key]); return cached }
+            dropDocument(key)
         }
         guard let record = try await storage.findDocument(address, at: .current, context: context) else { return nil }
         guard let stored = try await storage.document(record.id, at: .current, context: context) else {
@@ -280,11 +306,15 @@ public final class Session: Sendable {
     }
     internal func currentSnapshot<Value: Decodable & Sendable>(_ definition: DocumentDefinition,
                         address: DocumentAddress, context: ChordContext) async throws -> Value? {
+        let now = now(), retention = currentDocumentRetention()
         let captured = try committedRead.withLock { _ -> (LoadedDocument, Int, JSONValue)? in
             let cached = try state.withLock { state -> LoadedDocument? in
                 if let failure = guarded.failure { throw SessionFailed(failure) }
                 if state.closing != nil { throw SessionError.closed }
-                return state.documents[Array(documentAddressID(address).utf8)]
+                let key = Array(documentAddressID(address).utf8)
+                let cached = state.cache.documents[key]
+                if cached?.valueVersion == definition.version { touchDocument(key, in: &state, now: now, retention: retention) }
+                return cached
             }
             guard let cached, cached.valueVersion == definition.version else { return nil }
             try definition.check(cached.record)
@@ -335,15 +365,124 @@ public final class Session: Sendable {
         return (loaded.record, loaded.valueVersion, loaded.tracker.value.objectValue!)
     }
     internal func cachedDocument(_ address: DocumentAddress) -> LoadedDocument? {
-        state.withLock { $0.documents[Array(documentAddressID(address).utf8)] }
+        let key = Array(documentAddressID(address).utf8)
+        let cached = state.withLock { $0.cache.documents[key] }
+        if cached != nil { touchDocuments([key]) }
+        return cached
     }
     internal func installDocument(_ document: LoadedDocument) {
-        state.withLock { $0.documents[Array(documentAddressID(document.address).utf8)] = document }
+        let key = Array(documentAddressID(document.address).utf8)
+        state.withLock { $0.cache.documents[key] = document }
+        touchDocuments([key])
     }
     internal func evictDocument(_ address: DocumentAddress, recordID: DocumentID) {
-        state.withLock {
-            let key = Array(documentAddressID(address).utf8)
-            if $0.documents[key]?.record.id == recordID { $0.documents.removeValue(forKey: key) }
+        let key = Array(documentAddressID(address).utf8)
+        state.withLock { state in
+            if state.cache.documents[key]?.record.id == recordID { state.cache.documents.removeValue(forKey: key); state.cache.idle.remove(key) }
+        }
+    }
+    private func dropDocument(_ key: [UInt8]) {
+        state.withLock { $0.cache.documents.removeValue(forKey: key); $0.cache.idle.remove(key) }
+    }
+
+    /// The document retention in force: the Harness reads its settings at each use.
+    private func currentDocumentRetention() -> DocumentRetention { documentRetention(documentRetentionSetting()) }
+    /// Internal, for tests: how many documents the cache holds, how many are idle, how many incarnations are pinned, and
+    /// how many sweep jobs were queued on the line so far.
+    internal var documentCacheSizes: DocumentCacheSizes {
+        state.withLock { DocumentCacheSizes(cached: $0.cache.documents.count, idle: $0.cache.idle.count,
+                                            attached: $0.cache.attached.count, sweeps: $0.cache.sweepJobs) }
+    }
+    /// Note uses of cached documents. The clock and the setting are read before the lock: both are host code.
+    private func touchDocuments(_ keys: [[UInt8]]) {
+        let now = now(), retention = currentDocumentRetention()
+        state.withLock { state in for key in keys { touchDocument(key, in: &state, now: now, retention: retention) } }
+    }
+    /// Note a use of a cached document: an unattached one becomes the newest idle one, and an eviction is scheduled.
+    private func touchDocument(_ key: [UInt8], in state: inout State, now: Int64, retention: DocumentRetention) {
+        guard let cached = state.cache.documents[key], state.cache.attached[cached.record.id] == nil else { return }
+        // A hot document moves to the back at most once per granule, a tenth of the retention up to 1 s: it may then leave
+        // up to a granule early, which costs a reload, while a commit-heavy workload skips the reordering.
+        if let since = state.cache.idle.since(key), withinDocumentGranule(now - since, retention) { return }
+        state.cache.idle.use(key, at: now)
+        // A pending sweep for the oldest document comes first unless the retention was shortened since; then it moves up.
+        if let pending = state.cache.sweep, !(documentExpiry(now, retention).map { pending.at > $0 } ?? false) { return }
+        scheduleDocumentSweep(&state, now: now, retention: retention)
+    }
+    /// Schedule the eviction of the oldest idle document: on the line at once when it is due, otherwise when it expires,
+    /// by a timer that holds nothing alive. Where the host declines the timer, none is kept: the end of each commit evicts
+    /// what expired. `forever` schedules nothing.
+    private func scheduleDocumentSweep(_ state: inout State, now: Int64, retention: DocumentRetention) {
+        guard state.closing == nil, let oldest = state.cache.idle.oldest(), let at = documentExpiry(oldest, retention) else { return }
+        if let pending = state.cache.sweep, pending.at <= at { return }
+        state.cache.sweep?.cancel?()
+        state.cache.nextSweep += 1
+        let id = state.cache.nextSweep
+        // The pending sweep stays set until its job runs, so touches while the line is busy queue no more.
+        state.cache.sweep = PendingDocumentSweep(at: at, id: id)
+        let (delay, overflow) = at.subtractingReportingOverflow(now)
+        if !overflow, delay <= 0 { queueDocumentSweep(id, in: &state); return }
+        if state.cache.timersUnavailable { state.cache.sweep = nil; return }
+        // Longest delay upstream's `setTimeout` supports; a longer retention waits in several steps.
+        guard let cancel = timer(overflow ? 2_147_483_647 : min(delay, 2_147_483_647), { [weak self] in
+            self?.state.withLock { state in
+                guard state.closing == nil else { return }
+                self?.queueDocumentSweep(id, in: &state)
+            }
+        }) else {
+            state.cache.timersUnavailable = true
+            state.cache.sweep = nil
+            return
+        }
+        state.cache.sweep?.cancel = cancel
+    }
+    /// Queue a sweep job on the line now, behind whatever holds it, as upstream enqueues one.
+    private func queueDocumentSweep(_ id: Int, in state: inout State) {
+        state.cache.sweepJobs += 1
+        let ticket = line.reserve()
+        Task { [weak self, line] in
+            await ticket.wait()
+            defer { line.release() }
+            self?.sweepOnLine(id)
+        }
+    }
+    /// The sweep job, on the line: evict what expired, then schedule the next eviction.
+    private func sweepOnLine(_ id: Int) {
+        let now = now(), retention = currentDocumentRetention()
+        state.withLock { state in
+            if state.cache.sweep?.id == id { state.cache.sweep = nil }
+            if state.closing == nil { sweepDocuments(&state, now: now, retention: retention) }
+        }
+    }
+    /// On the line, after each commit outcome: evict what expired.
+    private func sweepDocuments() {
+        let now = now(), retention = currentDocumentRetention()
+        state.withLock { sweepDocuments(&$0, now: now, retention: retention) }
+    }
+    /// Evict the idle documents whose retention passed, oldest first, then schedule the next eviction.
+    private func sweepDocuments(_ state: inout State, now: Int64, retention: DocumentRetention) {
+        if let ms = retention.ms {
+            let (expired, overflow) = now.subtractingReportingOverflow(ms)
+            if !overflow { for key in state.cache.idle.removeUsed(atOrBefore: expired) { state.cache.documents.removeValue(forKey: key) } }
+        }
+        scheduleDocumentSweep(&state, now: now, retention: retention)
+    }
+    /// Pin a cached incarnation for one observer; unpinning releases it once, and the last makes it idle again.
+    internal func pinDocument(_ address: DocumentAddress, recordID: DocumentID) -> DocumentPin {
+        let key = Array(documentAddressID(address).utf8)
+        state.withLock { state in
+            state.cache.attached[recordID, default: 0] += 1
+            state.cache.idle.remove(key)
+        }
+        return DocumentPin { [weak self] in self?.unpinDocument(key, recordID: recordID) }
+    }
+    private func unpinDocument(_ key: [UInt8], recordID: DocumentID) {
+        let now = now(), retention = currentDocumentRetention()
+        state.withLock { state in
+            let count = (state.cache.attached[recordID] ?? 1) - 1
+            if count > 0 { state.cache.attached[recordID] = count; return }
+            state.cache.attached.removeValue(forKey: recordID)
+            if state.cache.documents[key]?.record.id == recordID { touchDocument(key, in: &state, now: now, retention: retention) }
         }
     }
 }

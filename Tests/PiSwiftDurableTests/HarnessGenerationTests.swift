@@ -179,6 +179,7 @@ struct HarnessGenerationTests {
         #expect(value.retry == defaultRetryPolicy && value.compaction == defaultCompactionPolicy && value.progress == defaultProgressPolicy)
         #expect(value.toolExecution == .parallel && value.steeringMode == .oneAtATime && value.followUpMode == .oneAtATime)
         #expect(value.contextRetentionMs == 600000)
+        #expect(value.documentRetentionMs == defaultDocumentRetention)
         let changed = resolveSettings(.init(retry: .init(enabled: false), compaction: .init(backgroundTokens: 0), progress: .init(outputIntervalMs: 500)))
         #expect(!changed.retry.enabled && changed.retry.maxRetries == 3 && changed.compaction.backgroundTokens == 0)
         #expect(changed.progress == .init(partialIntervalMs: 100, outputIntervalMs: 500))

@@ -174,14 +174,20 @@ public struct HarnessSettings: Sendable {
     public var followUpMode: QueueMode?
     /// How long reusable model context can remain cached, in milliseconds.
     public var contextRetentionMs: Int64?
+    /// How long a loaded document that no watch or document state observes stays in memory after its last read or write;
+    /// the next access loads it from Storage. Observed documents always stay. Default ten minutes; `0` drops one right
+    /// after use; `.forever` keeps them. A negative count means the default.
+    public var documentRetentionMs: DocumentRetention?
     /// Selects host defaults and optional request, compaction, and queue policies.
     public init(extensions: [Extension]? = nil, stream: ConversationStreamOptions? = nil,
                 retry: RetryPolicyOverrides? = nil, compaction: CompactionPolicyOverrides? = nil,
                 progress: ProgressPolicyOverrides? = nil, toolExecution: ToolExecutionMode? = nil,
-                steeringMode: QueueMode? = nil, followUpMode: QueueMode? = nil, contextRetentionMs: Int64? = nil) {
+                steeringMode: QueueMode? = nil, followUpMode: QueueMode? = nil, contextRetentionMs: Int64? = nil,
+                documentRetentionMs: DocumentRetention? = nil) {
         self.extensions = extensions; self.stream = stream; self.retry = retry; self.compaction = compaction
         self.progress = progress; self.toolExecution = toolExecution; self.steeringMode = steeringMode
         self.followUpMode = followUpMode; self.contextRetentionMs = contextRetentionMs
+        self.documentRetentionMs = documentRetentionMs
     }
 }
 
@@ -192,6 +198,8 @@ public struct HarnessSettingsProvider: Sendable {
     public init(_ read: @escaping @Sendable () -> HarnessSettings?) { self.read = read }
     /// Reads the current settings callback and fills unspecified policies with defaults.
     public func resolve() -> Settings { resolveSettings(read()) }
+    /// Reads the document retention alone, unresolved: the Session reads it on every commit.
+    internal var documentRetentionMs: DocumentRetention? { read()?.documentRetentionMs }
 }
 /// Harness settings with concrete default retry, compaction, and progress policies.
 public struct Settings: Sendable {
@@ -213,6 +221,8 @@ public struct Settings: Sendable {
     public var followUpMode: QueueMode
     /// How long reusable model context can remain cached, in milliseconds.
     public var contextRetentionMs: Int64
+    /// How long a loaded document nothing observes stays in memory after its last use.
+    public var documentRetentionMs: DocumentRetention
 }
 /// Fills unspecified retry, compaction, and progress fields with their defaults.
 public func resolveSettings(_ settings: HarnessSettings? = nil) -> Settings {
@@ -227,5 +237,6 @@ public func resolveSettings(_ settings: HarnessSettings? = nil) -> Settings {
                         outputIntervalMs: settings?.progress?.outputIntervalMs ?? 100),
         toolExecution: settings?.toolExecution ?? .parallel,
         steeringMode: settings?.steeringMode ?? .oneAtATime, followUpMode: settings?.followUpMode ?? .oneAtATime,
-        contextRetentionMs: settings?.contextRetentionMs ?? 600000)
+        contextRetentionMs: settings?.contextRetentionMs ?? 600000,
+        documentRetentionMs: documentRetention(settings?.documentRetentionMs))
 }

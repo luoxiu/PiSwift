@@ -25,6 +25,12 @@ A commit callback holds the Session line. Inside it, read only through `tx`. `sn
 queue on that line. There they never return, and the line stays held. A cache hit returns,
 so the hang is intermittent.
 
+The Session keeps the documents it loads or creates in memory. One that no watch or document
+state observes leaves once it was not read or written for `documentRetentionMs`: ten minutes
+by default, `0` right after use, `.forever` never. Set it in `HarnessSettings`, which the
+Harness reads at each use, or in `Session.open`. The next access loads it from storage.
+A watch or document state keeps the incarnation it observes until that incarnation retires.
+
 Changes go to storage before observers receive them. A transcript normally contains
 `pi.user`, a positional `pi.system` entry, and `pi.assistant`. Tool rounds also add
 `pi.tool-result`. Built-in documents include `pi.agent`, `pi.provider`, `pi.live`,
@@ -199,7 +205,8 @@ There is no cross-process lock. Keep commits serialized through Session.
 Preparation alone does not reserve a future commit. SQLite uses the Apple SDK library
 and requires SQLite 3.37 or later. The port reads the upstream SQLite schema.
 JSONL shares the valid format-1 files with TypeScript. JSON text bytes can differ.
-It holds full state in memory and replays `main.jsonl` on open. Open can repair file tails.
+It holds full state in memory and replays `main.jsonl` on open, so its memory grows with the
+history. Use SQLite for long-running agents. Open can repair file tails.
 
 Supply a fresh writable `sessionDirectory` and `context` for this storage example.
 
@@ -418,6 +425,11 @@ Harness's own bookkeeping, such as a scheduler commit, fails the Harness.
   this library rather than a separate entry and exists where ImageIO does. JPEG qualities 80 to
   40 map to ImageIO's 0.8 to 0.4, and Core Graphics' high-quality interpolation replaces Lanczos3,
   so re-encoded bytes differ. Foundation encodes base64.
+- `DocumentRetention` replaces the retention number. `.forever` is upstream `Infinity`, and a
+  negative count, the only value that is not milliseconds, means the default. The eviction timer
+  is a sleeping task that keeps nothing alive. Upstream evicts only on commits where timers cannot
+  be unreferenced; here that applies when the Session's internal timer declines, which only tests
+  do. `PI_DURABLE_DOCUMENT_RETENTION_MS` replaces the default for the test suite's second run.
 - This library has no CLI or TUI code. PowerShell and Windows process support are outside scope.
 
 Upstream examples 00–31 have Swift integration tests with assertions for the library

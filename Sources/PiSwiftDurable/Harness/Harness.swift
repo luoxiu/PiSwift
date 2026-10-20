@@ -53,7 +53,9 @@ public final class Harness: Sendable {
             let report: @Sendable (any Error) -> Void = options.onReport ?? { _ in }
             let hooks = HarnessSessionHooks(app: options.conversationCreated, onReport: report)
             let now = options.now ?? { options.clock.now() }
-            let session = try await Session.open(storage: rawStorage, now: now, hooks: hooks, context: context)
+            // Read at each use, as all settings are, but only this field: it is read on every commit.
+            let session = Session(storage: rawStorage, now: now, hooks: hooks,
+                                  documentRetention: { options.settings?.documentRetentionMs })
             // Every component reads and writes through the Session's failure guard: `rawStorage` serves only the Session.
             let storage = session.storage
             let settings: @Sendable () -> Settings = { options.settings?.resolve() ?? resolveSettings() }
