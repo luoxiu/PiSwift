@@ -714,7 +714,10 @@ until a compaction produces a summary. The event snapshot carries it as
   `applySqliteMigrations(_:migrations:table:)`, and `validateSqliteSchemaPrefix` have package access, where
   upstream exports them from `@earendil-works/chord/sqlite` and Durable re-exports them: a host opens storage
   with `SqliteStorage.open(path:options:)`, which opens its own file. The driver is synchronous, so a call on
-  the database inside its own transaction throws instead of queueing. There is no Durable Object driver.
+  the database inside its own transaction or `exclusive` operation throws instead of queueing. There is no Durable
+  Object driver. The replicated connection wrapper (`ReplicatedAppleSqliteDatabase`, upstream's
+  `sqlite/replication/node.ts`, which upstream does not export yet) is internal to PiSwiftChord. Apple's SQLite
+  keeps WAL files (persistent WAL), so a closed database leaves an empty `-wal` file, where Node's SQLite deletes it.
 - `ShellOutputSkip` is a type alias of PiSwiftChord's `OutputSkip`, where upstream declares the same shape
   twice. `Progress` takes a `ProgressClock` (`now()` and `setTimer(_:delayMs:)`); a tool's progress paces on
   the Harness clock and `TaskRuntime.setTimer()`.

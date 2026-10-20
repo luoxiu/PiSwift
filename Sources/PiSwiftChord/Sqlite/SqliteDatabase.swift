@@ -43,18 +43,22 @@ public struct SqliteRollbackError: Error, CustomStringConvertible {
 
 package enum SqliteFacadeError: Error, Equatable, CustomStringConvertible {
     case closed
-    case inactiveTransaction
+    /// A transaction or exclusive handle used after its scope ended; the associated value is `transaction` or
+    /// `exclusive`.
+    case inactiveHandle(String)
     case transactionHandleRequired
     case invalidMigrations
     case missingSchema
     case newerSchema(found: Int, supported: Int)
     case invalidPrefix(String)
     case reservedPrefix(String)
+    case replicatedClosed
+    case replicationPath(String)
 
     package var description: String {
         switch self {
         case .closed: "SQLite database is closed"
-        case .inactiveTransaction: "SQLite transaction handle is no longer active"
+        case .inactiveHandle(let kind): "SQLite \(kind) handle is no longer active"
         case .transactionHandleRequired: "SQLite operations inside a transaction must use its handle"
         case .invalidMigrations: "SQLite migrations must have contiguous versions starting at 1"
         case .missingSchema: "SQLite schema metadata is missing"
@@ -62,10 +66,25 @@ package enum SqliteFacadeError: Error, Equatable, CustomStringConvertible {
             "SQLite schema version \(found) is newer than supported version \(supported)"
         case .invalidPrefix(let prefix): "Invalid SQLite schema prefix \(quoted(prefix))"
         case .reservedPrefix(let prefix): "SQLite schema prefix \(quoted(prefix)) is reserved"
+        case .replicatedClosed: "Replicated SQLite database is closed"
+        case .replicationPath(let path): "Replication needs a database file path, got \(quoted(path))"
         }
     }
-    /// The prefix as `JSON.stringify` writes it in upstream's message.
-    private func quoted(_ prefix: String) -> String { (try? JSONValue.string(prefix).jsonText()) ?? "\"\(prefix)\"" }
+    /// The text as `JSON.stringify` writes it in upstream's message.
+    private func quoted(_ text: String) -> String { (try? JSONValue.string(text).jsonText()) ?? "\"\(text)\"" }
+}
+
+/// An exclusive operation left a transaction open. It was rolled back; `cause` is the operation's own error, if it failed.
+package struct SqliteExclusiveTransactionError: Error, CustomStringConvertible {
+    package let cause: (any Error)?
+    package var description: String { "SQLite exclusive operation left a transaction open; it was rolled back" }
+}
+
+/// An exclusive operation left a transaction open and the rollback failed: `errors` holds the
+/// `SqliteExclusiveTransactionError` and the rollback's error, as upstream's `AggregateError`.
+package struct SqliteExclusiveRollbackError: Error, CustomStringConvertible {
+    package let errors: [any Error]
+    package var description: String { "SQLite exclusive operation left a transaction open and rollback failed" }
 }
 
 /// Values the SQLite driver binds and returns.
@@ -111,7 +130,8 @@ package extension SqliteExecutor {
 package final class AppleSqliteDatabase: SqliteExecutor {
     private var connection: OpaquePointer?
     private var statements: [String: OpaquePointer] = [:]
-    private var transactionActive = false
+    /// A transaction or exclusive operation is running; calls on the database itself must use its handle.
+    private var scopeActive = false
     /// Test hook: count successful prepares by SQL text, including cache misses only.
     package private(set) var prepareCounts: [String: Int] = [:]
 
@@ -173,9 +193,9 @@ package final class AppleSqliteDatabase: SqliteExecutor {
     package func transaction<T>(_ body: (any SqliteExecutor) throws -> T) throws -> T {
         try requireOutsideTransaction()
         try execute("BEGIN IMMEDIATE")
-        transactionActive = true
-        let handle = TransactionHandle(database: self)
-        defer { transactionActive = false }
+        scopeActive = true
+        let handle = ScopedHandle(database: self, kind: "transaction")
+        defer { scopeActive = false }
         do {
             let result = try body(handle)
             handle.active = false
@@ -190,6 +210,36 @@ package final class AppleSqliteDatabase: SqliteExecutor {
             }
             throw error
         }
+    }
+
+    /// Runs `operation` alone on the connection, outside a transaction. The handle runs SQL immediately and is invalid
+    /// afterwards. Use it for work that must not interleave with commits but cannot run inside a transaction, such as
+    /// `PRAGMA wal_checkpoint`. The driver is synchronous, so every earlier call has returned and later ones wait for
+    /// the caller; as with `transaction`, a call on the database itself from inside the operation throws.
+    ///
+    /// An operation that begins a transaction must end it. Otherwise later statements would silently join it and
+    /// never commit, so a transaction still open when the operation returns or throws is rolled back and the call
+    /// throws `SqliteExclusiveTransactionError`, with the operation's own error as the `cause` if it failed.
+    package func exclusive<T>(_ operation: (any SqliteExecutor) throws -> T) throws -> T {
+        try requireOutsideTransaction()
+        scopeActive = true
+        let handle = ScopedHandle(database: self, kind: "exclusive")
+        let outcome: Result<T, any Error>
+        do { outcome = .success(try operation(handle)) } catch { outcome = .failure(error) }
+        handle.active = false
+        scopeActive = false
+        if let connection, sqlite3_get_autocommit(connection) == 0 {
+            let leftOpen: SqliteExclusiveTransactionError
+            if case .failure(let error) = outcome { leftOpen = SqliteExclusiveTransactionError(cause: error) }
+            else { leftOpen = SqliteExclusiveTransactionError(cause: nil) }
+            do {
+                try execute("ROLLBACK")
+            } catch {
+                throw SqliteExclusiveRollbackError(errors: [leftOpen, error])
+            }
+            throw leftOpen
+        }
+        return try outcome.get()
     }
 
     package func close() throws {
@@ -209,7 +259,7 @@ package final class AppleSqliteDatabase: SqliteExecutor {
 
     private func requireOutsideTransaction() throws {
         guard connection != nil else { throw SqliteFacadeError.closed }
-        guard !transactionActive else { throw SqliteFacadeError.transactionHandleRequired }
+        guard !scopeActive else { throw SqliteFacadeError.transactionHandleRequired }
     }
 
     private func execute(_ sql: String) throws {
@@ -339,12 +389,18 @@ package final class AppleSqliteDatabase: SqliteExecutor {
         return SqliteError(resultCode: result, message: message)
     }
 
-    private final class TransactionHandle: SqliteExecutor {
+    /// The handle passed to a transaction or exclusive operation; it runs SQL directly and is invalid once its scope
+    /// ends.
+    private final class ScopedHandle: SqliteExecutor {
         private let database: AppleSqliteDatabase
+        private let kind: String
         var active = true
-        init(database: AppleSqliteDatabase) { self.database = database }
+        init(database: AppleSqliteDatabase, kind: String) {
+            self.database = database
+            self.kind = kind
+        }
         private func requireActive() throws {
-            guard active else { throw SqliteFacadeError.inactiveTransaction }
+            guard active else { throw SqliteFacadeError.inactiveHandle(kind) }
         }
         func exec(_ sql: String) throws {
             try requireActive()

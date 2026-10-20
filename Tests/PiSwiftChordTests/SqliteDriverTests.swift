@@ -23,7 +23,7 @@ private actor TransactionProbe {
     func close() throws { try database.close() }
 }
 
-// chord/test/sqlite/node.test.ts (c268154ca) on AppleSqliteDatabase, which moved here from PiSwiftDurable with the
+// chord/test/sqlite/node.test.ts (48c8f3228; line numbers are that version's) on AppleSqliteDatabase, which moved here from PiSwiftDurable with the
 // tests Durable had for it.
 @Suite("PiSwiftChordTests.SqliteDriver")
 struct SqliteDriverTests {
@@ -93,14 +93,79 @@ struct SqliteDriverTests {
             try transaction.run("INSERT INTO stale_probe (value) VALUES (?)", [.integer(1)])
         }
         let stale = try #require(handle)
-        #expect(throws: SqliteFacadeError.inactiveTransaction) { try stale.exec("INSERT INTO stale_probe (value) VALUES (2)") }
-        #expect(throws: SqliteFacadeError.inactiveTransaction) { try stale.run("INSERT INTO stale_probe (value) VALUES (?)", [.integer(3)]) }
-        #expect(throws: SqliteFacadeError.inactiveTransaction) { _ = try stale.get("SELECT value FROM stale_probe") }
-        #expect(throws: SqliteFacadeError.inactiveTransaction) { _ = try stale.all("SELECT value FROM stale_probe") }
+        #expect(throws: SqliteFacadeError.inactiveHandle("transaction")) { try stale.exec("INSERT INTO stale_probe (value) VALUES (2)") }
+        #expect(throws: SqliteFacadeError.inactiveHandle("transaction")) { try stale.run("INSERT INTO stale_probe (value) VALUES (?)", [.integer(3)]) }
+        #expect(throws: SqliteFacadeError.inactiveHandle("transaction")) { _ = try stale.get("SELECT value FROM stale_probe") }
+        #expect(throws: SqliteFacadeError.inactiveHandle("transaction")) { _ = try stale.all("SELECT value FROM stale_probe") }
         #expect(try database.all("SELECT value FROM stale_probe") == [["value": .integer(1)]])
     }
 
-    // :156.
+    // :156. The driver is synchronous, so the earlier call has returned and the later one runs after the operation
+    // returns; upstream's gate that holds the later call back has no counterpart.
+    @Test func runsAnExclusiveOperationAloneOutsideATransactionAfterEarlierCalls() throws {
+        let database = try AppleSqliteDatabase(path: ":memory:")
+        defer { try? database.close() }
+        try database.exec("CREATE TABLE exclusive_probe (value INTEGER)")
+        try database.run("INSERT INTO exclusive_probe (value) VALUES (?)", [.integer(1)])
+        var handle: (any SqliteExecutor)?
+        let seen = try database.exclusive { executor in
+            handle = executor
+            let seen = try executor.all("SELECT value FROM exclusive_probe")
+            // Not inside a transaction: the handle may begin and commit one itself.
+            try executor.exec("BEGIN; INSERT INTO exclusive_probe (value) VALUES (2); COMMIT")
+            // Swift: as in a transaction, a call on the database itself must use the handle.
+            #expect(throws: SqliteFacadeError.transactionHandleRequired) { _ = try database.all("SELECT 1") }
+            return seen
+        }
+        #expect(seen == [["value": .integer(1)]])
+        #expect(try database.all("SELECT value FROM exclusive_probe ORDER BY value") == [["value": .integer(1)], ["value": .integer(2)]])
+        #expect(throws: SqliteFacadeError.inactiveHandle("exclusive")) { try #require(handle).exec("SELECT 1") }
+        #expect(SqliteFacadeError.inactiveHandle("exclusive").description == "SQLite exclusive handle is no longer active")
+        #expect(throws: CallbackRejection(message: "failed")) {
+            try database.exclusive { _ in throw CallbackRejection(message: "failed") }
+        }
+        #expect(try database.get("SELECT count(*) AS count FROM exclusive_probe") == ["count": .integer(2)])
+    }
+
+    // :190.
+    @Test func rollsBackATransactionAnExclusiveOperationLeftOpenAndThrows() throws {
+        let database = try AppleSqliteDatabase(path: ":memory:")
+        defer { try? database.close() }
+        try database.exec("CREATE TABLE left_open (value INTEGER)")
+        let leftOpen = "SQLite exclusive operation left a transaction open; it was rolled back"
+
+        do {
+            _ = try database.exclusive { executor in
+                try executor.exec("BEGIN; INSERT INTO left_open (value) VALUES (1)")
+                return "returned without committing"
+            }
+            Issue.record("An open transaction was accepted")
+        } catch let error as SqliteExclusiveTransactionError {
+            #expect(error.description == leftOpen)
+            #expect(error.cause == nil)
+        }
+
+        let failure = CallbackRejection(message: "failed mid-transaction")
+        do {
+            try database.exclusive { executor in
+                try executor.exec("BEGIN IMMEDIATE; INSERT INTO left_open (value) VALUES (2)")
+                throw failure
+            }
+            Issue.record("An open transaction was accepted")
+        } catch let error as SqliteExclusiveTransactionError {
+            #expect(error.description == leftOpen)
+            #expect(error.cause as? CallbackRejection == failure)
+        }
+
+        // Later calls run outside any leftover transaction: autocommit writes commit and transactions can begin.
+        try database.run("INSERT INTO left_open (value) VALUES (?)", [.integer(3)])
+        try database.transaction { transaction in
+            try transaction.run("INSERT INTO left_open (value) VALUES (?)", [.integer(4)])
+        }
+        #expect(try database.all("SELECT value FROM left_open ORDER BY value") == [["value": .integer(3)], ["value": .integer(4)]])
+    }
+
+    // :219.
     @Test func failedRollbackDoesNotPreserveCallbackError() throws {
         let database = try AppleSqliteDatabase(path: ":memory:")
         defer { try? database.close() }
