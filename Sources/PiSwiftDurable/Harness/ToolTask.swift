@@ -420,8 +420,7 @@ internal func startNestedCall(_ runtime: TaskRuntime, parentCallId: String, name
             let state = try await tx.doc(NestedCallDoc, taskId: runtime.taskId, key: key, seed: .null)
             if let existing = try state.get("taskId")?.decode(TaskID.self) {
                 let input = try await tx.task(existing).map { try $0.input.decode(ToolTaskInput.self) }
-                guard case .nested(let found)? = input, found.parent == runtime.taskId,
-                      harnessNamesEqual(found.call.name, name),
+                guard case .nested(let found)? = input, harnessNamesEqual(found.call.name, name),
                       jsonStructurallyEqual(.object(found.call.arguments), .object(call.arguments)) else {
                     throw TaskDefinitionError("Nested call \(call.id) was already made with another tool or other arguments")
                 }

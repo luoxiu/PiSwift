@@ -210,7 +210,7 @@ private func ownedTasksProbe(_ gates: HarnessHoldGates, _ log: OwnedTasksLog) ->
         var opened = try await openTasks(storage: SqliteStorage.open(path: path), tasks: [AnyTaskDefinition(hold), AnyTaskDefinition(probe)])
         let root = try await opened.harness.root(context: .background)
         try opened.harness.resume()
-        // The probe owns: two held tasks, one that ends, a grandchild below one of them, and a conversation with a task.
+        // The probe owns: two held tasks, one that ends, a grandchild below the first, and a conversation with a task.
         let ids = try await root.commit({ [hold, probe] tx in
             let owner = try await tx.createTask(probe, input: .init(name: "probe"), options: .init(ownership: .conversation()))
             let first = try await tx.createTask(hold, input: .init(name: "first"), options: .init(ownership: .task(taskId: owner)))
@@ -223,6 +223,11 @@ private func ownedTasksProbe(_ gates: HarnessHoldGates, _ log: OwnedTasksLog) ->
         }, context: .background)
         gates.open("ends")
         _ = try await opened.harness.waitForTask(id: ids.ends, context: .background)
+        // The first ends too, but holds its outcome as `completing` while its grandchild runs: still live, so listed.
+        gates.open("first")
+        try await eventually { [harness = opened.harness] in
+            try await harness.getTask(id: ids.first, context: .background)?.state.status == "completing"
+        }
         gates.open("look.probe")
         try await eventually { [log] in log.owned.withLock { $0["probe"] } != nil }
         #expect(log.owned.withLock { $0["probe"] } == [ids.first, ids.second])
